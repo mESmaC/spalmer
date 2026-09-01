@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 from spalmer.attention import KDAConfig, KDATokenMixer
@@ -93,9 +92,7 @@ def test_mixer_gradcheck_float64():
     from torch.func import functional_call
 
     torch.manual_seed(0)
-    cfg = KDAConfig(
-        hidden_size=6, num_heads=2, head_k_dim=3, head_v_dim=2, backend="reference"
-    )
+    cfg = KDAConfig(hidden_size=6, num_heads=2, head_k_dim=3, head_v_dim=2, backend="reference")
     mixer = KDATokenMixer(cfg).double()
     x = torch.randn(1, 4, cfg.hidden_size, dtype=torch.float64)
     names = [n for n, _ in mixer.named_parameters()]

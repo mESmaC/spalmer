@@ -111,9 +111,7 @@ class KDATokenMixer(nn.Module):
         if x.dim() != 3:
             raise ValueError(f"expected x [B, T, D], got {tuple(x.shape)}")
         if x.shape[-1] != self.hidden_size:
-            raise ValueError(
-                f"expected hidden size {self.hidden_size}, got {x.shape[-1]}"
-            )
+            raise ValueError(f"expected hidden size {self.hidden_size}, got {x.shape[-1]}")
         if expected_t is not None and x.shape[1] != expected_t:
             raise ValueError(f"expected T={expected_t}, got T={x.shape[1]}")
 
@@ -167,24 +165,66 @@ class KDATokenMixer(nn.Module):
         return rms * torch.sigmoid(gate)
 
     def forward(
-        self, x: torch.Tensor, state: KDAState | None = None
+        self,
+        x: torch.Tensor,
+        state: KDAState | None = None,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        state_reset_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, KDAState]:
         """Chunk/prefill path: consume ``x [B, T, D]`` in one call."""
 
         self._check_input(x, expected_t=None)
+        self._validate_initial_masking(x, attention_mask, state_reset_mask)
         if state is None:
             state = self.create_state(x.shape[0], device=x.device, dtype=x.dtype)
         return self._core(x, state, is_step=False)
 
     def step(
-        self, x_t: torch.Tensor, state: KDAState | None = None
+        self,
+        x_t: torch.Tensor,
+        state: KDAState | None = None,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        state_reset_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, KDAState]:
         """Recurrent/decode path: consume exactly one token ``[B, 1, D]``."""
 
         self._check_input(x_t, expected_t=1)
+        self._validate_initial_masking(x_t, attention_mask, state_reset_mask)
         if state is None:
             state = self.create_state(x_t.shape[0], device=x_t.device, dtype=x_t.dtype)
         return self._core(x_t, state, is_step=True)
+
+    @staticmethod
+    def _validate_initial_masking(
+        x: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        state_reset_mask: torch.Tensor | None,
+    ) -> None:
+        """Keep the v0 path correct by accepting only unpadded fresh sequences."""
+
+        expected_shape = x.shape[:2]
+        if attention_mask is not None:
+            if attention_mask.shape != expected_shape:
+                raise ValueError(
+                    f"attention_mask must have shape {tuple(expected_shape)}, "
+                    f"got {tuple(attention_mask.shape)}"
+                )
+            if not bool(attention_mask.bool().all().item()):
+                raise NotImplementedError(
+                    "KDA v0 accepts only unpadded batches; pack fixed-length sequences"
+                )
+        if state_reset_mask is not None:
+            if state_reset_mask.shape != expected_shape:
+                raise ValueError(
+                    f"state_reset_mask must have shape {tuple(expected_shape)}, "
+                    f"got {tuple(state_reset_mask.shape)}"
+                )
+            if bool(state_reset_mask.bool().any().item()):
+                raise NotImplementedError(
+                    "in-chunk KDA state resets are not implemented; start a fresh state instead"
+                )
 
     def extra_repr(self) -> str:
         c = self.config

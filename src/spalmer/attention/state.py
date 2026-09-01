@@ -2,9 +2,9 @@
 
 The state is the only memory carried between calls:
 
-- ``recurrent_state``: KDA matrix state ``S`` of shape ``[B, H, K, V]``
-  following fla-core's ``state_v_first=True`` convention (ledger C04 writes
-  the update with rows indexed by the key dimension K, columns by V).
+- ``recurrent_state``: KDA matrix state ``S`` of shape ``[B, H, K, V]``.
+  The FLA adapter uses its default K-first state layout to preserve this
+  contract across the reference and optimized backends.
 - ``conv_q`` / ``conv_k`` / ``conv_v``: causal depthwise-conv caches, each
   ``[B, channels, conv_width - 1]``, holding the previous ``conv_width - 1``
   raw (pre-activation) projected inputs, oldest first. Note this is the
@@ -52,9 +52,7 @@ class KDAState:
         conv_q = torch.zeros(batch_size, config.key_dim, config.conv_width - 1, **opts)
         conv_k = conv_q.clone()
         conv_v = torch.zeros(batch_size, config.value_dim, config.conv_width - 1, **opts)
-        return cls(
-            recurrent_state=recurrent_state, conv_q=conv_q, conv_k=conv_k, conv_v=conv_v
-        )
+        return cls(recurrent_state=recurrent_state, conv_q=conv_q, conv_k=conv_k, conv_v=conv_v)
 
     def to(
         self, *, device: torch.device | None = None, dtype: torch.dtype | None = None
