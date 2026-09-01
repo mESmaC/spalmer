@@ -13,8 +13,8 @@ from .vocab import (
     FORMAT_NAME,
     FORMAT_VERSION,
     TokenEntry,
-    Vocab,
     VersionRecord,
+    Vocab,
     append_byte_backstop,
     byte_surface,
 )

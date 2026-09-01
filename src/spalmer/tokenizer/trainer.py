@@ -37,17 +37,80 @@ from .tiers import Tier
 from .vocab import Vocab, append_byte_backstop
 
 PYTHON_KEYWORDS = (
-    "False", "None", "True", "and", "as", "assert", "async", "await",
-    "break", "class", "continue", "def", "del", "elif", "else", "except",
-    "finally", "for", "from", "global", "if", "import", "in", "is",
-    "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try",
-    "while", "with", "yield",
+    "False",
+    "None",
+    "True",
+    "and",
+    "as",
+    "assert",
+    "async",
+    "await",
+    "break",
+    "class",
+    "continue",
+    "def",
+    "del",
+    "elif",
+    "else",
+    "except",
+    "finally",
+    "for",
+    "from",
+    "global",
+    "if",
+    "import",
+    "in",
+    "is",
+    "lambda",
+    "nonlocal",
+    "not",
+    "or",
+    "pass",
+    "raise",
+    "return",
+    "try",
+    "while",
+    "with",
+    "yield",
 )
 
 OPERATORS = (
-    "**=", "//=", ">>=", "<<=", "...", "->", ":=", "==", "!=", "<=", ">=",
-    "**", "//", "<<", ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
-    "@=", "+", "-", "*", "/", "%", "&", "|", "^", "~", "<", ">", "=",
+    "**=",
+    "//=",
+    ">>=",
+    "<<=",
+    "...",
+    "->",
+    ":=",
+    "==",
+    "!=",
+    "<=",
+    ">=",
+    "**",
+    "//",
+    "<<",
+    ">>",
+    "+=",
+    "-=",
+    "*=",
+    "/=",
+    "%=",
+    "&=",
+    "|=",
+    "^=",
+    "@=",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "&",
+    "|",
+    "^",
+    "~",
+    "<",
+    ">",
+    "=",
 )
 
 DELIMITERS = ("(", ")", "[", "]", "{", "}", ",", ":", ".", ";", "@")
@@ -169,9 +232,7 @@ def train(
     return vocab
 
 
-def _top_phrases(
-    streams: list[list[str]], config: TrainerConfig
-) -> list[tuple[str, int]]:
+def _top_phrases(streams: list[list[str]], config: TrainerConfig) -> list[tuple[str, int]]:
     counts: Counter[str] = Counter()
     for words in streams:
         for n in range(2, config.max_phrase_words + 1):
@@ -221,16 +282,19 @@ def _learn_salvage(vocab: Vocab, samples: list[Sample], config: TrainerConfig) -
             vocab.append(Tier.SALVAGE, surface)
 
 
-def _residual_runs(
-    tables, max_lens, tiers, text: str
-) -> list[list[str]]:
+def _residual_runs(tables, max_lens, tiers, text: str) -> list[list[str]]:
     runs: list[list[str]] = []
     current: list[str] = []
     pos = 0
     while pos < len(text):
         match = longest_match_in(tables, max_lens, text, pos, tiers)
         if match is None:
-            current.append(text[pos])
+            character = text[pos]
+            if character.isalpha():
+                current.append(character)
+            elif current:
+                runs.append(current)
+                current = []
             pos += 1
         else:
             if current:
@@ -255,9 +319,7 @@ def _merge_pair(pieces: list[str], pair: tuple[str, str]) -> list[str]:
     return merged
 
 
-def _top_fallback_bigrams(
-    prose_texts: list[str], config: TrainerConfig
-) -> list[tuple[str, int]]:
+def _top_fallback_bigrams(prose_texts: list[str], config: TrainerConfig) -> list[tuple[str, int]]:
     counts: Counter[str] = Counter()
     for text in prose_texts:
         lowered = text.lower()

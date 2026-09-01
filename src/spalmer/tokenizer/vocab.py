@@ -7,6 +7,7 @@ rewritten; `Vocab.extend_append_only` adds entries and seals a new record.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -24,7 +25,7 @@ def byte_surface(value: int) -> str:
     return f"<byte:0x{value:02x}>"
 
 
-def append_byte_backstop(vocab: "Vocab") -> None:
+def append_byte_backstop(vocab: Vocab) -> None:
     for value in range(256):
         if vocab.find(Tier.BYTE, byte_surface(value)) is None:
             vocab.append(Tier.BYTE, byte_surface(value), byte=value)
@@ -55,7 +56,7 @@ class TokenEntry:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "TokenEntry":
+    def from_dict(cls, data: dict) -> TokenEntry:
         return cls(
             token_id=int(data["id"]),
             surface=str(data["surface"]),
@@ -82,7 +83,7 @@ class VersionRecord:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "VersionRecord":
+    def from_dict(cls, data: dict) -> VersionRecord:
         return cls(
             version=int(data["version"]),
             created=str(data["created"]),
@@ -102,6 +103,8 @@ def _validate_history(history: list[VersionRecord], total_entries: int) -> None:
             raise ValueError("version entry_count must be non-decreasing and in range")
         last_count = record.entry_count
         expected_version += 1
+    if history and history[-1].entry_count != total_entries:
+        raise ValueError("the latest version record must seal every vocabulary entry")
 
 
 class Vocab:
@@ -118,6 +121,24 @@ class Vocab:
     def version(self) -> int:
         return self.history[-1].version if self.history else 0
 
+    @property
+    def fingerprint(self) -> str:
+        """Stable identity for the token-id mapping consumed by a model."""
+
+        identity = {
+            "format": FORMAT_NAME,
+            "format_version": FORMAT_VERSION,
+            "version": self.version,
+            "entries": [entry.to_dict() for entry in self.entries],
+        }
+        payload = json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
     def get(self, token_id: int) -> TokenEntry:
         return self.entries[token_id]
 
@@ -125,6 +146,18 @@ class Vocab:
         return self._surface_index.get((int(tier), surface))
 
     def append(self, tier: Tier, surface: str, byte: int | None = None) -> TokenEntry:
+        if (int(tier), surface) in self._surface_index:
+            raise ValueError(f"duplicate surface in tier {tier!r}: {surface!r}")
+        if self.history:
+            raise RuntimeError("sealed vocabulary is immutable; use extend_append_only")
+        return self._append_unchecked(tier, surface, byte)
+
+    def _append_unchecked(
+        self,
+        tier: Tier,
+        surface: str,
+        byte: int | None = None,
+    ) -> TokenEntry:
         if (int(tier), surface) in self._surface_index:
             raise ValueError(f"duplicate surface in tier {tier!r}: {surface!r}")
         entry = TokenEntry(token_id=len(self.entries), surface=surface, tier=tier, byte=byte)
@@ -147,7 +180,7 @@ class Vocab:
         self, created: str, note: str, items: Iterable[tuple[Tier, str]]
     ) -> VersionRecord:
         for tier, surface in items:
-            self.append(tier, surface)
+            self._append_unchecked(tier, surface)
         return self.seal_version(created, note, frozen=True)
 
     def to_dict(self) -> dict:
@@ -160,7 +193,7 @@ class Vocab:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Vocab":
+    def from_dict(cls, data: dict) -> Vocab:
         if data.get("format") != FORMAT_NAME:
             raise ValueError("not a spalmer tokenizer vocabulary")
         if int(data.get("format_version", 0)) != FORMAT_VERSION:
@@ -180,12 +213,12 @@ class Vocab:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=1)
 
     @classmethod
-    def from_json(cls, text: str) -> "Vocab":
+    def from_json(cls, text: str) -> Vocab:
         return cls.from_dict(json.loads(text))
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(self.to_json() + "\n", encoding="utf-8")
 
     @classmethod
-    def load(cls, path: str | Path) -> "Vocab":
+    def load(cls, path: str | Path) -> Vocab:
         return cls.from_json(Path(path).read_text(encoding="utf-8"))

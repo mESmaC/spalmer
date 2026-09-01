@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from spalmer.tokenizer import Encoder, Tier, Vocab
-
 from helpers import build_demo_vocab, precedence_vocab, within_tier_vocab
+
+from spalmer.tokenizer import Encoder, Tier, Vocab
 
 
 def test_encode_is_deterministic(tmp_path):

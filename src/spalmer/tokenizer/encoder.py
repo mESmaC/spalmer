@@ -68,9 +68,7 @@ class Encoder:
         pos = 0
         length = len(text)
         while pos < length:
-            match = longest_match_in(
-                self._tables, self._max_lens, text, pos, self._text_tiers
-            )
+            match = longest_match_in(self._tables, self._max_lens, text, pos, self._text_tiers)
             if match is not None:
                 token_id, tier, surface = match
                 out.append((token_id, tier))

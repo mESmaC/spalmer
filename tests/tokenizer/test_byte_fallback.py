@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from spalmer.tokenizer import Encoder, Tier
-
 from helpers import build_demo_vocab, precedence_vocab
+
+from spalmer.tokenizer import Encoder, Tier
 
 
 def test_byte_backstop_is_complete():

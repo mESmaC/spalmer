@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import pytest
+from helpers import build_demo_vocab, within_tier_vocab
 
 from spalmer.tokenizer import Encoder
-
-from helpers import build_demo_vocab, within_tier_vocab
 
 ROUND_TRIP_CASES = [
     "",

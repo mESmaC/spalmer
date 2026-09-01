@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import pytest
+from helpers import build_demo_vocab
 
 from spalmer.tokenizer import Tier, Vocab
-
-from helpers import build_demo_vocab
 
 
 def test_demo_vocab_represents_all_tiers():
@@ -20,11 +19,16 @@ def test_initial_version_is_frozen():
     assert record.frozen
     assert record.entry_count == len(vocab)
 
+    with pytest.raises(RuntimeError, match="sealed vocabulary"):
+        vocab.append(Tier.SALVAGE, "new")
+
 
 def test_append_only_extend_keeps_existing_ids():
     vocab = build_demo_vocab()
     before = list(vocab.entries)
-    record = vocab.extend_append_only("2026-09-02", "append one salvage merge", [(Tier.SALVAGE, "qx")])
+    record = vocab.extend_append_only(
+        "2026-09-02", "append one salvage merge", [(Tier.SALVAGE, "qx")]
+    )
     assert record.version == 2
     assert record.entry_count == len(before) + 1
     assert vocab.entries[: len(before)] == before
@@ -44,6 +48,7 @@ def test_json_roundtrip_preserves_entries_and_history():
     assert clone.name == vocab.name
     assert clone.entries == vocab.entries
     assert clone.history == vocab.history
+    assert clone.fingerprint == vocab.fingerprint
 
 
 def test_tampered_history_is_rejected():
