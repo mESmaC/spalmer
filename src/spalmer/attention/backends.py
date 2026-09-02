@@ -4,7 +4,8 @@
   compute, differentiable, exact ledger semantics). Used for correctness and
   smoke tests.
 - :class:`FlaKdaBackend`: guarded adapter around fla-core's ``chunk_kda``
-  kernel for both prefill and decode. It does
+  prefill kernel and its recurrent decode kernel when the head width is safe.
+  It does
   NOT reimplement any kernel; if fla-core is unavailable it raises a clear
   error instead of silently falling back.
 
@@ -29,7 +30,7 @@ def fla_available() -> bool:
     """True if ``fla.ops.kda`` is importable in this environment."""
 
     try:
-        from fla.ops.kda import chunk_kda  # noqa: F401
+        from fla.ops.kda import chunk_kda, fused_recurrent_kda  # noqa: F401
     except Exception:
         return False
     return True
@@ -116,13 +117,14 @@ class FlaKdaBackend:
 
     def __init__(self) -> None:
         try:
-            from fla.ops.kda import chunk_kda
+            from fla.ops.kda import chunk_kda, fused_recurrent_kda
         except Exception as exc:  # pragma: no cover - depends on env
             raise ImportError(
                 "FlaKdaBackend requested but fla.ops.kda is not importable "
                 f"({_MIN_FLA_VERSION_HINT}). Original error: {exc}"
             ) from exc
         self._chunk_kda = chunk_kda
+        self._fused_recurrent_kda = fused_recurrent_kda
 
     def _run(self, kernel, **kwargs):
         try:
@@ -181,13 +183,20 @@ class FlaKdaBackend:
         lower_bound: float | None,
         allow_neg_eigval: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # fla-core 0.5.2's fused recurrent KDA kernel can intermittently
-        # produce NaN recurrent states during BF16 decode on SM120, despite
-        # finite inputs and a finite prefill state.  The chunk kernel accepts
-        # T=1 plus the same FP32 state contract and is stable, so keep decode
-        # on that optimized path as well.
+        key_width = q.shape[-1]
+        # fla-core 0.5.2's fused recurrent KDA kernel loads its power-of-two
+        # padded gate lanes without a mask.  Non-power-of-two head widths can
+        # therefore ingest out-of-bounds values and intermittently produce NaN
+        # states.  chunk_kda accepts T=1 with the same FP32 state contract and
+        # is the stable fallback; retain the faster fused path when no padded
+        # lanes exist.
+        kernel = (
+            self._fused_recurrent_kda
+            if key_width > 0 and key_width & (key_width - 1) == 0
+            else self._chunk_kda
+        )
         return self._run(
-            self._chunk_kda,
+            kernel,
             q=q,
             k=k,
             v=v,

@@ -22,6 +22,7 @@ def test_fla_backend_flattens_dt_bias_without_changing_parameter_gradient_shape(
         return output, kwargs["initial_state"]
 
     backend._chunk_kda = fake_kernel
+    backend._fused_recurrent_kda = fake_kernel
 
     batch, heads, key_dim = 2, 2, 3
     q = torch.randn(batch, sequence_length, heads, key_dim)
@@ -48,18 +49,30 @@ def test_fla_backend_flattens_dt_bias_without_changing_parameter_gradient_shape(
     assert torch.isfinite(dt_bias.grad).all()
 
 
-def test_fla_decode_uses_chunk_kernel_for_stable_single_token_recurrence() -> None:
+@pytest.mark.parametrize(
+    ("key_width", "expected_kernel"),
+    [(12, "chunk"), (16, "fused")],
+)
+def test_fla_decode_selects_safe_single_token_kernel(
+    key_width: int,
+    expected_kernel: str,
+) -> None:
     backend = object.__new__(FlaKdaBackend)
-    calls: list[int] = []
+    calls: list[tuple[str, int, torch.dtype]] = []
 
     def fake_chunk_kernel(**kwargs):
-        calls.append(kwargs["q"].shape[1])
+        calls.append(("chunk", kwargs["q"].shape[1], kwargs["initial_state"].dtype))
+        return kwargs["q"], kwargs["initial_state"]
+
+    def fake_fused_kernel(**kwargs):
+        calls.append(("fused", kwargs["q"].shape[1], kwargs["initial_state"].dtype))
         return kwargs["q"], kwargs["initial_state"]
 
     backend._chunk_kda = fake_chunk_kernel
+    backend._fused_recurrent_kda = fake_fused_kernel
 
-    q = torch.randn(1, 1, 2, 3)
-    state = torch.zeros(1, 2, 3, 3)
+    q = torch.randn(1, 1, 2, key_width)
+    state = torch.zeros(1, 2, key_width, key_width)
     output, final_state = backend.step(
         q=q,
         k=q,
@@ -67,12 +80,12 @@ def test_fla_decode_uses_chunk_kernel_for_stable_single_token_recurrence() -> No
         f=q,
         beta_raw=torch.zeros(1, 1, 2),
         A_log=torch.zeros(2),
-        dt_bias=torch.zeros(2, 3),
+        dt_bias=torch.zeros(2, key_width),
         state=state,
         lower_bound=None,
         allow_neg_eigval=False,
     )
 
-    assert calls == [1]
+    assert calls == [(expected_kernel, 1, torch.float32)]
     assert output is q
     assert final_state is state
