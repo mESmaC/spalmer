@@ -12,6 +12,22 @@ The repository is at the first executable-prototype stage. Components are kept
 small, independently testable, and feature-gated so architectural ideas can be
 changed without treating an early implementation as a frozen specification.
 
+## Run the prototype
+
+```shell
+python -m pip install -e .
+spalmer corpus.txt --steps 100 --output runs/prototype.pt
+```
+
+That command trains a tokenizer, assembles the 3:1 KDA/MLA model with
+surprise-routed micro-experts, trains next-token prediction, saves the exact
+tokenizer and construction configuration with the weights, and generates a
+short sample. Model width, layer count, head count, expert count, active expert
+count, sequence length, batch size, and training steps are command-line knobs.
+
+The current optimized KDA adapter uses `fla-core` when it is installed and
+otherwise runs the plain-PyTorch correctness backend.
+
 ## Current implementation lanes
 
 - shared configuration and decoder assembly;
