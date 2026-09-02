@@ -16,6 +16,8 @@ def test_token_budget_includes_accumulation() -> None:
 
     assert config.tokens_per_optimizer_step == 1_536
     assert config.token_budget == 15_360
+    assert config.parameter_dtype == "bfloat16"
+    assert config.optimizer_state_dtype == "float32"
 
 
 def test_schedule_warms_then_decays_to_floor() -> None:

@@ -21,6 +21,11 @@ def _config(**overrides: object) -> MicroExpertsConfig:
         "d_model": 4,
         "num_experts": 4,
         "expert_inter_dim": 2,
+        "expert_weight_format": "legacy_int",
+        "expert_activation_format": "bfloat16",
+        "expert_master_dtype": "float32",
+        "expert_qat_backend": "reference",
+        "expert_promotion_format": "bfloat16",
         "potentiation_budget": 2,
         "potentiation_ema_decay": 0.0,
         "potentiation_warmup_steps": 1,
@@ -291,6 +296,11 @@ def test_checkpoint_restores_one_authoritative_controller_and_effective_logits(
         "expert_fake_quantization",
         "expert_quant_bits",
         "expert_stochastic_rounding",
+        "expert_weight_format",
+        "expert_activation_format",
+        "expert_master_dtype",
+        "expert_qat_backend",
+        "expert_promotion_format",
         "potentiation_budget",
         "potentiation_ema_decay",
         "potentiation_warmup_steps",
@@ -313,6 +323,8 @@ def test_checkpoint_restores_one_authoritative_controller_and_effective_logits(
     assert legacy_controller is not None
     assert legacy_controller.config.router_score_transform == "identity"
     assert not legacy_controller.config.expert_fake_quantization
+    assert legacy_controller.config.expert_weight_format == "legacy_int"
+    assert legacy_controller.config.expert_master_dtype == "float32"
     assert legacy_controller.config.potentiation_budget == 0
 
     damaged_legacy_payload = torch.load(legacy_path, weights_only=False)

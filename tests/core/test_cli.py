@@ -52,6 +52,7 @@ def test_generate_command_loads_saved_vocab_and_uses_cached_runtime(monkeypatch,
 
     monkeypatch.setattr(cli, "load_checkpoint", fake_load_checkpoint)
     monkeypatch.setattr(cli, "Encoder", FakeEncoder)
+    monkeypatch.setattr(cli, "Vocab", _FakeVocab)
     monkeypatch.setattr(cli, "generate_tokens", fake_generate_tokens)
 
     cli.main(

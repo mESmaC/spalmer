@@ -29,6 +29,8 @@ def test_plan_cli_emits_machine_readable_ladder(capsys) -> None:
             "4096",
             "8192",
             "16384",
+            "--expert-weight-format",
+            "nvfp4",
             "--json",
         ]
     )
@@ -40,6 +42,7 @@ def test_plan_cli_emits_machine_readable_ladder(capsys) -> None:
         100_000_000,
     ]
     assert [item["config"]["vocab_size"] for item in payload] == [4096, 8192, 16384]
+    assert {item["config"]["expert_weight_format"] for item in payload} == {"nvfp4"}
 
 
 def test_prepare_data_cli_defaults_to_yylab_export_fields() -> None:

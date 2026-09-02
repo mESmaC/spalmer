@@ -63,10 +63,13 @@ otherwise runs the plain-PyTorch correctness backend.
 - an always-on shared SwiGLU channel path beside the routed micro-experts
   (`shared_inter_dim`), with grouped batched expert execution and a per-expert
   loop reference path;
+- routed-expert W4A8 QAT with selectable MXFP4 or NVFP4 forward weights,
+  MXFP8 expert inputs, one BF16 persistent/master weight payload, FP32 Adam
+  moments, and expert-wide promotion to MXFP8 or BF16 execution;
 - feature-gated C16 lateral mixing with peer-aware active silencing
   (`directional_config`) and feature-gated ATXY exact memory (`atxy_config`,
   acting only on forward calls that pass an `ATXYRequest`);
-- `spalmer.presets` shape hooks for 10M/50M/100M-class non-embedding budgets
+- `spalmer.presets` shape hooks for inclusive 10M/50M/100M total-parameter budgets
   at any vocabulary size, with analytic parameter estimates that match the
   measured accounting.
 
@@ -106,18 +109,24 @@ bits-per-byte is reported only when a prepared shard carries exact target-byte
 metadata; it is never inferred from a lossy token decode. RPD preparation gives
 EOD a reserved model-only ID after the content vocabulary rather than relabeling
 an ordinary token. The training engine moves only the current mmap sample batch
-to the GPU and keeps persistent parameters and optimizer state in FP32 while
-using BF16 autocast for supported accelerator operations.
+to the GPU. Base pretraining keeps one BF16 parameter/master payload and BF16
+gradients; Adam moments remain independent FP32 state. Stochastic BF16 writeback
+preserves small updates without creating a duplicate FP32 master weight copy.
 
 ## Reference-backend boundary
 
-The initial PLE and expert implementations are fake-quantization correctness
-backends. They use stochastic low-bit values in the training forward pass while
-retaining floating shadow weights for autograd, so they do **not** yet provide
-packed-storage memory savings. Expert potentiation reversibly promotes a whole
-expert identity to those shadow weights; it establishes the controller semantics
-but is not yet packed FP4 plus an FP8 residual. A hard allocation guard prevents
-accidentally scaling the PLE shadow tables beyond prototype size.
+PLE and routed-expert low-precision paths currently remain quantize/dequantize
+QAT correctness backends, so they do **not** yet provide packed-storage or
+low-bit GEMM speedups. The routed experts nevertheless exercise the requested
+MXFP4-or-NVFP4 weight and MXFP8 activation numerics from a BF16 master. A strict
+native request fails instead of silently using BF16 matmul. The installed SM120
+software stack has no mixed W4A8 grouped kernel; native execution is a separate
+backend milestone. Backward currently uses BF16 autograd through the QAT STE;
+an explicit MXFP8 backward kernel is also a later backend milestone. Expert
+potentiation changes a complete expert's derived
+forward precision to MXFP8 or BF16 without adding another master copy. A hard
+allocation guard prevents accidentally scaling the PLE tables beyond prototype
+size.
 
 The surprise-calibration target is mixture-level realized NLL attributed by
 routing responsibility. It is not a measured counterfactual NLL for every

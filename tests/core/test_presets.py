@@ -1,42 +1,44 @@
-"""Architecture shape hooks: analytic accounting must match built models (no training)."""
+"""Static checks for the ScalePlan-to-configuration construction boundary."""
 
 from __future__ import annotations
 
 import pytest
-import torch
 
-from spalmer.experts import account_parameters
-from spalmer.memory import ATXYConfig
+from spalmer.experiment import (
+    ATXYScaleConfig,
+    DirectionalScaleConfig,
+    ScaleSearchSpace,
+    plan_configuration,
+)
+from spalmer.experts.accounting import ParameterAccounting
 from spalmer.presets import (
-    PARAMETER_CLASSES,
-    ArchitectureShape,
+    TOTAL_PARAMETER_TARGETS,
+    assert_accounting_matches_plan,
     build_configs,
-    estimate_parameters,
-    shape_for,
-)
-
-TINY = ArchitectureShape(
-    name="tiny",
-    d_model=32,
-    n_layers=4,
-    num_heads=2,
-    head_dim=16,
-    q_latent_dim=16,
-    kv_latent_dim=8,
-    num_experts=8,
-    expert_inter_dim=4,
-    shared_inter_dim=16,
-    max_resident_experts=4,
+    plan_named_scale,
 )
 
 
-@pytest.mark.parametrize("vocab_size", [37, 300])
-@pytest.mark.parametrize("directional", [False, True])
-@pytest.mark.parametrize("with_atxy", [False, True])
-def test_analytic_estimate_matches_measured_parameters(vocab_size, directional, with_atxy) -> None:
+def _one_shape_search() -> ScaleSearchSpace:
+    return ScaleSearchSpace(
+        d_models=(32,),
+        n_layers=(4,),
+        num_heads=(2,),
+        num_experts=8,
+        expert_width_divisors=(8,),
+        shared_width_multipliers=(1,),
+        ple_expansions=(2,),
+    )
+
+
+def _tiny_plan(*, extensions: bool = False, expert_weight_format: str = "mxfp4"):
+    directional = (
+        DirectionalScaleConfig(num_feature_groups=4, lateral_rank=4)
+        if extensions
+        else None
+    )
     atxy = (
-        ATXYConfig(
-            d_model=32,
+        ATXYScaleConfig(
             value_dim=6,
             a_cardinality=3,
             t_cardinality=4,
@@ -44,95 +46,146 @@ def test_analytic_estimate_matches_measured_parameters(vocab_size, directional, 
             y_cardinality=6,
             injection_layer=1,
         )
-        if with_atxy
+        if extensions
         else None
     )
-    bundle = build_configs(
-        TINY,
-        vocab_size=vocab_size,
-        tokenizer_version=1,
-        tokenizer_fingerprint="presets",
-        attention_backend="reference",
+    return plan_configuration(
+        1_000_000,
+        300,
+        search_space=_one_shape_search(),
+        expert_weight_format=expert_weight_format,
         directional=directional,
         atxy=atxy,
     )
-    torch.manual_seed(0)
-    model = bundle.build()
-    measured = account_parameters(model)
-    estimate = estimate_parameters(TINY, vocab_size, directional=directional, atxy=atxy)
-    for name in (
-        "attention",
-        "norms",
-        "shared_channel",
-        "router",
-        "expert_pool",
-        "directional",
-        "atxy",
-        "embeddings",
-        "vocab_head",
-    ):
-        assert measured.components[name] == getattr(estimate, name), name
-    assert measured.total == estimate.total
-    assert measured.parameters_per_expert == estimate.parameters_per_expert
-    assert estimate.resident(TINY.min_resident_experts) == (
-        measured.total - measured.expert_pool + 2 * measured.parameters_per_expert
+
+
+@pytest.mark.parametrize("extensions", [False, True])
+@pytest.mark.parametrize("expert_weight_format", ["mxfp4", "nvfp4"])
+def test_scale_plan_builds_matching_static_configs(extensions, expert_weight_format) -> None:
+    plan = _tiny_plan(
+        extensions=extensions,
+        expert_weight_format=expert_weight_format,
     )
-    output = model(torch.randint(0, vocab_size, (1, 5)))
-    assert output.logits.shape == (1, 5, vocab_size)
-
-
-@pytest.mark.parametrize(
-    "name,target", [("10M", 10_000_000), ("50M", 50_000_000), ("100M", 100_000_000)]
-)
-def test_parameter_classes_land_near_their_non_embedding_targets(name, target) -> None:
-    shape = shape_for(name)
-    estimate = estimate_parameters(shape, vocab_size=4096)
-    assert abs(estimate.non_embedding - target) / target < 0.06
-    assert estimate.non_embedding == estimate_parameters(shape, vocab_size=65536).non_embedding
-    # The ledger's residency numbers: start at two, cap at roughly 10%.
-    assert shape.min_resident_experts == 2
-    assert shape.max_resident_experts <= max(2, round(0.125 * shape.num_experts))
-    assert (
-        3 * shape.d_model * shape.expert_inter_dim * shape.n_layers
-        == estimate.parameters_per_expert
-    )
-
-
-def test_vocabulary_scales_only_the_embedding_and_head_components() -> None:
-    shape = shape_for("10M")
-    small = estimate_parameters(shape, vocab_size=4096)
-    large = estimate_parameters(shape, vocab_size=32768)
-    assert large.non_embedding == small.non_embedding
-    assert large.vocab_head == 8 * small.vocab_head
-    assert large.embeddings - small.embeddings == shape.n_layers * (32768 - 4096) * shape.d_model
-    bytes_small = small.nominal_bytes()
-    assert bytes_small["embeddings"] == small.embeddings * shape.ple_quant_bits / 8
-    assert bytes_small["attention"] == small.attention * 2
-
-
-def test_shape_overrides_and_bundle_contents() -> None:
-    shape = shape_for("50M", num_experts=200, expert_inter_dim=6)
-    assert shape.num_experts == 200 and shape.name == "50M"
-    with pytest.raises(KeyError, match="unknown parameter class"):
-        shape_for("7B")
-    with pytest.raises(ValueError, match="multiple"):
-        shape.with_overrides(n_layers=6)
     bundle = build_configs(
-        shape,
-        vocab_size=12345,
+        plan,
         tokenizer_version=3,
-        tokenizer_fingerprint="abc",
+        tokenizer_fingerprint="presets",
+        attention_backend="reference",
         experts_overrides={"potentiation_budget": 0},
         model_overrides={"surprise_ema_decay": 0.9},
     )
-    assert bundle.model.vocab_size == 12345
-    assert bundle.model.tokenizer_version == 3
+    config = plan.config
+
+    assert bundle.plan is plan
+    assert bundle.model.vocab_size == config.vocab_size
+    assert bundle.model.d_model == config.d_model
+    assert bundle.model.n_layers == config.n_layers
+    assert bundle.model.ple_expansion_factor == config.ple_expansion
     assert bundle.model.surprise_ema_decay == 0.9
-    assert bundle.kda.backend == "auto"
-    assert bundle.mla.kv_latent_dim == shape.kv_latent_dim
-    assert bundle.experts.num_experts == 200
+    assert bundle.kda.hidden_size == config.d_model
+    assert bundle.kda.num_heads == config.num_heads
+    assert bundle.mla.q_latent_dim == config.resolved_q_latent_dim
+    assert bundle.mla.kv_latent_dim == config.resolved_kv_latent_dim
+    assert bundle.experts.num_experts == config.num_experts
+    assert bundle.experts.resolved_inter_dim == config.expert_width
+    assert bundle.experts.resolved_shared_inter_dim == config.resolved_shared_width
+    assert bundle.experts.expert_weight_format == expert_weight_format
+    assert bundle.experts.expert_activation_format == "mxfp8"
+    assert bundle.experts.expert_master_dtype == "bfloat16"
     assert bundle.experts.potentiation_budget == 0
-    assert bundle.experts.max_resident_experts == shape.max_resident_experts
-    assert bundle.directional is None and bundle.atxy is None
-    assert bundle.model.token_mixer_pattern == ("kda", "kda", "kda", "mla")
-    assert set(PARAMETER_CLASSES) == {"10M", "50M", "100M"}
+
+    assert plan.parameters.shared_channel == (
+        config.n_layers * bundle.experts.shared_parameters_per_layer
+    )
+    assert plan.parameters.expert_pool == (
+        config.n_layers * bundle.experts.expert_pool_parameters_per_layer
+    )
+    assert plan.parameters.router == config.d_model * config.num_experts
+    assert (bundle.directional is not None) is extensions
+    assert (bundle.atxy is not None) is extensions
+    if extensions:
+        assert plan.parameters.directional == (
+            config.n_layers * bundle.directional.parameters_per_layer
+        )
+        assert plan.parameters.atxy == bundle.atxy.parameter_count
+    else:
+        assert plan.parameters.directional == 0
+        assert plan.parameters.atxy == 0
+
+
+def test_measured_accounting_contract_uses_the_same_component_ownership() -> None:
+    plan = _tiny_plan(extensions=True)
+    per_expert = (
+        plan.config.n_layers
+        * 3
+        * plan.config.d_model
+        * plan.config.expert_width
+    )
+    accounting = ParameterAccounting(
+        components=dict(plan.parameters.components),
+        num_experts=plan.config.num_experts,
+        resident_expert_ids=tuple(range(plan.config.num_experts)),
+        active_experts_per_token=plan.config.active_experts,
+        parameters_per_expert=per_expert,
+    )
+
+    assert_accounting_matches_plan(plan, accounting)
+    wrong_components = dict(accounting.components)
+    wrong_components["shared_channel"] += 1
+    wrong = ParameterAccounting(
+        components=wrong_components,
+        num_experts=accounting.num_experts,
+        resident_expert_ids=accounting.resident_expert_ids,
+        active_experts_per_token=accounting.active_experts_per_token,
+        parameters_per_expert=accounting.parameters_per_expert,
+    )
+    with pytest.raises(ValueError, match="shared_channel"):
+        assert_accounting_matches_plan(plan, wrong)
+
+
+@pytest.mark.parametrize("name", ["10M", "50M", "100M"])
+def test_named_scales_are_total_targets_with_scale_owned_vocab(name) -> None:
+    plan = plan_named_scale(name, vocab_size=4_096)
+
+    assert plan.target_parameters == TOTAL_PARAMETER_TARGETS[name]
+    assert plan.config.vocab_size == 4_096
+    assert plan.config.num_experts == 200
+    assert plan.config.ple_expansion in {2, 4}
+    assert plan.parameters.total == sum(plan.parameters.components.values())
+    assert abs(plan.relative_error) < 0.01
+
+
+def test_plan_fields_cannot_be_silently_overridden() -> None:
+    plan = _tiny_plan()
+
+    with pytest.raises(ValueError, match="ScalePlan fields"):
+        build_configs(
+            plan,
+            tokenizer_version=1,
+            tokenizer_fingerprint="presets",
+            model_overrides={"d_model": 64},
+        )
+    with pytest.raises(ValueError, match="ScalePlan fields"):
+        build_configs(
+            plan,
+            tokenizer_version=1,
+            tokenizer_fingerprint="presets",
+            experts_overrides={"num_experts": 200},
+        )
+    with pytest.raises(ValueError, match="ScalePlan fields"):
+        build_configs(
+            plan,
+            tokenizer_version=1,
+            tokenizer_fingerprint="presets",
+            experts_overrides={"expert_fake_quantization": False},
+        )
+    with pytest.raises(KeyError, match="unknown scale"):
+        plan_named_scale("7B", vocab_size=32_000)
+
+
+def test_named_scale_target_table_contains_only_total_budget_labels() -> None:
+    assert TOTAL_PARAMETER_TARGETS == {
+        "10M": 10_000_000,
+        "50M": 50_000_000,
+        "100M": 100_000_000,
+    }

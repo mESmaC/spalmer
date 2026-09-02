@@ -127,10 +127,15 @@ def test_resident_set_smaller_than_topk_is_rejected() -> None:
     with pytest.raises(ValueError, match="at least active_experts"):
         model.residency.set([3])
     model.residency.set([3, 4])
+    with pytest.raises(ValueError, match="cannot be served"):
+        model.set_active_experts(4)
+    assert model.active_experts == 2
+    model.residency.expand([5, 6])
     model.set_active_experts(4)
-    with pytest.raises(ValueError, match="cannot serve"):
-        model(torch.randint(0, 40, (1, 3)))
+    with pytest.raises(ValueError, match="at least active_experts=4"):
+        model.residency.set([3, 4])
     model.set_active_experts(None)
+    model.residency.reset()
 
 
 # --- expansion monotonicity -------------------------------------------------
@@ -148,10 +153,14 @@ def test_expansion_preserves_existing_ids_and_adds_only_new_explicit_ids() -> No
     with pytest.raises(ValueError, match="lie in"):
         residency.expand([NUM_EXPERTS])
     snapshot = residency.snapshot()
+    state = residency.snapshot_state()
     residency.expand([1])
+    residency.set_active_experts(4)
     assert set(snapshot) < set(residency.ids)
-    residency.restore(snapshot)
+    residency.restore_state(state)
     assert residency.ids == snapshot
+    assert residency.active_experts == 2
+    assert residency.active_experts_override is None
     assert torch.equal(residency.resident_ids, torch.tensor(snapshot, dtype=torch.long))
     assert residency.resident_mask.sum() == len(snapshot)
 
@@ -160,13 +169,21 @@ def test_session_restores_the_previous_set_even_after_expansion() -> None:
     model = _model()
     with model.residency_session([1, 2]):
         model.residency.expand([8])
+        model.set_active_experts(3)
         assert model.resident_expert_ids == (1, 2, 8)
+        assert model.active_experts == 3
     assert model.resident_expert_ids == tuple(range(NUM_EXPERTS))
+    assert model.active_experts_override is None
+    assert model.active_experts == 2
     model.residency.set([3, 4])
+    model.set_active_experts(2)
     with model.residency_session():
         model.residency.expand([10])
+        model.set_active_experts(3)
     assert model.resident_expert_ids == (3, 4)
+    assert model.active_experts == 2
     model.residency.reset()
+    model.set_active_experts(None)
 
 
 def test_topk_override_does_not_change_residency() -> None:
@@ -178,6 +195,8 @@ def test_topk_override_does_not_change_residency() -> None:
     assert output.layer_metrics[0]["expert_ids"].shape[-1] == 3
     assert _selected_ids(output) <= {0, 1, 2, 3}
     model.set_active_experts(None)
+    assert model.resident_expert_ids == (0, 1, 2, 3)
+    model.residency.reset()
 
 
 # --- exact parameter accounting ---------------------------------------------
@@ -210,7 +229,15 @@ def test_accounting_matches_tensor_sums_and_moves_by_whole_experts() -> None:
     model.residency.expand([7])
     three = model.parameter_accounting()
     assert three.resident_parameters - two.resident_parameters == accounting.parameters_per_expert
-    assert three.nominal_bits["expert_pool"] == 4
+    # Persistent storage uses the configured BF16 expert masters; execution
+    # remains four-bit fake QAT and is reported separately.
+    assert three.nominal_bits["expert_pool"] == 16
+    assert three.execution_bits["expert_pool"] == 4
+    assert three.nominal_bits["embeddings"] == 32
+    assert three.execution_bits["embeddings"] == 4
+    assert three.actual_parameter_bytes == sum(
+        parameter.numel() * parameter.element_size() for parameter in model.parameters()
+    )
     assert three.resident_bytes() < accounting.resident_bytes()
     assert "resident=" in three.summary()
     model.residency.reset()
@@ -374,10 +401,15 @@ def test_controller_start_size_honors_a_topk_override_and_reports_effective_k() 
     assert decision.active_experts == 4
     assert decision.resident_count == 4
     assert model.residency.request_open
-    # The top-k restore at the end of generation also ends the request.
-    model.set_active_experts(4)
+    # Changing top-k does not silently tear down request residency.
+    model.set_active_experts(3)
+    assert model.residency.request_open
+    assert model.resident_expert_ids == decision.resident_ids
+    # Explicit request exit restores both the prior full set and top-k=4.
+    model.end_residency_request()
     assert not model.residency.request_open
     assert model.resident_expert_ids == tuple(range(NUM_EXPERTS))
+    assert model.active_experts == 4
     model.set_active_experts(None)
 
 
@@ -401,6 +433,7 @@ def test_controller_restores_the_prior_set_when_evaluation_fails(monkeypatch) ->
             model, torch.randint(0, 40, (1, 6)), min_gain=-1.0
         )
     assert model.resident_expert_ids == (3, 4, 5)
+    assert model.active_experts == 2
     assert not model.residency.request_open
     model.residency.reset()
 
@@ -420,14 +453,21 @@ def test_residency_set_under_inference_mode_still_allows_a_grad_forward() -> Non
 
 def test_nested_request_end_returns_to_the_outermost_prior_set() -> None:
     residency = ExpertResidency(_experts())
-    residency.set([6, 7])
-    residency.begin_request([0, 1])
-    residency.begin_request([2, 3])
-    assert residency.ids == (2, 3)
+    residency.set([6, 7, 8])
+    residency.set_active_experts(3)
+    with pytest.raises(ValueError, match="at least active_experts=3"):
+        residency.begin_request([0, 1])
+    assert not residency.request_open
+    residency.begin_request([0, 1], active_experts=2)
+    residency.begin_request([2, 3, 4, 5], active_experts=4)
+    assert residency.ids == (2, 3, 4, 5)
+    assert residency.active_experts == 4
     residency.end_request()
-    assert residency.ids == (6, 7)
+    assert residency.ids == (6, 7, 8)
+    assert residency.active_experts == 3
     residency.end_request()  # no open request: a no-op
-    assert residency.ids == (6, 7)
+    assert residency.ids == (6, 7, 8)
+    assert residency.active_experts == 3
 
 
 def test_grouped_execution_skips_experts_without_pairs() -> None:

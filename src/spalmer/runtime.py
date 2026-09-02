@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 
 from spalmer.modeling import SPALMERCausalLM
+from spalmer.training.optim import BF16MasterAdamW
 
 
 @dataclass(slots=True)
@@ -53,7 +54,18 @@ def train_token_stream(
     device = next(model.parameters()).device
     stream = token_ids.to(device=device, dtype=torch.long)
     generator = torch.Generator(device=device).manual_seed(seed)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    parameters, parameter_dtype = _validated_trainable_parameters(model)
+    if parameter_dtype == torch.bfloat16:
+        optimizer = BF16MasterAdamW(
+            [{"params": parameters, "weight_decay": 0.01}],
+            lr=learning_rate,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            stochastic_rounding=True,
+            update_chunk_size=1_048_576,
+        )
+    else:  # _validated_trainable_parameters only permits FP32 or BF16.
+        optimizer = torch.optim.AdamW(parameters, lr=learning_rate)
     losses: list[float] = []
     final_model_loss = float("nan")
     final_auxiliary_loss: float | None = None
@@ -121,6 +133,43 @@ def train_token_stream(
     )
 
 
+def _validated_trainable_parameters(
+    model: SPALMERCausalLM,
+) -> tuple[tuple[torch.nn.Parameter, ...], torch.dtype]:
+    """Resolve the legacy optimizer only after validating its entire parameter set."""
+
+    named = tuple(
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    )
+    if not named:
+        raise ValueError("model has no trainable parameters")
+    non_floating = sorted(name for name, parameter in named if not parameter.is_floating_point())
+    if non_floating:
+        raise ValueError(
+            "all trainable parameters must be floating point before optimizer construction; "
+            f"non-floating={non_floating}"
+        )
+    by_dtype: dict[torch.dtype, list[str]] = {}
+    for name, parameter in named:
+        by_dtype.setdefault(parameter.dtype, []).append(name)
+    if len(by_dtype) != 1:
+        detail = ", ".join(
+            f"{dtype}: {sorted(names)}" for dtype, names in sorted(by_dtype.items(), key=str)
+        )
+        raise ValueError(
+            "all trainable parameters must share one dtype before optimizer construction; "
+            f"observed {detail}"
+        )
+    dtype = next(iter(by_dtype))
+    if dtype not in {torch.bfloat16, torch.float32}:
+        raise ValueError(
+            f"unsupported trainable parameter dtype {dtype}; expected bfloat16 or float32"
+        )
+    return tuple(parameter for _, parameter in named), dtype
+
+
 @torch.inference_mode()
 def generate_tokens(
     model: SPALMERCausalLM,
@@ -154,7 +203,6 @@ def generate_tokens(
     if max_new_tokens == 0:
         return generated
     was_training = model.training
-    previous_residency = model.active_experts_override if dynamic_residency else None
     model.eval()
     try:
         if dynamic_residency:
@@ -187,7 +235,7 @@ def generate_tokens(
             channel_states = output.channel_mixer_states
     finally:
         if dynamic_residency:
-            model.set_active_experts(previous_residency)
+            model.end_residency_request()
         model.train(was_training)
     return generated
 

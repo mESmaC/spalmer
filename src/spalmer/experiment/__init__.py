@@ -11,6 +11,8 @@ from .evaluation import (
 )
 from .planning import (
     DEFAULT_SEARCH_SPACE,
+    ATXYScaleConfig,
+    DirectionalScaleConfig,
     ExplicitVocabularyPolicy,
     MemoryAssumptions,
     MemoryEstimate,
@@ -56,6 +58,7 @@ from .telemetry import (
 )
 
 __all__ = [
+    "ATXYScaleConfig",
     "ArtifactHashes",
     "CheckpointBinding",
     "CausalBatchStats",
@@ -65,6 +68,7 @@ __all__ = [
     "CrossStratumMetrics",
     "DEFAULT_SEARCH_SPACE",
     "DependencyProvenance",
+    "DirectionalScaleConfig",
     "EvaluationStratum",
     "ExplicitVocabularyPolicy",
     "GitProvenance",

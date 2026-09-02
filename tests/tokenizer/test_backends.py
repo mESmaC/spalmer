@@ -91,6 +91,16 @@ def test_rpd_adapter_is_deterministic_and_exposes_all_special_roles(tmp_path: Pa
     assert first.identity.source != copied.identity.source
 
 
+def test_rpd_adapter_can_render_invalid_generated_byte_sequences_safely() -> None:
+    vocab = build_demo_vocab()
+    invalid_byte = next(entry.token_id for entry in vocab.entries if entry.byte == 0xFF)
+    adapter = RPDTokenizerAdapter(vocab)
+
+    with pytest.raises(UnicodeDecodeError):
+        adapter.decode([invalid_byte])
+    assert adapter.decode([invalid_byte], errors="replace") == "\ufffd"
+
+
 def test_special_assignment_is_part_of_adapter_identity() -> None:
     vocab = build_demo_vocab()
     first_special = len(vocab)

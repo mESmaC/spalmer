@@ -13,6 +13,7 @@ from spalmer.training.engine import (
 )
 from spalmer.training.evaluation import ModelEvaluationReport, evaluate_model_batches
 from spalmer.training.optim import (
+    BF16MasterAdamW,
     OptimizerBundle,
     ParameterGroups,
     build_optimizers,
@@ -27,6 +28,7 @@ from spalmer.training.resume import (
 )
 
 __all__ = [
+    "BF16MasterAdamW",
     "OptimizerBundle",
     "ParameterGroups",
     "RuntimeDevice",

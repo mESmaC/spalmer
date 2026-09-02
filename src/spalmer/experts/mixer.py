@@ -93,43 +93,34 @@ class MicroExpertChannelMixer(nn.Module):
         # the same state under every layer-local bank.
         object.__setattr__(self, "_potentiation_controller_ref", ref(potentiation_controller))
         object.__setattr__(self, "_residency_ref", ref(residency))
-        self._active_experts_override: int | None = None
 
     @property
     def active_experts(self) -> int:
-        """Per-token top-``k``: the override if one is set, else the config value."""
+        """Per-token top-``k`` shared with every layer through residency."""
 
-        if self._active_experts_override is not None:
-            return self._active_experts_override
-        return self.config.active_experts
+        return self.residency.active_experts
 
     @property
     def active_experts_override(self) -> int | None:
         """Per-token top-``k`` override currently applied, or ``None``."""
 
-        return self._active_experts_override
+        return self.residency.active_experts_override
 
     @property
     def max_active_experts(self) -> int:
         """Upper bound of the per-token top-``k`` (bounded by the bank size)."""
 
-        return min(self.config.max_active_experts, self.config.num_experts)
+        return self.residency.max_active_experts
 
     def set_active_experts(self, count: int | None) -> None:
         """Override the per-token top-``k``; ``None`` restores the configured value.
 
-        This does not change residency. Growing capacity for a request is the
-        job of :class:`ExpertResidency` (explicit ids), never of this knob.
+        This does not change resident identities. The inference controller
+        grows identities and this shared execution capacity together through
+        :class:`ExpertResidency`.
         """
 
-        if count is not None and not (
-            self.config.min_active_experts <= count <= self.max_active_experts
-        ):
-            raise ValueError(
-                f"active expert count must be in [{self.config.min_active_experts}, "
-                f"{self.max_active_experts}]; got {count}"
-            )
-        self._active_experts_override = count
+        self.residency.set_active_experts(count)
 
     @property
     def potentiation_controller(self) -> ExpertPotentiationController:
@@ -219,6 +210,7 @@ class MicroExpertChannelMixer(nn.Module):
             "expert_quantization_error": quantization_error,
             "promoted_experts": controller.promoted_mask.detach().clone(),
             "resident_experts": resident_mask.detach().clone(),
+            "active_experts_per_token": num_active,
             # Distinct experts executed this pass, kept on device (no sync).
             "num_active_experts": (utilization > 0).sum(),
         }

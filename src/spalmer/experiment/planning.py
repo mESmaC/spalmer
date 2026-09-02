@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 
 def _require_positive(name: str, value: int) -> None:
@@ -22,6 +23,66 @@ def _require_positive(name: str, value: int) -> None:
 def _canonical_digest(payload: object) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class DirectionalScaleConfig:
+    """Countable configuration for the optional lateral/silencing branch."""
+
+    num_feature_groups: int = 4
+    lateral_rank: int = 16
+
+    def __post_init__(self) -> None:
+        if self.num_feature_groups < 2:
+            raise ValueError("num_feature_groups must be at least 2")
+        _require_positive("lateral_rank", self.lateral_rank)
+
+    def parameters_per_layer(self, d_model: int) -> int:
+        if d_model % self.num_feature_groups:
+            raise ValueError("num_feature_groups must divide d_model")
+        group_width = d_model // self.num_feature_groups
+        return 2 * self.num_feature_groups * self.lateral_rank + 2 * group_width + 2
+
+
+@dataclass(frozen=True, slots=True)
+class ATXYScaleConfig:
+    """Countable configuration for the optional exact-memory path."""
+
+    value_dim: int
+    a_cardinality: int
+    t_cardinality: int
+    x_cardinality: int
+    y_cardinality: int
+    injection_layer: int = 0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "value_dim",
+            "a_cardinality",
+            "t_cardinality",
+            "x_cardinality",
+            "y_cardinality",
+        ):
+            _require_positive(name, int(getattr(self, name)))
+        if self.injection_layer < 0:
+            raise ValueError("injection_layer must be non-negative")
+
+    @property
+    def cardinalities(self) -> tuple[int, int, int, int]:
+        return (
+            self.a_cardinality,
+            self.t_cardinality,
+            self.x_cardinality,
+            self.y_cardinality,
+        )
+
+    def parameter_count(self, d_model: int) -> int:
+        return (
+            sum(self.cardinalities) * d_model
+            + d_model * d_model
+            + self.value_dim * d_model
+            + 1
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,11 +101,20 @@ class ModelScaleConfig:
     num_experts: int
     expert_width: int
     ple_expansion: int
+    shared_width: int | None = None
     q_latent_dim: int | None = None
     kv_latent_dim: int | None = None
     conv_width: int = 4
     conv_bias: bool = False
     router_bias: bool = False
+    active_experts: int = 2
+    min_resident_experts: int = 2
+    max_resident_experts: int = 20
+    expert_weight_format: Literal["mxfp4", "nvfp4"] = "mxfp4"
+    expert_activation_format: Literal["mxfp8"] = "mxfp8"
+    expert_master_dtype: Literal["bfloat16"] = "bfloat16"
+    directional: DirectionalScaleConfig | None = None
+    atxy: ATXYScaleConfig | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -56,8 +126,13 @@ class ModelScaleConfig:
             "expert_width",
             "ple_expansion",
             "conv_width",
+            "active_experts",
+            "min_resident_experts",
+            "max_resident_experts",
         ):
             _require_positive(name, int(getattr(self, name)))
+        if self.shared_width is not None:
+            _require_positive("shared_width", self.shared_width)
         if self.n_layers % 4:
             raise ValueError("n_layers must be a multiple of 4 for the 3:1 KDA/MLA cycle")
         if self.d_model % self.num_heads:
@@ -68,6 +143,25 @@ class ModelScaleConfig:
             _require_positive("q_latent_dim", self.q_latent_dim)
         if self.kv_latent_dim is not None:
             _require_positive("kv_latent_dim", self.kv_latent_dim)
+        if self.active_experts < 2:
+            raise ValueError("active_experts must preserve the architecture's two-expert floor")
+        if not self.active_experts <= self.min_resident_experts <= self.max_resident_experts:
+            raise ValueError(
+                "expert counts must satisfy active_experts <= min_resident_experts "
+                "<= max_resident_experts"
+            )
+        if self.min_resident_experts > self.num_experts:
+            raise ValueError("min_resident_experts cannot exceed num_experts")
+        if self.expert_weight_format not in {"mxfp4", "nvfp4"}:
+            raise ValueError("expert_weight_format must be 'mxfp4' or 'nvfp4'")
+        if self.expert_activation_format != "mxfp8":
+            raise ValueError("expert_activation_format must be 'mxfp8'")
+        if self.expert_master_dtype != "bfloat16":
+            raise ValueError("expert_master_dtype must be 'bfloat16'")
+        if self.directional is not None:
+            self.directional.parameters_per_layer(self.d_model)
+        if self.atxy is not None and self.atxy.injection_layer >= self.n_layers:
+            raise ValueError("ATXY injection_layer must be below n_layers")
 
     @property
     def head_dim(self) -> int:
@@ -82,6 +176,10 @@ class ModelScaleConfig:
         return self.kv_latent_dim or max(self.head_dim, self.d_model // 4)
 
     @property
+    def resolved_shared_width(self) -> int:
+        return self.shared_width or 2 * self.d_model
+
+    @property
     def kda_layers(self) -> int:
         return self.n_layers * 3 // 4
 
@@ -89,7 +187,7 @@ class ModelScaleConfig:
     def mla_layers(self) -> int:
         return self.n_layers // 4
 
-    def to_dict(self) -> dict[str, int | bool | None]:
+    def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
 
@@ -102,8 +200,11 @@ class ParameterBreakdown:
     kda_mixers: int
     mla_mixers: int
     block_norms: int
+    shared_channel: int
     router: int
     expert_banks: int
+    directional: int
+    atxy: int
     lm_head: int
 
     @property
@@ -115,15 +216,55 @@ class ParameterBreakdown:
                 self.kda_mixers,
                 self.mla_mixers,
                 self.block_norms,
+                self.shared_channel,
                 self.router,
                 self.expert_banks,
+                self.directional,
+                self.atxy,
                 self.lm_head,
             )
         )
 
     @property
+    def embeddings(self) -> int:
+        """All PLE tensors, matching ``account_parameters(...).components``."""
+
+        return self.ple_lookup + self.ple_controls
+
+    @property
+    def attention(self) -> int:
+        """All KDA and MLA tensors."""
+
+        return self.kda_mixers + self.mla_mixers
+
+    @property
+    def norms(self) -> int:
+        return self.block_norms
+
+    @property
+    def expert_pool(self) -> int:
+        return self.expert_banks
+
+    @property
+    def components(self) -> dict[str, int]:
+        """Component map with the same ownership keys as measured accounting."""
+
+        return {
+            "embeddings": self.embeddings,
+            "attention": self.attention,
+            "norms": self.norms,
+            "shared_channel": self.shared_channel,
+            "router": self.router,
+            "expert_pool": self.expert_pool,
+            "directional": self.directional,
+            "atxy": self.atxy,
+            "vocab_head": self.lm_head,
+            "other": 0,
+        }
+
+    @property
     def low_bit_candidates(self) -> int:
-        """Parameters currently represented by fake-QAT PLE/expert shadows."""
+        """Parameters whose forward representations are derived at low precision."""
 
         return self.ple_lookup + self.expert_banks
 
@@ -186,12 +327,21 @@ def count_parameters(config: ModelScaleConfig) -> ParameterBreakdown:
     )
     mla_mixers = config.mla_layers * one_mla
 
-    # Two pre-norm weights per block and one final RMSNorm weight.
-    block_norms = (2 * config.n_layers + 1) * d
+    # Two ordinary pre-norm weights per block, an additional pre-norm when the
+    # directional branch is enabled, and one final RMSNorm weight.
+    norms_per_block = 3 if config.directional is not None else 2
+    block_norms = (norms_per_block * config.n_layers + 1) * d
+    shared_channel = config.n_layers * 3 * d * config.resolved_shared_width
     router = d * config.num_experts + (config.num_experts if config.router_bias else 0)
     expert_banks = (
         config.n_layers * config.num_experts * 3 * d * config.expert_width
     )
+    directional = (
+        0
+        if config.directional is None
+        else config.n_layers * config.directional.parameters_per_layer(d)
+    )
+    atxy = 0 if config.atxy is None else config.atxy.parameter_count(d)
     lm_head = d * config.vocab_size
     return ParameterBreakdown(
         ple_lookup=ple_lookup,
@@ -199,8 +349,11 @@ def count_parameters(config: ModelScaleConfig) -> ParameterBreakdown:
         kda_mixers=kda_mixers,
         mla_mixers=mla_mixers,
         block_norms=block_norms,
+        shared_channel=shared_channel,
         router=router,
         expert_banks=expert_banks,
+        directional=directional,
+        atxy=atxy,
         lm_head=lm_head,
     )
 
@@ -211,22 +364,26 @@ class MemoryAssumptions:
 
     Activations, logits, caches, input batches, allocator fragmentation, and
     distributed communication buffers are intentionally excluded.  The
-    reference defaults mirror the current engine: FP32 persistent parameters,
-    FP32 gradients, two FP32 optimizer slots, and no separate master copy.
+    reference defaults mirror the selected base-pretraining lane: one BF16
+    persistent/master parameter payload, BF16 gradients, two FP32 optimizer
+    slots, and no duplicate FP32 weight copy.
 
-    The ``hypothetical_*`` fields describe a future packed-weight training lane,
-    not the current fake-QAT implementation.  That estimate retains a separate
-    FP32 master copy because packed weights would not themselves be directly
-    updateable by the optimizer.
+    The ``hypothetical_*`` fields describe optionally caching a packed forward
+    payload beside the BF16 master. The current QAT correctness lane derives
+    quantized operands per call and does not retain that extra packed copy.
     """
 
-    reference_weight_bits: int = 32
-    reference_gradient_bits: int = 32
+    reference_weight_bits: int = 16
+    reference_gradient_bits: int = 16
     optimizer_state_bits: int = 32
     optimizer_slots: int = 2
     hypothetical_packed_base_weight_bits: int = 16
-    hypothetical_packed_low_bit_bits: int = 4
-    hypothetical_master_weight_bits: int = 32
+    # Four data bits plus a conservative half-bit/value allowance for block
+    # scales (NVFP4 is 8 scale bits per 16 values; MXFP4 needs less).
+    # Tensor-level scales and backend-specific alignment padding remain outside
+    # this rough estimate and are called out in the result documentation.
+    hypothetical_packed_low_bit_bits: float = 4.5
+    hypothetical_master_weight_bits: int = 16
     overhead_fraction: float = 0.10
 
     def __post_init__(self) -> None:
@@ -235,12 +392,13 @@ class MemoryAssumptions:
             "reference_gradient_bits",
             "optimizer_state_bits",
             "hypothetical_packed_base_weight_bits",
-            "hypothetical_packed_low_bit_bits",
         ):
             value = getattr(self, name)
             _require_positive(name, value)
             if value % 2:
                 raise ValueError(f"{name} must be divisible by 2")
+        if self.hypothetical_packed_low_bit_bits <= 0:
+            raise ValueError("hypothetical_packed_low_bit_bits must be positive")
         if (
             self.hypothetical_master_weight_bits < 0
             or self.hypothetical_master_weight_bits % 2
@@ -258,9 +416,11 @@ class MemoryAssumptions:
 class MemoryEstimate:
     """Persistent-state estimates; activation memory is not included.
 
-    ``reference_*`` is the current FP32 parameter/gradient lane.
-    ``hypothetical_*`` assumes future packed execution weights plus a distinct
-    master copy; the fake-QAT implementation does not realize those weights.
+    ``reference_*`` is the current BF16 master/gradient lane. ``hypothetical_*``
+    adds cached packed execution weights beside the same BF16 master; the QAT
+    correctness backend does not retain that cache. Packed estimates include
+    a conservative block-scale allowance but exclude tensor-level metadata and
+    backend alignment padding.
     """
 
     reference_weights_bytes: int
@@ -280,7 +440,7 @@ class MemoryEstimate:
 
     @property
     def gradients_bytes(self) -> int:
-        """Compatibility alias for current FP32 reference gradients."""
+        """Compatibility alias for current BF16 reference gradients."""
 
         return self.reference_gradients_bytes
 
@@ -315,15 +475,15 @@ class MemoryEstimate:
         return values
 
 
-def _bits_to_bytes(parameters: int, bits: int) -> int:
-    return (parameters * bits + 7) // 8
+def _bits_to_bytes(parameters: int, bits: int | float) -> int:
+    return math.ceil(parameters * bits / 8)
 
 
 def estimate_memory(
     parameters: ParameterBreakdown,
     assumptions: MemoryAssumptions = MemoryAssumptions(),
 ) -> MemoryEstimate:
-    """Estimate current FP32 fake-QAT and hypothetical packed persistent memory."""
+    """Estimate BF16-master QAT and an optional cached packed-weight lane."""
 
     reference_weights = _bits_to_bytes(parameters.total, assumptions.reference_weight_bits)
     packed_weights = _bits_to_bytes(
@@ -401,6 +561,7 @@ class ScaleSearchSpace:
     num_heads: tuple[int, ...] = (2, 4, 8)
     num_experts: int = 200
     expert_width_divisors: tuple[int, ...] = (2, 4, 8, 16)
+    shared_width_multipliers: tuple[int, ...] = (1, 2, 4)
     ple_expansions: tuple[int, ...] = (2, 4)
 
     def __post_init__(self) -> None:
@@ -409,6 +570,7 @@ class ScaleSearchSpace:
             "n_layers",
             "num_heads",
             "expert_width_divisors",
+            "shared_width_multipliers",
             "ple_expansions",
         ):
             values = getattr(self, name)
@@ -466,6 +628,9 @@ def plan_configuration(
     *,
     search_space: ScaleSearchSpace = DEFAULT_SEARCH_SPACE,
     memory_assumptions: MemoryAssumptions = MemoryAssumptions(),
+    expert_weight_format: Literal["mxfp4", "nvfp4"] = "mxfp4",
+    directional: DirectionalScaleConfig | None = None,
+    atxy: ATXYScaleConfig | None = None,
 ) -> ScalePlan:
     """Choose the enumerated shape nearest an explicit total parameter target."""
 
@@ -473,8 +638,12 @@ def plan_configuration(
     _require_positive("vocab_size", vocab_size)
     candidates: list[tuple[tuple[int, ...], ModelScaleConfig, ParameterBreakdown]] = []
     for d_model in sorted(set(search_space.d_models)):
+        if directional is not None and d_model % directional.num_feature_groups:
+            continue
         for n_layers in sorted(set(search_space.n_layers)):
             if n_layers % 4:
+                continue
+            if atxy is not None and atxy.injection_layer >= n_layers:
                 continue
             for num_heads in sorted(set(search_space.num_heads)):
                 if d_model % num_heads:
@@ -482,29 +651,38 @@ def plan_configuration(
                 for divisor in sorted(set(search_space.expert_width_divisors)):
                     if d_model % divisor:
                         continue
-                    for expansion in sorted(set(search_space.ple_expansions)):
-                        config = ModelScaleConfig(
-                            vocab_size=vocab_size,
-                            d_model=d_model,
-                            n_layers=n_layers,
-                            num_heads=num_heads,
-                            num_experts=search_space.num_experts,
-                            expert_width=d_model // divisor,
-                            ple_expansion=expansion,
-                        )
-                        breakdown = count_parameters(config)
-                        # Target distance dominates; stable tie-breakers prefer
-                        # fewer shadow weights, then the simpler shape.
-                        key = (
-                            abs(breakdown.total - target_parameters),
-                            breakdown.low_bit_candidates,
-                            n_layers,
-                            d_model,
-                            num_heads,
-                            divisor,
-                            expansion,
-                        )
-                        candidates.append((key, config, breakdown))
+                    for shared_multiplier in sorted(
+                        set(search_space.shared_width_multipliers)
+                    ):
+                        for expansion in sorted(set(search_space.ple_expansions)):
+                            config = ModelScaleConfig(
+                                vocab_size=vocab_size,
+                                d_model=d_model,
+                                n_layers=n_layers,
+                                num_heads=num_heads,
+                                num_experts=search_space.num_experts,
+                                expert_width=d_model // divisor,
+                                shared_width=d_model * shared_multiplier,
+                                ple_expansion=expansion,
+                                max_resident_experts=min(20, search_space.num_experts),
+                                expert_weight_format=expert_weight_format,
+                                directional=directional,
+                                atxy=atxy,
+                            )
+                            breakdown = count_parameters(config)
+                            # Target distance dominates; stable tie-breakers prefer
+                            # the smaller low-bit footprint and simpler shape.
+                            key = (
+                                abs(breakdown.total - target_parameters),
+                                breakdown.low_bit_candidates,
+                                n_layers,
+                                d_model,
+                                num_heads,
+                                divisor,
+                                shared_multiplier,
+                                expansion,
+                            )
+                            candidates.append((key, config, breakdown))
     if not candidates:
         raise ValueError("search_space contains no valid 3:1 KDA/MLA configurations")
     _, config, breakdown = min(candidates, key=lambda candidate: candidate[0])
@@ -522,6 +700,9 @@ def plan_ladder(
     *,
     search_space: ScaleSearchSpace = DEFAULT_SEARCH_SPACE,
     memory_assumptions: MemoryAssumptions = MemoryAssumptions(),
+    expert_weight_format: Literal["mxfp4", "nvfp4"] = "mxfp4",
+    directional: DirectionalScaleConfig | None = None,
+    atxy: ATXYScaleConfig | None = None,
 ) -> tuple[ScalePlan, ...]:
     """Plan several scales, resolving vocabulary size independently per rung."""
 
@@ -536,13 +717,18 @@ def plan_ladder(
                 vocab_size,
                 search_space=search_space,
                 memory_assumptions=memory_assumptions,
+                expert_weight_format=expert_weight_format,
+                directional=directional,
+                atxy=atxy,
             )
         )
     return tuple(plans)
 
 
 __all__ = [
+    "ATXYScaleConfig",
     "DEFAULT_SEARCH_SPACE",
+    "DirectionalScaleConfig",
     "ExplicitVocabularyPolicy",
     "MemoryAssumptions",
     "MemoryEstimate",

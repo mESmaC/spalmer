@@ -20,7 +20,7 @@ from spalmer.experiment import ExplicitVocabularyPolicy, plan_ladder
 from spalmer.experts import MicroExpertsConfig
 from spalmer.factory import build_spalmer_model
 from spalmer.runtime import generate_tokens, train_token_stream
-from spalmer.tokenizer import Encoder, Sample, TrainerConfig, train
+from spalmer.tokenizer import Encoder, Sample, TokenizerBackend, TrainerConfig, Vocab, train
 from spalmer.tokenizer.backends import (
     HFTokenizerAdapter,
     RPDTokenizerAdapter,
@@ -81,6 +81,12 @@ def _plan_parser() -> argparse.ArgumentParser:
         required=True,
         help="one explicit vocabulary size per target, in the same order",
     )
+    parser.add_argument(
+        "--expert-weight-format",
+        choices=("mxfp4", "nvfp4"),
+        default="mxfp4",
+        help="routed-expert QAT forward-weight format recorded in each plan",
+    )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     return parser
 
@@ -136,7 +142,23 @@ def _training_parser() -> argparse.ArgumentParser:
     parser.add_argument("--experts", type=int, default=16)
     parser.add_argument("--active-experts", type=int, default=2)
     parser.add_argument("--expert-width", type=int)
-    parser.add_argument("--expert-quant-bits", type=int, default=4)
+    parser.add_argument(
+        "--expert-weight-format",
+        choices=("mxfp4", "nvfp4"),
+        default="mxfp4",
+        help="routed-expert QAT forward-weight format",
+    )
+    parser.add_argument(
+        "--expert-qat-backend",
+        choices=("auto", "reference", "native"),
+        default="auto",
+        help="auto/reference emulate W4A8 today; native fails unless a real kernel is available",
+    )
+    parser.add_argument(
+        "--expert-promotion-format",
+        choices=("mxfp8", "bfloat16"),
+        default="mxfp8",
+    )
     parser.add_argument("--potentiation-budget", type=int, default=2)
     parser.add_argument("--potentiation-warmup-steps", type=int, default=4)
     parser.add_argument("--potentiation-hold-steps", type=int, default=8)
@@ -189,14 +211,18 @@ def _run_plan(args: argparse.Namespace) -> None:
     ):
         raise SystemExit("vocabulary size must increase at every larger model target")
     policy = ExplicitVocabularyPolicy(tuple(zip(args.targets, args.vocab_sizes, strict=True)))
-    plans = plan_ladder(tuple(args.targets), policy)
+    plans = plan_ladder(
+        tuple(args.targets),
+        policy,
+        expert_weight_format=args.expert_weight_format,
+    )
     if args.json:
         print(json.dumps([plan.to_dict() for plan in plans], indent=2))
         return
     header = (
         f"{'target':>12} {'planned':>12} {'error':>9} {'vocab':>8} "
         f"{'d':>5} {'L':>3} {'h':>3} {'E':>4} {'expert':>7} {'PLE':>4} "
-        f"{'ref GiB':>9} {'packed GiB':>11}"
+        f"{'BF16 GiB':>9} {'cached W4':>11}"
     )
     print(header)
     print("-" * len(header))
@@ -319,6 +345,7 @@ def _run(args: argparse.Namespace) -> None:
     encoder = Encoder(vocab)
     token_ids = torch.tensor(encoder.encode(text, kind=args.kind), dtype=torch.long)
     head_dim = args.d_model // args.heads
+    device = torch.device(args.device)
 
     config = SPALMERConfig(
         vocab_size=len(vocab),
@@ -351,7 +378,11 @@ def _run(args: argparse.Namespace) -> None:
         expert_inter_dim=args.expert_width,
         active_experts=args.active_experts,
         max_active_experts=min(20, args.experts),
-        expert_quant_bits=args.expert_quant_bits,
+        expert_weight_format=args.expert_weight_format,
+        expert_activation_format="mxfp8",
+        expert_master_dtype="bfloat16",
+        expert_qat_backend=args.expert_qat_backend,
+        expert_promotion_format=args.expert_promotion_format,
         potentiation_budget=args.potentiation_budget,
         potentiation_warmup_steps=args.potentiation_warmup_steps,
         potentiation_hold_steps=args.potentiation_hold_steps,
@@ -359,9 +390,18 @@ def _run(args: argparse.Namespace) -> None:
         residency_min_gain=args.residency_min_gain,
     )
     model = build_spalmer_model(config, kda_config, mla_config, experts_config)
-    device = torch.device(args.device)
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    dtype = torch.bfloat16
     model.to(device=device, dtype=dtype)
+    qat_status = model.backbone.blocks[0].channel_mixer.experts.qat_backend_status
+    print(
+        "expert QAT: "
+        f"weights={experts_config.expert_weight_format} "
+        f"activations={experts_config.expert_activation_format} "
+        f"master={experts_config.expert_master_dtype} "
+        f"backend={qat_status.selected_backend or 'unavailable'} "
+        f"emulated={qat_status.emulated}",
+        flush=True,
+    )
 
     def report(step: int, loss: float) -> None:
         interval = max(1, args.steps // 10)
@@ -425,14 +465,19 @@ def _run(args: argparse.Namespace) -> None:
 
 def _run_generate(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
-    model, vocab, metadata = load_checkpoint(args.checkpoint, map_location="cpu")
+    model, tokenizer, metadata = load_checkpoint(args.checkpoint, map_location="cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     model.to(device=device, dtype=dtype)
     model.eval()
 
-    encoder = Encoder(vocab)
     prompt_kind = args.kind or metadata.get("kind", "mixed")
-    prompt_ids = torch.tensor(encoder.encode(args.prompt, kind=prompt_kind), dtype=torch.long)
+    if isinstance(tokenizer, Vocab):
+        encoded_prompt = Encoder(tokenizer).encode(args.prompt, kind=prompt_kind)
+    elif isinstance(tokenizer, TokenizerBackend):
+        encoded_prompt = tokenizer.encode(args.prompt, kind=prompt_kind)
+    else:  # The checkpoint boundary should make this unreachable.
+        raise TypeError(f"unsupported checkpoint tokenizer: {type(tokenizer).__name__}")
+    prompt_ids = torch.tensor(encoded_prompt, dtype=torch.long)
     if prompt_ids.numel() == 0:
         raise ValueError("prompt must encode to at least one token")
     generated_ids = generate_tokens(
@@ -443,8 +488,19 @@ def _run_generate(args: argparse.Namespace) -> None:
         top_k=args.top_k,
         dynamic_residency=args.dynamic_residency,
     )
-    payload = b"".join(vocab.get(int(token)).payload() for token in generated_ids[0])
-    print(_terminal_safe_text(payload.decode("utf-8", errors="replace")))
+    decoded_ids = generated_ids[0].detach().cpu().tolist()
+    if isinstance(tokenizer, Vocab):
+        payload = b"".join(tokenizer.get(token).payload() for token in decoded_ids)
+        generated = payload.decode("utf-8", errors="replace")
+    elif isinstance(tokenizer, RPDTokenizerAdapter):
+        generated = tokenizer.decode(
+            decoded_ids,
+            skip_special_tokens=False,
+            errors="replace",
+        )
+    else:
+        generated = tokenizer.decode(decoded_ids, skip_special_tokens=False)
+    print(_terminal_safe_text(generated))
 
 
 def _terminal_safe_text(text: str, *, encoding: str | None = None) -> str:

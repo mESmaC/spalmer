@@ -11,9 +11,10 @@ from typing import Any, Literal
 class TrainingConfig:
     """Runtime controls independent of the model and corpus definitions.
 
-    Parameters remain FP32 while BF16 autocast supplies the accelerator compute
-    lane.  This gives AdamW FP32 parameters and moment state without maintaining
-    a second hand-written shadow copy.
+    Base pretraining defaults to one BF16 persistent parameter/master copy.
+    Routed-expert QAT derives FP4 execution values from that copy; it does not
+    retain a duplicate FP32 weight tensor. Adam moments remain FP32 and are a
+    separate optimizer-state choice.
     """
 
     max_steps: int
@@ -33,7 +34,10 @@ class TrainingConfig:
     device: str = "cuda"
     require_cuda: bool = True
     compute_dtype: Literal["bfloat16", "float32"] = "bfloat16"
-    parameter_dtype: Literal["float32"] = "float32"
+    parameter_dtype: Literal["bfloat16", "float32"] = "bfloat16"
+    optimizer_state_dtype: Literal["float32"] = "float32"
+    stochastic_parameter_rounding: bool = True
+    optimizer_update_chunk_size: int = 1_048_576
     fused_adamw: Literal["auto", "on", "off"] = "auto"
     activation_checkpointing: bool = False
     deterministic_algorithms: bool = False
@@ -74,8 +78,17 @@ class TrainingConfig:
             raise ValueError("seed cannot be negative")
         if self.compute_dtype not in {"bfloat16", "float32"}:
             raise ValueError(f"unsupported compute_dtype: {self.compute_dtype!r}")
-        if self.parameter_dtype != "float32":
-            raise ValueError("the current persistent parameter lane must remain float32")
+        if self.parameter_dtype not in {"bfloat16", "float32"}:
+            raise ValueError(f"unsupported parameter_dtype: {self.parameter_dtype!r}")
+        if self.optimizer_state_dtype != "float32":
+            raise ValueError("the current optimizer-state lane must remain float32")
+        if self.optimizer_update_chunk_size <= 0:
+            raise ValueError("optimizer_update_chunk_size must be positive")
+        if self.parameter_dtype == "bfloat16" and self.fused_adamw == "on":
+            raise ValueError(
+                "fused_adamw='on' cannot preserve FP32 moments with a BF16-only "
+                "master; choose 'auto' or 'off'"
+            )
         if self.fused_adamw not in {"auto", "on", "off"}:
             raise ValueError(f"unsupported fused_adamw policy: {self.fused_adamw!r}")
 

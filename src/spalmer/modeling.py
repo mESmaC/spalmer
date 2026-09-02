@@ -379,6 +379,8 @@ class SPALMERCausalLM(nn.Module):
     def active_experts(self) -> int | None:
         """Experts executed per token by the routed channel mixers, if any."""
 
+        if self.residency is not None:
+            return self.residency.active_experts
         for block in self.backbone.blocks:
             count = getattr(block.channel_mixer, "active_experts", None)
             if isinstance(count, int):
@@ -389,6 +391,8 @@ class SPALMERCausalLM(nn.Module):
     def active_experts_override(self) -> int | None:
         """Per-token top-``k`` override applied to the routed mixers, or ``None``."""
 
+        if self.residency is not None:
+            return self.residency.active_experts_override
         for block in self.backbone.blocks:
             mixer = block.channel_mixer
             if hasattr(mixer, "active_experts_override"):
@@ -398,22 +402,25 @@ class SPALMERCausalLM(nn.Module):
     def set_active_experts(self, count: int | None) -> None:
         """Override the per-token top-``k`` on every routed channel mixer.
 
-        Any call also ends an open controller-managed residency request (the
-        resident set returns to what it was before that request), and ``None``
-        additionally clears every request-level override: the top-``k`` returns
-        to its configured value and the resident set to the full pool.
-        Capacity for a request is grown through :attr:`residency` (explicit
-        expert ids), never through this knob.
+        This changes execution capacity only. It deliberately does not change
+        resident identities or end a controller-managed request; callers must
+        use :meth:`end_residency_request` (or :meth:`residency_session`) when
+        they intend to restore request state.
         """
 
+        if self.residency is not None:
+            self.residency.set_active_experts(count)
+            return
         for block in self.backbone.blocks:
             setter = getattr(block.channel_mixer, "set_active_experts", None)
             if callable(setter):
                 setter(count)
+
+    def end_residency_request(self) -> None:
+        """End a dynamic expert request, restoring its prior ids and top-``k``."""
+
         if self.residency is not None:
             self.residency.end_request()
-            if count is None:
-                self.residency.reset()
 
     @property
     def resident_expert_ids(self) -> tuple[int, ...]:
@@ -429,7 +436,7 @@ class SPALMERCausalLM(nn.Module):
 
     @contextmanager
     def residency_session(self, ids: Sequence[int] | None = None) -> Iterator[SPALMERCausalLM]:
-        """Scope request-level residency; the prior resident set is restored on exit."""
+        """Scope request residency; prior identities and top-``k`` return on exit."""
 
         if self.residency is None:
             yield self

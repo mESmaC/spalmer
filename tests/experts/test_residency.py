@@ -35,6 +35,11 @@ def _build(num_experts: int = 8, **overrides: object):
         "active_experts": 2,
         "max_active_experts": 6,
         "potentiation_budget": 0,
+        "expert_weight_format": "legacy_int",
+        "expert_activation_format": "bfloat16",
+        "expert_master_dtype": "float32",
+        "expert_qat_backend": "reference",
+        "expert_promotion_format": "bfloat16",
     }
     values.update(overrides)
     experts = MicroExpertsConfig(**values)
@@ -43,7 +48,7 @@ def _build(num_experts: int = 8, **overrides: object):
     return model, vocab, (kda, mla, experts)
 
 
-def test_topk_override_is_bounded_and_none_clears_every_request_override() -> None:
+def test_topk_override_is_bounded_and_never_changes_resident_ids() -> None:
     model, _, _ = _build()
     assert model.active_experts == 2
     model.set_active_experts(4)
@@ -55,7 +60,8 @@ def test_topk_override_is_bounded_and_none_clears_every_request_override() -> No
     model.residency.set([0, 3, 5, 6])
     model.set_active_experts(None)
     assert model.active_experts == 2
-    assert model.resident_expert_ids == tuple(range(8))
+    assert model.resident_expert_ids == (0, 3, 5, 6)
+    model.residency.reset()
 
 
 def test_controller_starts_at_minimum_and_adds_explicit_ids_up_to_the_cap() -> None:
@@ -67,7 +73,9 @@ def test_controller_starts_at_minimum_and_adds_explicit_ids_up_to_the_cap() -> N
     decision = choose_inference_residency(model, prompt, min_gain=-1.0)
     assert [count for count, _ in decision.trace] == [2, 4, 6]
     assert decision.resident_count == 6
-    assert decision.active_experts == 2  # the per-token top-k never moved
+    assert decision.active_experts == 6
+    assert model.active_experts == 6
+    assert model.parameter_accounting().active_experts_per_token == 6
     assert model.resident_expert_ids == decision.resident_ids
     # Each expansion added explicit new ids while preserving the earlier set.
     seen = set(decision.trace and default_ids(model))
@@ -77,7 +85,10 @@ def test_controller_starts_at_minimum_and_adds_explicit_ids_up_to_the_cap() -> N
     assert seen == set(decision.resident_ids)
     assert decision.effective_nll is not None and decision.effective_nll > 0
     assert decision.output.logits.shape[1] == prompt.shape[1]
-    model.residency.reset()
+    for metrics in decision.output.layer_metrics:
+        assert metrics["expert_ids"].shape[-1] == 6
+        assert metrics["active_experts_per_token"] == 6
+    model.end_residency_request()
 
 
 def default_ids(model) -> tuple[int, ...]:
@@ -92,8 +103,13 @@ def test_controller_rolls_back_an_expansion_that_does_not_pay() -> None:
     assert [count for count, _ in decision.trace] == [2, 4]
     assert decision.resident_ids == (0, 1)
     assert decision.expansions == ()
+    assert decision.active_experts == 2
+    assert model.active_experts == 2
     assert model.resident_expert_ids == (0, 1)
-    model.residency.reset()
+    for metrics in decision.output.layer_metrics:
+        assert metrics["expert_ids"].shape[-1] == 2
+        assert metrics["active_experts_per_token"] == 2
+    model.end_residency_request()
 
 
 def test_controller_retains_the_minimum_when_surprise_is_below_average() -> None:
@@ -105,8 +121,9 @@ def test_controller_retains_the_minimum_when_surprise_is_below_average() -> None
     decision = choose_inference_residency(model, prompt)
     assert decision.trace == ((2, decision.effective_signal),)
     assert decision.resident_ids == (0, 1)
+    assert decision.active_experts == 2
     assert decision.average_surprise == 1000.0
-    model.residency.reset()
+    model.end_residency_request()
 
 
 def test_single_token_prompt_uses_predictive_entropy() -> None:
@@ -115,7 +132,7 @@ def test_single_token_prompt_uses_predictive_entropy() -> None:
     decision = choose_inference_residency(model, prompt, min_gain=10.0)
     assert decision.effective_nll is None
     assert decision.effective_signal == decision.predictive_entropy
-    model.residency.reset()
+    model.end_residency_request()
 
 
 def test_explicit_initial_ids_are_honored() -> None:
@@ -123,7 +140,18 @@ def test_explicit_initial_ids_are_honored() -> None:
     prompt = torch.tensor([Encoder(vocab).encode("alpha beta gamma")])
     decision = choose_inference_residency(model, prompt, initial_ids=(5, 2), min_gain=10.0)
     assert decision.resident_ids == (2, 5)
-    model.residency.reset()
+    assert decision.active_experts == 2
+    model.end_residency_request()
+
+
+def test_explicit_initial_ids_cannot_bypass_the_execution_cap() -> None:
+    model, vocab, _ = _build(max_resident_experts=8)
+    prompt = torch.tensor([Encoder(vocab).encode("alpha beta gamma")])
+    with pytest.raises(ValueError, match="controller cap of 6"):
+        choose_inference_residency(model, prompt, initial_ids=tuple(range(7)))
+    assert not model.residency.request_open
+    assert model.resident_expert_ids == tuple(range(8))
+    assert model.active_experts == 2
 
 
 def test_training_tracks_average_surprise_and_checkpoints_carry_it(tmp_path) -> None:
@@ -147,6 +175,14 @@ def test_training_tracks_average_surprise_and_checkpoints_carry_it(tmp_path) -> 
     payload["model_state"].pop("surprise_observations")
     payload["experts_config"].pop("residency_increment")
     payload["experts_config"].pop("residency_min_gain")
+    for field in (
+        "expert_weight_format",
+        "expert_activation_format",
+        "expert_master_dtype",
+        "expert_qat_backend",
+        "expert_promotion_format",
+    ):
+        payload["experts_config"].pop(field)
     payload["metadata"]["average_surprise"] = 1.5
     legacy = tmp_path / "v2.pt"
     torch.save(payload, legacy)
@@ -159,6 +195,14 @@ def test_training_tracks_average_surprise_and_checkpoints_carry_it(tmp_path) -> 
     hybrid_payload["model_state"].pop("surprise_ema")
     hybrid_payload["experts_config"].pop("residency_increment")
     hybrid_payload["experts_config"].pop("residency_min_gain")
+    for field in (
+        "expert_weight_format",
+        "expert_activation_format",
+        "expert_master_dtype",
+        "expert_qat_backend",
+        "expert_promotion_format",
+    ):
+        hybrid_payload["experts_config"].pop(field)
     hybrid = tmp_path / "hybrid-v2.pt"
     torch.save(hybrid_payload, hybrid)
     with pytest.raises(RuntimeError, match="surprise_ema"):
@@ -193,3 +237,4 @@ def test_generation_restores_the_previous_residency_after_dynamic_prefill() -> N
     assert generated.shape == (1, prompt.numel() + 3)
     assert model.active_experts_override is None
     assert model.active_experts == 2
+    assert model.resident_expert_ids == tuple(range(8))

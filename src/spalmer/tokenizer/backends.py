@@ -249,7 +249,13 @@ class RPDTokenizerAdapter:
             raise AssertionError("RPD byte accounting must exactly cover the original input")
         return token_ids, byte_lengths
 
-    def decode(self, token_ids: Iterable[int], *, skip_special_tokens: bool = False) -> str:
+    def decode(
+        self,
+        token_ids: Iterable[int],
+        *,
+        skip_special_tokens: bool = False,
+        errors: str = "strict",
+    ) -> str:
         ids = _validated_token_ids(token_ids, self.vocab_size)
         assigned = self.special_tokens.assigned
         unknown_reserved = next(
@@ -269,7 +275,7 @@ class RPDTokenizerAdapter:
                     payload.extend(self._special_surface(token_id).encode("utf-8"))
                 continue
             payload.extend(self.vocab.get(token_id).payload())
-        return payload.decode("utf-8")
+        return payload.decode("utf-8", errors=errors)
 
     def _special_surface(self, token_id: int) -> str:
         roles = (

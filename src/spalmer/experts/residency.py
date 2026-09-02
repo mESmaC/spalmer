@@ -14,10 +14,12 @@ Two objects implement it:
 - :class:`ExpertResidency` is the resident identity set. It is one module
   shared by all layer-local banks (like the router and the potentiation
   controller), so expert ``e`` is resident in every layer or in none. Per-token
-  routing is restricted to residents; the per-token top-``k`` never changes
-  as part of residency. Expansion adds explicit expert ids and never removes
-  existing ones; rollback restores an exact earlier set. Outside a request the
-  full pool is resident, which is what training uses.
+  routing is restricted to residents. During a controller-managed request the
+  resident count is also the requested per-token top-``k`` (bounded by
+  ``max_active_experts``): accepted expansion therefore adds coherent expert
+  ids *and* executes the added capacity. Rollback restores both the exact id
+  set and the earlier top-``k``. Outside a request the full pool is resident,
+  which is what training uses.
 - :func:`choose_inference_residency` is the request-level controller applied
   at prefill. It starts from the minimum resident set, compares the prompt's
   effective surprise with the model's average surprise (C08: ``if effective
@@ -44,6 +46,14 @@ from spalmer.experts.config import MicroExpertsConfig
 from spalmer.modeling import CausalLMOutput, SPALMERCausalLM
 
 
+@dataclass(frozen=True, slots=True)
+class ResidencyState:
+    """Exact request-local residency and execution-capacity state."""
+
+    resident_ids: tuple[int, ...]
+    active_experts_override: int | None
+
+
 class ExpertResidency(nn.Module):
     """The resident expert identity set shared across layers.
 
@@ -59,7 +69,8 @@ class ExpertResidency(nn.Module):
         super().__init__()
         self.config = config
         self._ids: tuple[int, ...] = tuple(range(config.num_experts))
-        self._request_previous: tuple[int, ...] | None = None
+        self._active_experts_override: int | None = None
+        self._request_previous: ResidencyState | None = None
         self.register_buffer(
             "resident_mask",
             torch.ones(config.num_experts, dtype=torch.bool),
@@ -95,40 +106,82 @@ class ExpertResidency(nn.Module):
 
         return self._request_previous is not None
 
+    @property
+    def active_experts(self) -> int:
+        """Experts actually executed per token at the current capacity."""
+
+        if self._active_experts_override is not None:
+            return self._active_experts_override
+        return self.config.active_experts
+
+    @property
+    def active_experts_override(self) -> int | None:
+        """Explicit per-token execution capacity, or the configured default."""
+
+        return self._active_experts_override
+
+    @property
+    def max_active_experts(self) -> int:
+        """Largest per-token execution capacity supported by this expert pool."""
+
+        return min(self.config.max_active_experts, self.num_experts)
+
     def reset(self) -> None:
         """Make every expert resident (the training / no-request state)."""
 
         self._commit(tuple(range(self.num_experts)))
 
-    def begin_request(self, ids: Sequence[int]) -> tuple[int, ...]:
-        """Start a controller-managed request from ``ids``, remembering the prior set.
+    def begin_request(
+        self,
+        ids: Sequence[int],
+        *,
+        active_experts: int | None = None,
+    ) -> tuple[int, ...]:
+        """Start a request from ``ids`` and remember the complete prior state.
 
         Nested calls keep the outermost prior set so that :meth:`end_request`
-        always returns to the state before the first request.
+        always returns to the state before the first request. The controller
+        supplies ``active_experts`` when resident capacity must also become
+        executed capacity.
         """
 
+        if active_experts is not None:
+            self._validate_active_experts(active_experts)
+        required_active = self.active_experts if active_experts is None else active_experts
+        committed = self._validate_resident_set(ids, required_active=required_active)
         if self._request_previous is None:
-            self._request_previous = self.snapshot()
-        return self.set(ids)
+            self._request_previous = self.snapshot_state()
+        self._commit(committed)
+        if active_experts is not None:
+            self._active_experts_override = active_experts
+        return committed
 
     def end_request(self) -> None:
-        """Restore the set that was resident before :meth:`begin_request` (no-op otherwise)."""
+        """Restore ids and top-``k`` from before :meth:`begin_request` (or no-op)."""
 
-        previous = self._request_previous
-        if previous is None:
+        previous_state = self._request_previous
+        if previous_state is None:
             return
         self._request_previous = None
-        self.restore(previous)
+        self.restore_state(previous_state)
+
+    def set_active_experts(self, count: int | None) -> None:
+        """Set per-token execution capacity without changing resident identities."""
+
+        if count is not None:
+            self._validate_active_experts(count)
+        effective = self.config.active_experts if count is None else count
+        if effective > self.size:
+            raise ValueError(
+                f"per-token top-{effective} cannot be served by only "
+                f"{self.size} resident experts"
+            )
+        self._active_experts_override = count
 
     def set(self, ids: Sequence[int]) -> tuple[int, ...]:
         """Replace the resident set with exactly ``ids`` (validated, deduplicated)."""
 
-        unique = self._validate_ids(ids)
-        if len(unique) < self.config.active_experts:
-            raise ValueError(
-                f"a resident set needs at least active_experts={self.config.active_experts} "
-                f"ids; got {len(unique)}"
-            )
+        unique = self._validate_resident_set(ids)
         self._commit(unique)
         return unique
 
@@ -148,21 +201,45 @@ class ExpertResidency(nn.Module):
         return unique
 
     def snapshot(self) -> tuple[int, ...]:
+        """Snapshot resident identities only (the legacy residency API)."""
+
         return self._ids
 
+    def snapshot_state(self) -> ResidencyState:
+        """Snapshot identities and the exact top-``k`` override for rollback."""
+
+        return ResidencyState(self._ids, self._active_experts_override)
+
     def restore(self, ids: Sequence[int]) -> None:
-        """Return to an exact earlier set (rollback)."""
+        """Return to an exact earlier identity set without changing top-``k``."""
 
         if len(ids) >= self.num_experts:
             self.reset()
         else:
             self.set(ids)
 
+    def restore_state(self, state: ResidencyState) -> None:
+        """Restore exact identities and execution capacity from ``state``."""
+
+        effective = (
+            self.config.active_experts
+            if state.active_experts_override is None
+            else state.active_experts_override
+        )
+        if state.active_experts_override is not None:
+            self._validate_active_experts(state.active_experts_override)
+        ids = self._validate_resident_set(state.resident_ids, required_active=effective)
+        # Commit the validated pair as one state. Either ordering through the
+        # public setters can temporarily violate the opposite half when a
+        # candidate expansion is rolled back.
+        self._active_experts_override = state.active_experts_override
+        self._commit(ids)
+
     @contextmanager
     def session(self, ids: Sequence[int] | None = None) -> Iterator[ExpertResidency]:
         """Scope a request: optionally start from ``ids``; restore the prior set on exit."""
 
-        previous = self.snapshot()
+        previous = self.snapshot_state()
         previous_request = self._request_previous
         try:
             if ids is not None:
@@ -170,7 +247,7 @@ class ExpertResidency(nn.Module):
             yield self
         finally:
             self._request_previous = previous_request
-            self.restore(previous)
+            self.restore_state(previous)
 
     def _commit(self, ids: tuple[int, ...]) -> None:
         self._ids = ids
@@ -193,8 +270,33 @@ class ExpertResidency(nn.Module):
             raise ValueError(f"expert ids must lie in [0, {self.num_experts}); got {unique}")
         return unique
 
+    def _validate_resident_set(
+        self,
+        ids: Sequence[int],
+        *,
+        required_active: int | None = None,
+    ) -> tuple[int, ...]:
+        unique = self._validate_ids(ids)
+        required = self.active_experts if required_active is None else required_active
+        if len(unique) < required:
+            raise ValueError(
+                f"a resident set needs at least active_experts={required} "
+                f"ids; got {len(unique)}"
+            )
+        return unique
+
+    def _validate_active_experts(self, count: int) -> None:
+        if not self.config.min_active_experts <= count <= self.max_active_experts:
+            raise ValueError(
+                f"active expert count must be in [{self.config.min_active_experts}, "
+                f"{self.max_active_experts}]; got {count}"
+            )
+
     def extra_repr(self) -> str:
-        return f"num_experts={self.num_experts}, resident={self.size}"
+        return (
+            f"num_experts={self.num_experts}, resident={self.size}, "
+            f"active_per_token={self.active_experts}"
+        )
 
 
 def rank_nonresident_experts(
@@ -266,16 +368,18 @@ def choose_inference_residency(
             The chosen resident set stays applied on return so decoding
             continues with the same residency. The request is opened with
             ``residency.begin_request``; end it with ``residency.end_request()``
-            (``model.set_active_experts(...)`` does so too) or wrap the whole
-            request in ``model.residency_session()``. On any error the prior
-            resident set is restored before the exception propagates.
+            (or ``model.end_residency_request()``), or wrap the whole request
+            in ``model.residency_session()``. On any error the prior resident
+            ids and top-``k`` are restored before the exception propagates.
         prompt_ids: ``[1, tokens]`` prompt. With two or more tokens the observed
             next-token NLL of the prompt is the effective signal; a one-token
             prompt falls back to the target-free predictive entropy.
         initial_ids: Explicit starting residents. Defaults to the most-utilized
             experts recorded by the potentiation telemetry (or the lowest ids
             when nothing has been observed), ``max(min_resident_experts, k)``
-            of them where ``k`` is the per-token top-``k`` in effect.
+            of them where ``k`` is the per-token top-``k`` in effect. The
+            starting set becomes the starting executed capacity, capped by
+            ``max_active_experts``.
         increment: Expert ids added per expansion step (defaults to
             ``residency_increment``).
         min_gain: Smallest signal improvement, in nats per token, that keeps an
@@ -295,8 +399,11 @@ def choose_inference_residency(
         raise ValueError("increment must be positive")
     if not math.isfinite(gain):
         raise ValueError("min_gain must be finite")
-    per_token = model.active_experts or config.active_experts
-    cap = max(config.resident_cap, per_token)
+    previous_per_token = model.active_experts or config.active_experts
+    cap = min(
+        max(config.resident_cap, previous_per_token),
+        residency.max_active_experts,
+    )
     average = model.average_surprise
 
     was_training = model.training
@@ -304,15 +411,26 @@ def choose_inference_residency(
     try:
         with torch.no_grad():
             start = (
-                default_resident_ids(model, max(config.min_resident_experts, per_token))
+                default_resident_ids(
+                    model,
+                    max(config.min_resident_experts, previous_per_token),
+                )
                 if initial_ids is None
                 else tuple(initial_ids)
             )
-            if len(set(start)) < per_token:
+            start_count = len(set(start))
+            if start_count < previous_per_token:
                 raise ValueError(
-                    f"{len(set(start))} starting residents cannot serve a per-token top-{per_token}"
+                    f"{start_count} starting residents cannot serve a per-token "
+                    f"top-{previous_per_token}"
                 )
-            residency.begin_request(start)
+            if start_count > cap:
+                raise ValueError(
+                    f"{start_count} starting residents exceed the dynamic controller "
+                    f"cap of {cap}"
+                )
+            start_active = start_count
+            residency.begin_request(start, active_experts=start_active)
             output, nll, entropy, signal = _evaluate(model, prompt_ids)
             trace = [(residency.size, signal)]
             expansions: list[tuple[int, ...]] = []
@@ -322,14 +440,17 @@ def choose_inference_residency(
                 added = candidates[: min(step, room)]
                 if not added:
                     break
-                before = residency.snapshot()
+                before = residency.snapshot_state()
                 residency.expand(added)
+                residency.set_active_experts(
+                    min(residency.size, residency.max_active_experts)
+                )
                 candidate_output, candidate_nll, candidate_entropy, candidate_signal = _evaluate(
                     model, prompt_ids
                 )
                 trace.append((residency.size, candidate_signal))
                 if signal - candidate_signal < gain:
-                    residency.restore(before)
+                    residency.restore_state(before)
                     break
                 expansions.append(added)
                 output, nll, entropy, signal = (
@@ -346,7 +467,7 @@ def choose_inference_residency(
 
     return ResidencyDecision(
         resident_ids=residency.ids,
-        active_experts=per_token,
+        active_experts=residency.active_experts,
         effective_nll=nll,
         predictive_entropy=entropy,
         average_surprise=average,
@@ -384,6 +505,7 @@ def _evaluate(
 __all__ = [
     "ExpertResidency",
     "ResidencyDecision",
+    "ResidencyState",
     "choose_inference_residency",
     "default_resident_ids",
     "rank_nonresident_experts",

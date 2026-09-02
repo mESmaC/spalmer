@@ -18,7 +18,12 @@ from torch import Tensor, nn
 from spalmer.modeling import CausalLMOutput, SPALMERCausalLM
 from spalmer.training.config import TrainingConfig
 from spalmer.training.device import RuntimeDevice, resolve_runtime_device, seed_everything
-from spalmer.training.optim import OptimizerBundle, build_optimizers, gradients_are_finite
+from spalmer.training.optim import (
+    BF16MasterAdamW,
+    OptimizerBundle,
+    build_optimizers,
+    gradients_are_finite,
+)
 
 
 @dataclass(slots=True)
@@ -130,11 +135,13 @@ ModelFactory = TypeVar("ModelFactory", bound=Callable[[], SPALMERCausalLM])
 
 
 def initialize_model(factory: ModelFactory, config: TrainingConfig) -> SPALMERCausalLM:
-    """Seed before model construction, then establish FP32 persistent weights."""
+    """Seed construction, then establish the configured persistent master dtype."""
 
     seed_everything(config.seed, deterministic_algorithms=config.deterministic_algorithms)
     model = factory()
-    return model.to(dtype=torch.float32)
+    model = model.to(dtype=_parameter_dtype(config))
+    _validate_expert_master_dtype(model, config)
+    return model
 
 
 class ExperimentTrainer:
@@ -157,9 +164,14 @@ class ExperimentTrainer:
             config.seed,
             deterministic_algorithms=config.deterministic_algorithms,
         )
-        self.model = model.to(device=self.runtime.device, dtype=torch.float32)
+        self.model = model.to(
+            device=self.runtime.device,
+            dtype=_parameter_dtype(config),
+        )
+        _validate_expert_master_dtype(self.model, config)
         self.batches = batches
         self.optimizer = optimizer or build_optimizers(self.model, config)
+        _validate_optimizer_precision_contract(self.optimizer, config)
         self.on_checkpoint = on_checkpoint
         self.on_validation = on_validation
         self.on_telemetry = on_telemetry
@@ -287,6 +299,42 @@ def _autocast(runtime: RuntimeDevice):
     if not runtime.autocast_enabled:
         return contextlib.nullcontext()
     return torch.autocast(device_type=runtime.device.type, dtype=runtime.compute_dtype)
+
+
+def _parameter_dtype(config: TrainingConfig) -> torch.dtype:
+    return torch.bfloat16 if config.parameter_dtype == "bfloat16" else torch.float32
+
+
+def _validate_expert_master_dtype(
+    model: SPALMERCausalLM,
+    config: TrainingConfig,
+) -> None:
+    """Keep the checkpointed expert recipe and optimizer-visible weights aligned."""
+
+    for layer_index, block in enumerate(model.backbone.blocks):
+        bank = getattr(block.channel_mixer, "experts", None)
+        expert_config = getattr(bank, "config", None)
+        expected = getattr(expert_config, "expert_master_dtype", config.parameter_dtype)
+        if expected != config.parameter_dtype:
+            raise ValueError(
+                f"expert master dtype at layer {layer_index} is {expected!r}, but "
+                f"training parameter_dtype is {config.parameter_dtype!r}"
+            )
+
+
+def _validate_optimizer_precision_contract(
+    optimizer: OptimizerBundle,
+    config: TrainingConfig,
+) -> None:
+    """Prevent injected optimizers from weakening the selected BF16 lane."""
+
+    if config.parameter_dtype != "bfloat16":
+        return
+    if not isinstance(optimizer.dense, BF16MasterAdamW) or optimizer.sparse is not None:
+        raise ValueError(
+            "BF16 base pretraining requires BF16MasterAdamW with FP32 moments "
+            "and no sparse optimizer lane"
+        )
 
 
 def _move_optional(value: Tensor | None, device: torch.device) -> Tensor | None:

@@ -76,6 +76,196 @@ def _no_weight_decay(name: str, parameter: nn.Parameter) -> bool:
     )
 
 
+class BF16MasterAdamW(torch.optim.Optimizer):
+    """AdamW with BF16 parameters, FP32 moments, and no FP32 weight copy.
+
+    Updates are formed a bounded chunk at a time in FP32, then written directly
+    to the sole BF16 parameter payload. Optional stochastic rounding preserves
+    sub-ULP updates in expectation without retaining a full-sized FP32 master.
+    """
+
+    def __init__(
+        self,
+        params,
+        *,
+        lr: float,
+        betas: tuple[float, float],
+        eps: float,
+        stochastic_rounding: bool,
+        update_chunk_size: int,
+    ) -> None:
+        if lr < 0:
+            raise ValueError("learning rate cannot be negative")
+        if eps <= 0:
+            raise ValueError("epsilon must be positive")
+        if update_chunk_size <= 0:
+            raise ValueError("update_chunk_size must be positive")
+        beta1, beta2 = betas
+        if not 0 <= beta1 < 1 or not 0 <= beta2 < 1:
+            raise ValueError("Adam betas must be in [0, 1)")
+        defaults = {
+            "lr": lr,
+            "betas": betas,
+            "eps": eps,
+            "stochastic_rounding": stochastic_rounding,
+            "update_chunk_size": update_chunk_size,
+        }
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = float(group["lr"])
+            beta1, beta2 = group["betas"]
+            eps = float(group["eps"])
+            weight_decay = float(group.get("weight_decay", 0.0))
+            stochastic = bool(group["stochastic_rounding"])
+            chunk_size = int(group["update_chunk_size"])
+            for parameter in group["params"]:
+                gradient = parameter.grad
+                if gradient is None:
+                    continue
+                if gradient.is_sparse:
+                    raise RuntimeError("BF16MasterAdamW does not accept sparse gradients")
+                if parameter.dtype != torch.bfloat16:
+                    raise TypeError(
+                        "BF16MasterAdamW requires BF16 parameters; "
+                        f"received {parameter.dtype}"
+                    )
+                state = self.state[parameter]
+                if not state:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(
+                        parameter,
+                        dtype=torch.float32,
+                        memory_format=torch.preserve_format,
+                    )
+                    state["exp_avg_sq"] = torch.zeros_like(
+                        parameter,
+                        dtype=torch.float32,
+                        memory_format=torch.preserve_format,
+                    )
+                state["step"] += 1
+                step = int(state["step"])
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+                bias_correction1 = 1.0 - beta1**step
+                bias_correction2 = 1.0 - beta2**step
+                step_size = lr / bias_correction1
+                correction2_sqrt = bias_correction2**0.5
+
+                parameter_flat = parameter.view(-1)
+                gradient_flat = gradient.contiguous().view(-1)
+                exp_avg_flat = exp_avg.view(-1)
+                exp_avg_sq_flat = exp_avg_sq.view(-1)
+                for start in range(0, parameter.numel(), chunk_size):
+                    stop = min(parameter.numel(), start + chunk_size)
+                    grad = gradient_flat[start:stop].float()
+                    mean = exp_avg_flat[start:stop]
+                    variance = exp_avg_sq_flat[start:stop]
+                    mean.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                    variance.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+                    updated = parameter_flat[start:stop].float()
+                    if weight_decay:
+                        updated.mul_(1.0 - lr * weight_decay)
+                    denominator = variance.sqrt().div_(correction2_sqrt).add_(eps)
+                    updated.addcdiv_(mean, denominator, value=-step_size)
+                    rounded = (
+                        _stochastic_round_bfloat16(updated)
+                        if stochastic
+                        else updated.to(torch.bfloat16)
+                    )
+                    parameter_flat[start:stop].copy_(rounded)
+        return loss
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # ``Optimizer.load_state_dict`` normally casts floating state tensors
+        # to the parameter dtype. Preserve references to the original FP32
+        # moments so that loading a BF16 parameter optimizer cannot quantize
+        # them before we restore the optimizer-state contract below.
+        saved_moments: list[tuple[nn.Parameter, dict[str, Any]]] = []
+        saved_groups = state_dict.get("param_groups", [])
+        if len(saved_groups) == len(self.param_groups):
+            for saved_group, current_group in zip(
+                saved_groups,
+                self.param_groups,
+                strict=True,
+            ):
+                saved_ids = saved_group.get("params", [])
+                current_parameters = current_group.get("params", [])
+                if len(saved_ids) != len(current_parameters):
+                    break
+                saved_moments.extend(
+                    (
+                        parameter,
+                        state_dict.get("state", {}).get(saved_id, {}),
+                    )
+                    for saved_id, parameter in zip(
+                        saved_ids,
+                        current_parameters,
+                        strict=True,
+                    )
+                )
+        super().load_state_dict(state_dict)
+        for parameter, saved_state in saved_moments:
+            state = self.state.get(parameter)
+            if state is None:
+                continue
+            for name in ("exp_avg", "exp_avg_sq"):
+                value = saved_state.get(name)
+                if isinstance(value, Tensor):
+                    state[name] = value.detach().to(
+                        device=parameter.device,
+                        dtype=torch.float32,
+                        copy=True,
+                    )
+        invalid = [
+            name
+            for state in self.state.values()
+            for name in ("exp_avg", "exp_avg_sq")
+            if isinstance(state.get(name), Tensor)
+            and state[name].dtype != torch.float32
+        ]
+        if invalid:
+            raise ValueError("loaded BF16MasterAdamW moments must remain FP32")
+
+
+def _stochastic_round_bfloat16(values: Tensor) -> Tensor:
+    """Unbiased in-range FP32-to-BF16 rounding with symmetric saturation."""
+
+    maximum = torch.finfo(torch.bfloat16).max
+    bounded = values.clamp(min=-maximum, max=maximum)
+    nearest = bounded.to(torch.bfloat16)
+    nearest_fp32 = nearest.float()
+    negative_infinity = torch.full_like(nearest, float("-inf"))
+    positive_infinity = torch.full_like(nearest, float("inf"))
+    lower = torch.where(
+        nearest_fp32 > bounded,
+        torch.nextafter(nearest, negative_infinity),
+        nearest,
+    )
+    upper = torch.where(
+        nearest_fp32 < bounded,
+        torch.nextafter(nearest, positive_infinity),
+        nearest,
+    )
+    lower_fp32 = lower.float()
+    upper_fp32 = upper.float()
+    span = upper_fp32 - lower_fp32
+    probability_upper = torch.where(
+        span > 0,
+        ((bounded - lower_fp32) / span).clamp(0.0, 1.0),
+        torch.zeros_like(bounded),
+    )
+    rounded = torch.where(torch.rand_like(probability_upper) < probability_upper, upper, lower)
+    return torch.where(torch.isfinite(values), rounded, values.to(torch.bfloat16))
+
+
 class OptimizerBundle:
     """One stateful façade for dense AdamW and optional SparseAdam."""
 
@@ -130,24 +320,55 @@ def build_optimizers(model: nn.Module, config: TrainingConfig) -> OptimizerBundl
     if groups.no_decay:
         dense_groups.append({"params": groups.no_decay, "weight_decay": 0.0})
     if dense_groups:
-        requested_fused = config.fused_adamw == "on" or (
-            config.fused_adamw == "auto" and next(model.parameters()).device.type == "cuda"
+        expected_dtype = (
+            torch.bfloat16 if config.parameter_dtype == "bfloat16" else torch.float32
         )
-        kwargs: dict[str, Any] = {
-            "lr": config.learning_rate,
-            "betas": (config.adam_beta1, config.adam_beta2),
-            "eps": config.adam_epsilon,
-        }
-        if requested_fused:
-            kwargs["fused"] = True
-        try:
-            dense_optimizer = torch.optim.AdamW(dense_groups, **kwargs)
-        except (RuntimeError, TypeError):
-            if config.fused_adamw == "on":
-                raise
-            kwargs.pop("fused", None)
-            dense_optimizer = torch.optim.AdamW(dense_groups, **kwargs)
+        wrong_dtype = next(
+            (
+                parameter.dtype
+                for parameter in (*groups.decay, *groups.no_decay)
+                if parameter.dtype != expected_dtype
+            ),
+            None,
+        )
+        if wrong_dtype is not None:
+            raise TypeError(
+                f"optimizer expected {expected_dtype} parameters, found {wrong_dtype}; "
+                "initialize or cast the model through the training configuration first"
+            )
+        if config.parameter_dtype == "bfloat16":
+            dense_optimizer = BF16MasterAdamW(
+                dense_groups,
+                lr=config.learning_rate,
+                betas=(config.adam_beta1, config.adam_beta2),
+                eps=config.adam_epsilon,
+                stochastic_rounding=config.stochastic_parameter_rounding,
+                update_chunk_size=config.optimizer_update_chunk_size,
+            )
+        else:
+            requested_fused = config.fused_adamw == "on" or (
+                config.fused_adamw == "auto" and next(model.parameters()).device.type == "cuda"
+            )
+            kwargs: dict[str, Any] = {
+                "lr": config.learning_rate,
+                "betas": (config.adam_beta1, config.adam_beta2),
+                "eps": config.adam_epsilon,
+            }
+            if requested_fused:
+                kwargs["fused"] = True
+            try:
+                dense_optimizer = torch.optim.AdamW(dense_groups, **kwargs)
+            except (RuntimeError, TypeError):
+                if config.fused_adamw == "on":
+                    raise
+                kwargs.pop("fused", None)
+                dense_optimizer = torch.optim.AdamW(dense_groups, **kwargs)
     if groups.sparse:
+        if config.parameter_dtype == "bfloat16":
+            raise ValueError(
+                "BF16 master training currently requires dense PLE gradients so its FP32 "
+                "moment contract is preserved"
+            )
         sparse_optimizer = torch.optim.SparseAdam(
             groups.sparse,
             lr=config.learning_rate,
@@ -184,6 +405,7 @@ def _load_optional_optimizer(
 
 
 __all__ = [
+    "BF16MasterAdamW",
     "OptimizerBundle",
     "ParameterGroups",
     "build_optimizers",

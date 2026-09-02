@@ -41,7 +41,16 @@ class ParameterAccounting:
     resident_expert_ids: tuple[int, ...]
     active_experts_per_token: int
     parameters_per_expert: int
+    # Persistent/master storage width. This intentionally does not describe
+    # fake-quantized forward execution.
     nominal_bits: dict[str, int] = field(default_factory=dict)
+    # Forward execution widths where they differ from persistent storage
+    # (currently PLE lookup weights and routed-expert weights).
+    execution_bits: dict[str, int] = field(default_factory=dict)
+    # Bytes occupied by the model's current PyTorch parameter tensors. This is
+    # useful when a newly constructed reference model has not yet been cast to
+    # its configured persistent dtype.
+    parameter_bytes: dict[str, int] = field(default_factory=dict)
 
     @property
     def total(self) -> int:
@@ -98,12 +107,22 @@ class ParameterAccounting:
         return self.resident_experts / self.num_experts if self.num_experts else 0.0
 
     def nominal_bytes(self) -> dict[str, float]:
-        """Storage at each component's nominal precision (bits from ``nominal_bits``)."""
+        """Persistent storage at each component's master precision."""
 
         return {
-            name: count * self.nominal_bits.get(name, 16) / 8
+            name: (
+                count * self.nominal_bits[name] / 8
+                if name in self.nominal_bits
+                else float(self.parameter_bytes.get(name, count * 2))
+            )
             for name, count in self.components.items()
         }
+
+    @property
+    def actual_parameter_bytes(self) -> int:
+        """Bytes occupied by all current (possibly not-yet-cast) parameter tensors."""
+
+        return sum(self.parameter_bytes.values())
 
     def resident_bytes(self) -> float:
         """Nominal bytes that must be resident for the current request."""
@@ -170,8 +189,13 @@ def account_parameters(
     """
 
     components = {name: 0 for name in _COMPONENT_ORDER}
+    parameter_bytes = {name: 0 for name in _COMPONENT_ORDER}
+    parameter_widths: dict[str, set[int]] = {name: set() for name in _COMPONENT_ORDER}
     for name, parameter in model.named_parameters():
-        components[classify_parameter(name)] += parameter.numel()
+        component = classify_parameter(name)
+        components[component] += parameter.numel()
+        parameter_bytes[component] += parameter.numel() * parameter.element_size()
+        parameter_widths[component].add(parameter.element_size() * 8)
 
     residency = getattr(model, "residency", None)
     num_experts = 0
@@ -186,21 +210,37 @@ def account_parameters(
     if banks:
         num_experts = banks[0].num_experts
         per_expert = sum(bank.parameters_per_expert for bank in banks)
-        per_token = getattr(model.backbone.blocks[0].channel_mixer, "active_experts", 0)
         resident_ids = residency.ids if residency is not None else tuple(range(num_experts))
+        per_token = (
+            residency.active_experts
+            if residency is not None
+            else getattr(model.backbone.blocks[0].channel_mixer, "active_experts", 0)
+        )
+        if per_token > len(resident_ids):
+            raise RuntimeError(
+                f"cannot account for top-{per_token} execution with only "
+                f"{len(resident_ids)} resident experts"
+            )
     if per_expert * num_experts != components["expert_pool"]:
         raise RuntimeError(
             "expert pool accounting mismatch: "
             f"{per_expert} per expert x {num_experts} != {components['expert_pool']}"
         )
-    bits = dict(nominal_bits or {})
-    if not bits:
-        config = getattr(model, "config", None)
-        ple_bits = getattr(config, "ple_quant_bits", None)
-        if ple_bits is not None:
-            bits["embeddings"] = int(ple_bits)
-        if banks and banks[0].config.expert_fake_quantization:
-            bits["expert_pool"] = int(banks[0].config.expert_quant_bits)
+    bits = {
+        name: next(iter(widths))
+        for name, widths in parameter_widths.items()
+        if len(widths) == 1
+    }
+    execution_bits: dict[str, int] = {}
+    config = getattr(model, "config", None)
+    ple_bits = getattr(config, "ple_quant_bits", None)
+    if ple_bits is not None:
+        execution_bits["embeddings"] = int(ple_bits)
+    if banks:
+        expert_config = banks[0].config
+        bits["expert_pool"] = int(expert_config.expert_master_bits)
+        execution_bits["expert_pool"] = int(expert_config.expert_forward_weight_bits)
+    bits.update(nominal_bits or {})
     return ParameterAccounting(
         components=components,
         num_experts=num_experts,
@@ -208,6 +248,8 @@ def account_parameters(
         active_experts_per_token=int(per_token),
         parameters_per_expert=per_expert,
         nominal_bits=bits,
+        execution_bits=execution_bits,
+        parameter_bytes=parameter_bytes,
     )
 
 

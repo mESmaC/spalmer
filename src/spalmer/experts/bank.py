@@ -21,6 +21,15 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from spalmer.experts.config import MicroExpertsConfig
+from spalmer.experts.qat import (
+    ExpertQATBackendStatus,
+    ExpertQATConfig,
+    expert_qat_backend_status,
+    fake_quantize_expert_activation,
+    fake_quantize_expert_weight,
+    fake_quantize_mxfp8,
+    require_expert_qat_backend,
+)
 from spalmer.nn import fake_quantize_low_bit
 
 
@@ -42,6 +51,28 @@ class MicroExpertBank(nn.Module):
         self.gate_proj = nn.Parameter(torch.randn(num_experts, d_model, inter_dim) * std)
         self.up_proj = nn.Parameter(torch.randn(num_experts, d_model, inter_dim) * std)
         self.down_proj = nn.Parameter(torch.randn(num_experts, inter_dim, d_model) * std)
+        resolved_weight_format = (
+            "mxfp4" if config.expert_weight_format == "legacy_int" else config.expert_weight_format
+        )
+        self._qat_deterministic_config = ExpertQATConfig(
+            weight_format=resolved_weight_format,
+            activation_format="mxfp8",
+            backend=config.expert_qat_backend,
+            stochastic_rounding=False,
+        )
+        self._qat_stochastic_config = ExpertQATConfig(
+            weight_format=resolved_weight_format,
+            activation_format="mxfp8",
+            backend=config.expert_qat_backend,
+            stochastic_rounding=True,
+        )
+        # Resolve strict-native requests at construction rather than silently
+        # reaching a dequantized GEMM on the first batch.
+        if (
+            config.expert_fake_quantization
+            and config.expert_weight_format != "legacy_int"
+        ):
+            require_expert_qat_backend(self._qat_config(stochastic=False))
 
     @property
     def num_experts(self) -> int:
@@ -65,35 +96,83 @@ class MicroExpertBank(nn.Module):
         gate_weight = self._effective_weight(self.gate_proj[expert_index], promoted)
         up_weight = self._effective_weight(self.up_proj[expert_index], promoted)
         down_weight = self._effective_weight(self.down_proj[expert_index], promoted)
-        gate = F.silu(hidden_states @ gate_weight)
-        up = hidden_states @ up_weight
-        return (gate * up) @ down_weight
+        expert_input = self._effective_activation(hidden_states)
+        gate = F.silu(expert_input @ gate_weight)
+        up = expert_input @ up_weight
+        down_input = self._effective_activation(gate * up)
+        return down_input @ down_weight
 
     def _effective_weight(self, shadow: Tensor, promoted: Tensor | None) -> Tensor:
-        """Use the low-bit substrate or its reversible shadow-precision residual.
+        """Derive an FP4 or promoted execution weight from the one master.
 
         ``shadow`` may be one expert's matrix or a stack ``[m, ...]`` of them;
         ``promoted`` is then a Boolean scalar or a ``[m]`` vector. The
-        quantization scale is taken along the last dimension, so a stacked
-        call quantizes each expert exactly as the single-expert call does.
+        quantizer sees the contraction dimension by transposing ``[K, N]`` to
+        ``[N, K]``. No second persistent high-precision weight is created.
         """
 
         if not self.config.expert_fake_quantization:
             return shadow
-        low = fake_quantize_low_bit(
-            shadow,
-            bits=self.config.expert_quant_bits,
-            stochastic=self.training and self.config.expert_stochastic_rounding,
-            straight_through=self.training,
-        )
+        low = self._quantize_weight(shadow, promoted=False)
         if promoted is None:
             return low
-        # One Boolean per expert controls the complete expert. Expressing the
-        # reversible residual algebraically avoids a GPU synchronization per
-        # expert while preserving the same shadow-weight gradient.
+        high = self._quantize_weight(shadow, promoted=True)
+        # One Boolean per expert controls the complete expert. Algebraic
+        # selection avoids host synchronization and keeps gradients on the
+        # same BF16 master parameters.
         enabled = promoted.to(device=shadow.device, dtype=shadow.dtype)
         enabled = enabled.reshape(-1, *([1] * (shadow.dim() - 1))) if enabled.dim() else enabled
-        return low + enabled * (shadow - low)
+        return low + enabled * (high - low)
+
+    def _quantize_weight(self, master: Tensor, *, promoted: bool) -> Tensor:
+        if self.config.expert_weight_format == "legacy_int" and not promoted:
+            return fake_quantize_low_bit(
+                master,
+                bits=self.config.expert_quant_bits,
+                stochastic=self.training and self.config.expert_stochastic_rounding,
+                straight_through=self.training,
+            )
+        transposed = master.transpose(-2, -1).contiguous()
+        if promoted and self.config.expert_promotion_format == "bfloat16":
+            effective = transposed.to(torch.bfloat16).to(transposed.dtype)
+            if self.training:
+                effective = transposed + (effective - transposed).detach()
+        elif promoted:
+            effective = fake_quantize_mxfp8(
+                transposed,
+                stochastic=self.training and self.config.expert_stochastic_rounding,
+                straight_through=self.training,
+            )
+        else:
+            effective = fake_quantize_expert_weight(
+                transposed,
+                self._qat_config(
+                    stochastic=self.training and self.config.expert_stochastic_rounding
+                ),
+            )
+        return effective.transpose(-2, -1)
+
+    def _effective_activation(self, values: Tensor) -> Tensor:
+        if (
+            not self.config.expert_fake_quantization
+            or self.config.expert_activation_format == "bfloat16"
+        ):
+            return values
+        return fake_quantize_expert_activation(
+            values,
+            self._qat_config(
+                stochastic=self.training and self.config.expert_stochastic_rounding
+            ),
+        )
+
+    def _qat_config(self, *, stochastic: bool) -> ExpertQATConfig:
+        return self._qat_stochastic_config if stochastic else self._qat_deterministic_config
+
+    @property
+    def qat_backend_status(self) -> ExpertQATBackendStatus:
+        """Resolved execution capability for logs and checkpoint diagnostics."""
+
+        return expert_qat_backend_status(self._qat_config(stochastic=False))
 
     @torch.no_grad()
     def quantization_error(
@@ -115,12 +194,19 @@ class MicroExpertBank(nn.Module):
         squared_weight: Tensor | None = None
         for parameter in (self.gate_proj, self.up_proj, self.down_proj):
             shadow = parameter if resident_ids is None else parameter[resident_ids]
-            low = fake_quantize_low_bit(
-                shadow,
-                bits=self.config.expert_quant_bits,
-                stochastic=False,
-                straight_through=False,
-            )
+            if self.config.expert_weight_format == "legacy_int":
+                low = fake_quantize_low_bit(
+                    shadow,
+                    bits=self.config.expert_quant_bits,
+                    stochastic=False,
+                    straight_through=False,
+                )
+            else:
+                transposed = shadow.transpose(-2, -1).contiguous()
+                low = fake_quantize_expert_weight(
+                    transposed,
+                    self._qat_config(stochastic=False),
+                ).transpose(-2, -1)
             error = (shadow.float() - low.float()).square().sum(dim=(1, 2))
             weight = shadow.float().square().sum(dim=(1, 2))
             squared_error = error if squared_error is None else squared_error + error
@@ -227,8 +313,11 @@ class MicroExpertBank(nn.Module):
         gate_weight, up_weight, down_weight = self._stacked_effective_weights(
             group_ids, promoted_mask
         )
-        hidden = F.silu(torch.bmm(inputs, gate_weight)) * torch.bmm(inputs, up_weight)
-        outputs = torch.bmm(hidden, down_weight)
+        expert_inputs = self._effective_activation(inputs)
+        hidden = F.silu(torch.bmm(expert_inputs, gate_weight)) * torch.bmm(
+            expert_inputs, up_weight
+        )
+        outputs = torch.bmm(self._effective_activation(hidden), down_weight)
         weights = (routing_weights[pair_rows] * valid.to(routing_weights.dtype)).unsqueeze(-1)
         return update.index_add(0, token_rows.reshape(-1), (outputs * weights).reshape(-1, d_model))
 

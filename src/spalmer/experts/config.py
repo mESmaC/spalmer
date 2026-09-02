@@ -16,9 +16,11 @@ class MicroExpertsConfig:
     - ``active_experts`` is the per-token top-``k``: how many experts one token
       executes, chosen among the currently *resident* experts.
     - the resident set (ledger C13) is one request-level identity set shared by
-      every layer; its size moves between ``min_resident_experts`` and
-      ``max_resident_experts`` by adding explicit expert ids, never by changing
-      ``k``. Outside a residency session every expert is resident.
+      every layer. Accepted controller expansions add explicit expert ids and
+      raise per-token ``k`` with the resident count, up to
+      ``max_active_experts``; rollback restores both. Outside a residency
+      session every expert is resident and configured ``active_experts`` is
+      used.
 
     Args:
         d_model: Residual-stream width shared with the surrounding block.
@@ -42,10 +44,22 @@ class MicroExpertsConfig:
         expert_execution: ``grouped`` executes every resident expert's tokens
             with padded batched matmuls (no per-expert Python loop);
             ``loop`` is the per-expert reference path.
-        expert_quant_bits: Fake-quantized reference substrate width.
-        expert_fake_quantization: Enable the reference low-bit expert substrate.
-        expert_stochastic_rounding: Apply stochastic rounding to the low-bit
-            substrate during training.
+        expert_weight_format: Routed-expert forward-weight format. ``mxfp4``
+            is the Kimi-style default; ``nvfp4`` selects NVIDIA's two-level
+            block scaling; ``legacy_int`` exists only for old checkpoints.
+        expert_activation_format: Input format at each routed-expert GEMM.
+            The selected base-pretraining contract uses ``mxfp8``.
+        expert_master_dtype: Persistent optimizer-visible expert weights. New
+            base-pretraining runs use one BF16 copy and no FP32 shadow.
+        expert_qat_backend: ``auto`` chooses the best implemented backend,
+            ``reference`` is the correctness lane, and ``native`` fails closed
+            unless a real mixed W4A8 kernel is present.
+        expert_promotion_format: Forward precision of a potentiated expert.
+        expert_quant_bits: Width of the pre-v5 ``legacy_int`` fake quantizer.
+        expert_fake_quantization: Master switch retained for dense legacy
+            checkpoints. New QAT runs leave it enabled.
+        expert_stochastic_rounding: Apply stochastic rounding to supported
+            low-bit expert formats during training.
         potentiation_budget: Number of complete expert identities promoted to
             shadow precision across every layer. Zero disables promotion.
         potentiation_ema_decay: Smoothing applied to the expert-wide precision
@@ -77,6 +91,11 @@ class MicroExpertsConfig:
     min_resident_experts: int | None = None
     max_resident_experts: int = 20
     expert_execution: Literal["grouped", "loop"] = "grouped"
+    expert_weight_format: Literal["mxfp4", "nvfp4", "legacy_int"] = "mxfp4"
+    expert_activation_format: Literal["mxfp8", "bfloat16"] = "mxfp8"
+    expert_master_dtype: Literal["bfloat16", "float32"] = "bfloat16"
+    expert_qat_backend: Literal["auto", "reference", "native"] = "auto"
+    expert_promotion_format: Literal["mxfp8", "bfloat16"] = "mxfp8"
     expert_quant_bits: int = 4
     expert_fake_quantization: bool = True
     expert_stochastic_rounding: bool = True
@@ -106,6 +125,31 @@ class MicroExpertsConfig:
             raise ValueError("shared_inter_dim must be non-negative when provided")
         if self.expert_execution not in {"grouped", "loop"}:
             raise ValueError("expert_execution must be 'grouped' or 'loop'")
+        if self.expert_weight_format not in {"mxfp4", "nvfp4", "legacy_int"}:
+            raise ValueError(
+                "expert_weight_format must be 'mxfp4', 'nvfp4', or 'legacy_int'"
+            )
+        if self.expert_activation_format not in {"mxfp8", "bfloat16"}:
+            raise ValueError("expert_activation_format must be 'mxfp8' or 'bfloat16'")
+        if self.expert_master_dtype not in {"bfloat16", "float32"}:
+            raise ValueError("expert_master_dtype must be 'bfloat16' or 'float32'")
+        if self.expert_qat_backend not in {
+            "auto",
+            "reference",
+            "native",
+        }:
+            raise ValueError(
+                "expert_qat_backend must be 'auto', 'reference', or 'native'"
+            )
+        if self.expert_promotion_format not in {"mxfp8", "bfloat16"}:
+            raise ValueError("expert_promotion_format must be 'mxfp8' or 'bfloat16'")
+        if self.expert_weight_format != "legacy_int":
+            if self.expert_activation_format != "mxfp8":
+                raise ValueError("FP4 expert QAT requires MXFP8 activations")
+            if self.expert_master_dtype != "bfloat16":
+                raise ValueError("FP4 expert QAT requires one BF16 master parameter payload")
+            if not self.expert_fake_quantization:
+                raise ValueError("FP4 expert formats require expert_fake_quantization")
         if not 2 <= self.expert_quant_bits <= 8:
             raise ValueError("expert_quant_bits must be between 2 and 8")
         if not 0 <= self.potentiation_budget <= self.num_experts:
@@ -141,6 +185,11 @@ class MicroExpertsConfig:
             raise ValueError(
                 f"active_experts must be in [{self.min_active_experts}, "
                 f"{effective_max}]; got {self.active_experts}"
+            )
+        if self.min_resident_experts > effective_max:
+            raise ValueError(
+                f"min_resident_experts ({self.min_resident_experts}) cannot exceed "
+                f"the controller's maximum active experts ({effective_max})"
             )
         if self.min_resident_experts < self.active_experts:
             raise ValueError(
@@ -197,6 +246,22 @@ class MicroExpertsConfig:
         """Exact parameter count of the whole expert bank in one layer."""
 
         return self.num_experts * self.expert_parameters_per_layer
+
+    @property
+    def expert_forward_weight_bits(self) -> int:
+        """Nominal routed-expert execution width (not persistent storage)."""
+
+        if not self.expert_fake_quantization:
+            return 16 if self.expert_master_dtype == "bfloat16" else 32
+        if self.expert_weight_format == "legacy_int":
+            return self.expert_quant_bits
+        return 4
+
+    @property
+    def expert_master_bits(self) -> int:
+        """Width of the single persistent trainable expert weight copy."""
+
+        return 16 if self.expert_master_dtype == "bfloat16" else 32
 
 
 def _require_positive(name: str, value: int) -> None:
