@@ -122,7 +122,53 @@ def test_cuda_generate_defaults_to_bounded_expert_offload(monkeypatch, capsys) -
     )
 
     assert model.placement_calls == [{"dtype": torch.bfloat16}]
-    assert model.offload_call == (torch.device("cuda"), {"cache_size": 4})
+    assert model.offload_call == (
+        torch.device("cuda"),
+        {"cache_size": 4, "paging": True},
+    )
+    assert capsys.readouterr().out == "AB\n"
+
+
+def test_cuda_dynamic_residency_explicitly_selects_legacy_offload(monkeypatch, capsys) -> None:
+    vocab = _FakeVocab()
+    model = _FakeModel()
+    monkeypatch.setattr(
+        cli,
+        "load_checkpoint",
+        lambda path, *, map_location: (model, vocab, {"kind": "prose"}),
+    )
+
+    class FakeEncoder:
+        def __init__(self, loaded_vocab) -> None:
+            assert loaded_vocab is vocab
+
+        def encode(self, text: str, *, kind: str) -> list[int]:
+            return [1]
+
+    monkeypatch.setattr(cli, "Encoder", FakeEncoder)
+    monkeypatch.setattr(cli, "Vocab", _FakeVocab)
+    monkeypatch.setattr(
+        cli,
+        "generate_tokens",
+        lambda loaded_model, prompt_ids, **kwargs: torch.tensor([[1, 2]]),
+    )
+
+    cli.main(
+        [
+            "generate",
+            "trained.pt",
+            "--prompt",
+            "prompt",
+            "--device",
+            "cuda",
+            "--dynamic-residency",
+        ]
+    )
+
+    assert model.offload_call == (
+        torch.device("cuda"),
+        {"cache_size": None, "paging": False},
+    )
     assert capsys.readouterr().out == "AB\n"
 
 

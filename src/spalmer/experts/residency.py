@@ -419,6 +419,12 @@ def choose_inference_residency(
             retains every expansion up to the cap.
     """
 
+    offload = getattr(model, "_expert_offload_manager", None)
+    if offload is not None and offload.paging:
+        raise RuntimeError(
+            "dynamic request-global residency is disabled while paged expert "
+            "offload is active; paged routing already scores the full expert pool"
+        )
     if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1 or prompt_ids.shape[1] == 0:
         raise ValueError("prompt_ids must describe one non-empty sequence")
     residency = model.residency

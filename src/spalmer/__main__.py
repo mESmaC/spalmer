@@ -191,8 +191,8 @@ def _generate_parser() -> argparse.ArgumentParser:
         "--dynamic-residency",
         action="store_true",
         help=(
-            "let the C13 residency controller expand the active expert count from the "
-            "configured minimum while the prompt's surprise stays above average"
+            "use the experimental legacy prompt-global residency controller instead of "
+            "quality-preserving full-pool expert paging"
         ),
     )
     parser.add_argument(
@@ -200,8 +200,8 @@ def _generate_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "keep complete expert banks on CPU and stage only resident rows on the "
-            "inference device (default: enabled for all CUDA generation)"
+            "keep complete expert banks on CPU and page selected rows into bounded, "
+            "layer-local inference caches (default: enabled for all CUDA generation)"
         ),
     )
     parser.add_argument(
@@ -491,7 +491,11 @@ def _run_generate(args: argparse.Namespace) -> None:
     if use_expert_offload:
         if device.type == "cpu":
             raise ValueError("--expert-offload requires a non-CPU --device")
-        model.enable_expert_offload(device, cache_size=args.expert_cache_size)
+        model.enable_expert_offload(
+            device,
+            cache_size=args.expert_cache_size,
+            paging=not args.dynamic_residency,
+        )
     else:
         model.to(device=device)
 

@@ -11,6 +11,12 @@ projection. Two execution paths produce the same routed update:
   other expert to allocate its global maximum capacity.
 - ``loop``: the per-expert reference path (one small matmul triple per
   distinct selected expert) used for equivalence checks and tiny CPU runs.
+
+Inference paging is an execution detail below routing.  The router may select
+any expert in the trained pool; this bank divides the selected identities into
+cache-sized tiles, stages only one tile of layer-local rows at a time, and
+accumulates every routed contribution.  Consequently cache capacity never
+changes the logical top-k decision.
 """
 
 from __future__ import annotations
@@ -58,12 +64,23 @@ class MicroExpertBank(nn.Module):
         self._offload_target: torch.device | None = None
         self._offload_capacity: int | None = None
         self._offload_non_blocking = True
+        self._offload_paging = False
         self._cached_expert_ids: tuple[int, ...] = ()
         self._cached_slot_by_id: dict[int, int] = {}
+        # Oldest-to-newest identity order used only to retain useful rows when
+        # a page does not fill the physical cache.  Identity-to-slot placement
+        # remains independent and layer-local.
+        self._cached_lru: list[int] = []
         self._cached_slot_map: Tensor | None = None
         self._cached_gate_proj: Tensor | None = None
         self._cached_up_proj: Tensor | None = None
         self._cached_down_proj: Tensor | None = None
+        self._offload_stage_operations = 0
+        self._offload_transferred_rows = 0
+        self._offload_evicted_rows = 0
+        self._offload_transfer_bytes = 0
+        self._last_paged_quantization_ids: tuple[int, ...] | None = None
+        self._last_paged_quantization_error: Tensor | None = None
         resolved_weight_format = (
             "mxfp4" if config.expert_weight_format == "legacy_int" else config.expert_weight_format
         )
@@ -102,6 +119,29 @@ class MicroExpertBank(nn.Module):
         """Whether this bank executes from a request-resident device cache."""
 
         return self._offload_target is not None
+
+    @property
+    def expert_paging_enabled(self) -> bool:
+        """Whether selected experts are paged independently in this layer."""
+
+        return self.expert_offload_enabled and self._offload_paging
+
+    @property
+    def expert_cache_capacity(self) -> int | None:
+        """Maximum number of expert rows in the physical execution cache."""
+
+        return self._offload_capacity
+
+    @property
+    def expert_offload_counters(self) -> tuple[int, int, int, int]:
+        """Layer-local stages, transferred rows, evictions, and transfer bytes."""
+
+        return (
+            self._offload_stage_operations,
+            self._offload_transferred_rows,
+            self._offload_evicted_rows,
+            self._offload_transfer_bytes,
+        )
 
     @property
     def cached_expert_ids(self) -> tuple[int, ...]:
@@ -180,6 +220,7 @@ class MicroExpertBank(nn.Module):
         capacity: int,
         non_blocking: bool,
         pin_memory: bool,
+        paging: bool = False,
     ) -> None:
         """Keep masters on CPU and prepare an empty inference cache."""
 
@@ -211,6 +252,11 @@ class MicroExpertBank(nn.Module):
         self._offload_target = target_device
         self._offload_capacity = capacity
         self._offload_non_blocking = non_blocking
+        self._offload_paging = paging
+        self._offload_stage_operations = 0
+        self._offload_transferred_rows = 0
+        self._offload_evicted_rows = 0
+        self._offload_transfer_bytes = 0
 
     @torch.no_grad()
     def _stage_expert_rows(
@@ -298,8 +344,46 @@ class MicroExpertBank(nn.Module):
         self._cached_slot_map = slot_map
         self._cached_expert_ids = expert_ids
         self._cached_slot_by_id = new_slots
+        self._last_paged_quantization_ids = None
+        self._last_paged_quantization_error = None
         bytes_per_row = self.parameters_per_expert * self.gate_proj.element_size()
-        return len(incoming), len(evicted), len(incoming) * bytes_per_row
+        delta = (len(incoming), len(evicted), len(incoming) * bytes_per_row)
+        self._cached_lru = list(expert_ids)
+        self._record_offload_stage(delta)
+        return delta
+
+    def _record_offload_stage(self, delta: tuple[int, int, int]) -> None:
+        rows_in, rows_out, bytes_in = delta
+        self._offload_stage_operations += 1
+        self._offload_transferred_rows += rows_in
+        self._offload_evicted_rows += rows_out
+        self._offload_transfer_bytes += bytes_in
+
+    def _stage_execution_page(self, required_ids: tuple[int, ...]) -> None:
+        """Stage required ids and retain recent rows in any spare slots."""
+
+        capacity = self._offload_capacity
+        if capacity is None or not self._offload_paging:
+            raise RuntimeError("layer-local expert paging is not enabled")
+        required = tuple(sorted(set(required_ids)))
+        if not required:
+            raise ValueError("an execution page needs at least one expert")
+        if len(required) > capacity:
+            raise ValueError(
+                f"{len(required)} requested experts exceed cache capacity {capacity}"
+            )
+        keep = set(required)
+        for expert in reversed(self._cached_lru):
+            if len(keep) >= capacity:
+                break
+            keep.add(expert)
+        desired = tuple(sorted(keep))
+        previous_lru = self._cached_lru
+        self._stage_expert_rows(desired)
+        self._cached_lru = [
+            expert for expert in previous_lru if expert in keep and expert not in required
+        ]
+        self._cached_lru.extend(required)
 
     def _set_expert_offload_target(self, target_device: torch.device) -> None:
         """Resolve an index-less target before the first cache allocation."""
@@ -319,8 +403,12 @@ class MicroExpertBank(nn.Module):
         self._cached_slot_map = None
         self._cached_expert_ids = ()
         self._cached_slot_by_id = {}
+        self._cached_lru = []
         self._offload_target = None
         self._offload_capacity = None
+        self._offload_paging = False
+        self._last_paged_quantization_ids = None
+        self._last_paged_quantization_error = None
 
     def _cached_projection_rows(self, name: str, expert_ids: Tensor) -> Tensor:
         cache = getattr(self, f"_cached_{name}")
@@ -465,6 +553,32 @@ class MicroExpertBank(nn.Module):
         errors = torch.zeros(self.num_experts, dtype=torch.float32, device=error_device)
         if not self.config.expert_fake_quantization:
             return errors
+
+        if self.expert_paging_enabled:
+            selected_ids = tuple(
+                sorted(int(expert) for expert in torch.unique(expert_ids).detach().cpu().tolist())
+            )
+            if (
+                selected_ids != self._last_paged_quantization_ids
+                or self._last_paged_quantization_error is None
+            ):
+                raise RuntimeError(
+                    "paged quantization error is available only for the most recent "
+                    "routing execution"
+                )
+            return self._last_paged_quantization_error
+
+        measured = self._quantization_error_for_rows(resident_ids)
+        if resident_ids is None:
+            errors = measured
+        else:
+            errors[resident_ids] = measured
+        selected = _pair_counts(expert_ids.reshape(-1), self.num_experts) > 0
+        return errors * selected.to(errors.dtype)
+
+    def _quantization_error_for_rows(self, row_ids: Tensor | None) -> Tensor:
+        """Reconstruction MSE for ``row_ids`` (or the complete local bank)."""
+
         squared_error: Tensor | None = None
         squared_weight: Tensor | None = None
         for name, parameter in (
@@ -473,11 +587,11 @@ class MicroExpertBank(nn.Module):
             ("down_proj", self.down_proj),
         ):
             if self.expert_offload_enabled:
-                if resident_ids is None:
+                if row_ids is None:
                     raise RuntimeError("offloaded execution requires explicit resident expert ids")
-                shadow = self._cached_projection_rows(name, resident_ids)
+                shadow = self._cached_projection_rows(name, row_ids)
             else:
-                shadow = parameter if resident_ids is None else parameter[resident_ids]
+                shadow = parameter if row_ids is None else parameter[row_ids]
             if self.config.expert_weight_format == "legacy_int":
                 low = fake_quantize_low_bit(
                     shadow,
@@ -496,13 +610,7 @@ class MicroExpertBank(nn.Module):
             squared_error = error if squared_error is None else squared_error + error
             squared_weight = weight if squared_weight is None else squared_weight + weight
         assert squared_error is not None and squared_weight is not None
-        measured = squared_error / squared_weight.clamp_min(1e-12)
-        if resident_ids is None:
-            errors = measured
-        else:
-            errors[resident_ids] = measured
-        selected = _pair_counts(expert_ids.reshape(-1), self.num_experts) > 0
-        return errors * selected.to(errors.dtype)
+        return squared_error / squared_weight.clamp_min(1e-12)
 
     def execute_routing(
         self,
@@ -530,12 +638,47 @@ class MicroExpertBank(nn.Module):
             expert updates.
         """
 
+        if self.expert_paging_enabled:
+            return self._execute_paged(
+                hidden_states,
+                token_index,
+                expert_index,
+                routing_weights,
+                promoted_mask,
+            )
+
         if self.config.expert_execution == "loop":
             return self._execute_loop(
                 hidden_states, token_index, expert_index, routing_weights, promoted_mask
             )
         return self._execute_grouped(
             hidden_states, token_index, expert_index, routing_weights, promoted_mask, resident_ids
+        )
+
+    def _execute_paged(
+        self,
+        hidden_states: Tensor,
+        token_index: Tensor,
+        expert_index: Tensor,
+        routing_weights: Tensor,
+        promoted_mask: Tensor | None,
+    ) -> Tensor:
+        """Execute unrestricted router choices through cache-sized tiles."""
+
+        if self.config.expert_execution == "loop":
+            return self._execute_paged_loop(
+                hidden_states,
+                token_index,
+                expert_index,
+                routing_weights,
+                promoted_mask,
+            )
+        return self._execute_paged_grouped(
+            hidden_states,
+            token_index,
+            expert_index,
+            routing_weights,
+            promoted_mask,
         )
 
     def _execute_loop(
@@ -628,6 +771,133 @@ class MicroExpertBank(nn.Module):
         pair_rows = torch.cat(routed_rows)
         weighted_updates = torch.cat(routed_updates)
         return update.index_add(0, token_index.index_select(0, pair_rows), weighted_updates)
+
+    def _execute_paged_loop(
+        self,
+        hidden_states: Tensor,
+        token_index: Tensor,
+        expert_index: Tensor,
+        routing_weights: Tensor,
+        promoted_mask: Tensor | None,
+    ) -> Tensor:
+        """Mirror loop execution order while staging cache-sized expert runs."""
+
+        update = hidden_states.new_zeros(hidden_states.shape)
+        selected_ids = tuple(
+            sorted(int(expert) for expert in torch.unique(expert_index).detach().cpu().tolist())
+        )
+        errors = hidden_states.new_zeros(self.num_experts, dtype=torch.float32)
+        capacity = self._require_paging_capacity()
+        for offset in range(0, len(selected_ids), capacity):
+            page = selected_ids[offset : offset + capacity]
+            self._stage_execution_page(page)
+            page_ids = torch.tensor(page, dtype=torch.long, device=expert_index.device)
+            self._measure_paged_quantization(errors, page_ids)
+            for expert in page:
+                slot_mask = expert_index == expert
+                rows = token_index[slot_mask]
+                outputs = self.expert_forward(hidden_states[rows], expert, promoted_mask)
+                weighted = routing_weights[slot_mask].unsqueeze(-1) * outputs
+                update = update.index_add(0, rows, weighted)
+        self._publish_paged_quantization(selected_ids, errors)
+        return update
+
+    def _execute_paged_grouped(
+        self,
+        hidden_states: Tensor,
+        token_index: Tensor,
+        expert_index: Tensor,
+        routing_weights: Tensor,
+        promoted_mask: Tensor | None,
+    ) -> Tensor:
+        """Mirror unrestricted grouping/reduction while paging group weights."""
+
+        num_tokens, d_model = hidden_states.shape
+        num_pairs = expert_index.numel()
+        device = hidden_states.device
+        update = hidden_states.new_zeros(num_tokens, d_model)
+        if num_pairs == 0:
+            self._publish_paged_quantization((), hidden_states.new_zeros(self.num_experts))
+            return update
+
+        counts = _pair_counts(expert_index, self.num_experts)
+        starts = torch.cumsum(counts, dim=0) - counts
+        order = torch.argsort(expert_index, stable=True)
+        candidates = torch.arange(self.num_experts, device=device)
+        group_ids = candidates[counts > 0]
+        group_counts = counts[group_ids]
+        group_starts = starts[group_ids]
+        buckets = _power_of_two_count_buckets(group_counts.detach().cpu().tolist())
+        selected_ids = tuple(int(expert) for expert in group_ids.detach().cpu().tolist())
+        errors = hidden_states.new_zeros(self.num_experts, dtype=torch.float32)
+        cache_capacity = self._require_paging_capacity()
+        routed_rows: list[Tensor] = []
+        routed_updates: list[Tensor] = []
+
+        # Preserve the unrestricted executor's bucket and group ordering.
+        # Only each bucket's weight batch is split to respect cache capacity.
+        for bucket_capacity, positions in buckets:
+            for offset in range(0, len(positions), cache_capacity):
+                page_positions_tuple = positions[offset : offset + cache_capacity]
+                page_positions = torch.tensor(
+                    page_positions_tuple,
+                    dtype=torch.long,
+                    device=device,
+                )
+                page_ids = group_ids.index_select(0, page_positions)
+                page = tuple(selected_ids[position] for position in page_positions_tuple)
+                self._stage_execution_page(page)
+                self._measure_paged_quantization(errors, page_ids)
+
+                page_counts = group_counts.index_select(0, page_positions)
+                page_starts = group_starts.index_select(0, page_positions)
+                slot = torch.arange(bucket_capacity, device=device)
+                valid = slot[None, :] < page_counts[:, None]
+                gather = (page_starts[:, None] + slot[None, :]).clamp_max(num_pairs - 1)
+                pair_rows = order[gather]
+                token_rows = token_index[pair_rows]
+                inputs = hidden_states[token_rows]
+
+                gate_weight, up_weight, down_weight = self._stacked_effective_weights(
+                    page_ids,
+                    promoted_mask,
+                )
+                expert_inputs = self._effective_activation(inputs)
+                hidden = F.silu(torch.bmm(expert_inputs, gate_weight)) * torch.bmm(
+                    expert_inputs,
+                    up_weight,
+                )
+                outputs = torch.bmm(self._effective_activation(hidden), down_weight)
+                real_rows = pair_rows[valid]
+                routed_rows.append(real_rows)
+                routed_updates.append(
+                    outputs[valid]
+                    * routing_weights.index_select(0, real_rows).unsqueeze(-1)
+                )
+
+        pair_rows = torch.cat(routed_rows)
+        weighted_updates = torch.cat(routed_updates)
+        self._publish_paged_quantization(selected_ids, errors)
+        return update.index_add(0, token_index.index_select(0, pair_rows), weighted_updates)
+
+    def _require_paging_capacity(self) -> int:
+        capacity = self._offload_capacity
+        if capacity is None or not self.expert_paging_enabled:
+            raise RuntimeError("expert paging has no configured cache capacity")
+        return capacity
+
+    @torch.no_grad()
+    def _measure_paged_quantization(self, errors: Tensor, page_ids: Tensor) -> None:
+        if self.config.expert_fake_quantization:
+            errors[page_ids] = self._quantization_error_for_rows(page_ids)
+
+    def _publish_paged_quantization(
+        self,
+        selected_ids: tuple[int, ...],
+        errors: Tensor,
+    ) -> None:
+        self._last_paged_quantization_ids = selected_ids
+        self._last_paged_quantization_error = errors
 
     def _stacked_effective_weights(
         self,

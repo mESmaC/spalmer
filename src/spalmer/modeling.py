@@ -391,12 +391,15 @@ class SPALMERCausalLM(nn.Module):
         resident_ids: Sequence[int] | None = None,
         non_blocking: bool = True,
         pin_memory: bool | None = None,
+        paging: bool = True,
     ) -> ExpertOffloadTelemetry:
         """Selectively place this eval model for bounded expert inference.
 
         Call this instead of ``model.to(device)``.  Shared weights move to the
-        inference device, complete expert masters stay on CPU, and only the
-        fixed/request-resident expert rows are staged on the device.
+        inference device, complete expert masters stay on CPU, and only a
+        bounded set of expert rows is staged on the device. Paged full-pool
+        routing is the default; pass ``paging=False`` for legacy
+        request-global resident routing.
         """
 
         from spalmer.experts.offload import enable_expert_offload
@@ -408,6 +411,7 @@ class SPALMERCausalLM(nn.Module):
             resident_ids=resident_ids,
             non_blocking=non_blocking,
             pin_memory=pin_memory,
+            paging=paging,
         )
 
     def disable_expert_offload(self, *, device: torch.device | str = "cpu") -> None:

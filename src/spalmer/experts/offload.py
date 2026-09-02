@@ -1,11 +1,17 @@
-"""Physical request-resident inference cache for routed expert banks.
+"""Bounded physical inference caches for routed expert banks.
 
 The checkpoint-visible expert parameters remain one complete CPU bank per
-layer.  A model-owned :class:`ExpertOffloadManager` mirrors exactly the global
-expert ids committed by :class:`~spalmer.experts.residency.ExpertResidency`
-into small, non-persistent execution tensors on the inference device.  The
-same ids occupy the same logical slots in every layer, while weights remain
-layer-local.
+layer. In the default paged mode, routers remain unrestricted and each layer
+stages only the expert rows selected at that layer. Long prefills are tiled
+when their distinct selections exceed cache capacity. The former mode remains
+available with ``paging=False``: it mirrors one request-global identity set
+into every layer and restricts routing to those residents.
+
+The published steady-state cache of each layer contains at most ``capacity``
+rows. Replacement is transactional: new tensors are populated before they are
+published, so a transfer failure leaves the old cache executable. During that
+brief replacement window both old and new tensors may exist (at most roughly
+``2 * capacity`` rows per layer).
 
 This is intentionally an inference backend.  It does not create trainable
 shadow parameters and it does not alter state-dict names, so ordinary
@@ -34,6 +40,7 @@ class ExpertOffloadTelemetry:
     """Auditable placement, occupancy, and cumulative transfer counters."""
 
     enabled: bool
+    paging: bool
     target_device: str | None
     capacity: int
     resident_expert_ids: tuple[int, ...]
@@ -52,9 +59,21 @@ class ExpertOffloadTelemetry:
 
     @property
     def occupancy(self) -> float:
-        """Fraction of the configured identity capacity currently occupied."""
+        """Largest per-layer fraction of physical cache capacity occupied."""
 
-        return len(self.resident_expert_ids) / self.capacity if self.capacity else 0.0
+        if not self.capacity:
+            return 0.0
+        if self.paging:
+            occupied = max((len(ids) for ids in self.cached_expert_ids_by_layer), default=0)
+        else:
+            occupied = len(self.resident_expert_ids)
+        return occupied / self.capacity
+
+    @property
+    def mode(self) -> str:
+        """Human-readable cache policy name."""
+
+        return "paged" if self.paging else "resident"
 
     @property
     def masters_on_cpu(self) -> bool:
@@ -80,7 +99,7 @@ class ExpertOffloadTelemetry:
 
 
 class ExpertOffloadManager:
-    """Synchronize one bounded resident identity set across layer-local banks."""
+    """Own bounded layer caches in paged or request-global resident mode."""
 
     def __init__(
         self,
@@ -90,6 +109,7 @@ class ExpertOffloadManager:
         *,
         capacity: int,
         non_blocking: bool,
+        paging: bool,
     ) -> None:
         if not banks:
             raise ValueError("expert offload requires at least one layer-local expert bank")
@@ -101,6 +121,7 @@ class ExpertOffloadManager:
         self.target_device = target_device
         self.capacity = capacity
         self.non_blocking = non_blocking
+        self.paging = paging
         self._resident_ids: tuple[int, ...] = ()
         self._stage_operations = 0
         self._transferred_rows = 0
@@ -131,6 +152,11 @@ class ExpertOffloadManager:
     def stage(self, expert_ids: Sequence[int], *, force: bool = False) -> None:
         """Stage an exact, sorted identity set in every layer as one operation."""
 
+        if self.paging:
+            raise RuntimeError(
+                "request-global staging is unavailable in paged expert mode"
+            )
+
         raw_ids = tuple(int(expert) for expert in expert_ids)
         desired = tuple(sorted(set(raw_ids)))
         if len(desired) != len(raw_ids):
@@ -160,6 +186,21 @@ class ExpertOffloadManager:
         self._evicted_rows += sum(delta[1] for delta in deltas)
         self._transfer_bytes += sum(delta[2] for delta in deltas)
 
+    def warm(self, expert_ids: Sequence[int]) -> None:
+        """Optionally seed every independent layer cache with the same ids."""
+
+        if not self.paging:
+            raise RuntimeError("cache warming is only available in paged expert mode")
+        desired = tuple(sorted({int(expert) for expert in expert_ids}))
+        if not desired:
+            return
+        if len(desired) > self.capacity:
+            raise ValueError(
+                f"{len(desired)} warm experts exceed physical cache capacity {self.capacity}"
+            )
+        for bank in self._banks:
+            bank._stage_expert_rows(desired)
+
     def install_load_hook(self) -> None:
         """Refresh detached execution caches after master weights are loaded."""
 
@@ -167,7 +208,11 @@ class ExpertOffloadManager:
 
         def refresh_after_load(module: nn.Module, incompatible_keys: object) -> None:
             del module, incompatible_keys
-            if self._resident_ids:
+            if self.paging:
+                for bank in self._banks:
+                    if bank.cached_expert_ids:
+                        bank._stage_expert_rows(bank.cached_expert_ids, force=True)
+            elif self._resident_ids:
                 self.stage(self._resident_ids, force=True)
 
         self._load_hook = model.register_load_state_dict_post_hook(refresh_after_load)
@@ -186,8 +231,20 @@ class ExpertOffloadManager:
             "" if bank.expert_cache_device is None else str(bank.expert_cache_device)
             for bank in self._banks
         )
+        if self.paging:
+            counters = tuple(bank.expert_offload_counters for bank in self._banks)
+            stage_operations = sum(counter[0] for counter in counters)
+            transferred_rows = sum(counter[1] for counter in counters)
+            evicted_rows = sum(counter[2] for counter in counters)
+            transfer_bytes = sum(counter[3] for counter in counters)
+        else:
+            stage_operations = self._stage_operations
+            transferred_rows = self._transferred_rows
+            evicted_rows = self._evicted_rows
+            transfer_bytes = self._transfer_bytes
         return ExpertOffloadTelemetry(
             enabled=True,
+            paging=self.paging,
             target_device=str(self.target_device),
             capacity=self.capacity,
             resident_expert_ids=self._resident_ids,
@@ -203,10 +260,10 @@ class ExpertOffloadManager:
             master_bytes=sum(bank.expert_master_bytes for bank in self._banks),
             cache_bytes=sum(bank.expert_cache_bytes for bank in self._banks),
             cache_index_bytes=sum(bank.expert_cache_index_bytes for bank in self._banks),
-            stage_operations=self._stage_operations,
-            transferred_expert_rows=self._transferred_rows,
-            evicted_expert_rows=self._evicted_rows,
-            transfer_bytes=self._transfer_bytes,
+            stage_operations=stage_operations,
+            transferred_expert_rows=transferred_rows,
+            evicted_expert_rows=evicted_rows,
+            transfer_bytes=transfer_bytes,
         )
 
     def clear(self) -> None:
@@ -235,15 +292,15 @@ def enable_expert_offload(
     resident_ids: Sequence[int] | None = None,
     non_blocking: bool = True,
     pin_memory: bool | None = None,
+    paging: bool = True,
 ) -> ExpertOffloadTelemetry:
-    """Place shared inference weights on ``device`` and cache only resident experts.
+    """Place shared weights on ``device`` and bound layer-local expert caches.
 
     Call this *instead of* ``model.to(device)``.  Complete expert master banks
-    stay on CPU; all other model weights and buffers move normally.  The
-    default fixed resident set is the configured request minimum (or the
-    current bounded set), so inference is immediately usable even without the
-    dynamic residency controller.  Dynamic expansion and rollback reuse the
-    same cache through the shared residency commit boundary.
+    stay on CPU; all other model weights and buffers move normally. By default,
+    routing scores/selects from the full trained pool and selected layer rows
+    are paged on demand. ``resident_ids`` then only warms the physical caches.
+    Set ``paging=False`` to retain legacy request-global masked routing.
     """
 
     if model.training:
@@ -262,13 +319,19 @@ def enable_expert_offload(
 
     banks = _expert_banks(model)
     config = model.residency.config
+    if model.residency.request_open:
+        raise RuntimeError("cannot enable expert offload during an open residency request")
+    previous_residency = model.residency.snapshot_state()
     capacity = config.resident_cap if cache_size is None else int(cache_size)
-    if not model.residency.active_experts <= capacity <= config.num_experts:
+    minimum_capacity = 1 if paging else model.residency.active_experts
+    if not minimum_capacity <= capacity <= config.num_experts:
         raise ValueError(
-            f"cache_size must lie in [{model.residency.active_experts}, "
-            f"{config.num_experts}]; got {capacity}"
+            f"cache_size must lie in [{minimum_capacity}, {config.num_experts}]; "
+            f"got {capacity}"
         )
-    if resident_ids is None:
+    if paging:
+        initial = () if resident_ids is None else tuple(resident_ids)
+    elif resident_ids is None:
         if model.residency.is_full:
             from spalmer.experts.residency import default_resident_ids
 
@@ -279,7 +342,7 @@ def enable_expert_offload(
     else:
         initial = tuple(resident_ids)
     initial = tuple(sorted({int(expert) for expert in initial}))
-    if len(initial) < model.residency.active_experts:
+    if not paging and len(initial) < model.residency.active_experts:
         raise ValueError(
             f"the initial cache needs at least active_experts={model.residency.active_experts} ids"
         )
@@ -287,26 +350,32 @@ def enable_expert_offload(
         raise ValueError(
             f"{len(initial)} initial residents exceed physical cache capacity {capacity}"
         )
-    if model.residency.request_open:
-        raise RuntimeError("cannot enable expert offload during an open residency request")
-
     manager = ExpertOffloadManager(
         model,
         banks,
         target,
         capacity=capacity,
         non_blocking=non_blocking,
+        paging=paging,
     )
     setattr(model, "_expert_offload_manager", manager)
     try:
+        if paging:
+            # Physical cache policy must not inherit a stale logical
+            # restriction. No residency backend is attached in this mode:
+            # router eligibility and cache placement have independent
+            # lifecycles.
+            model.residency.reset()
         for bank in banks:
             bank._prepare_expert_offload(
                 target,
                 capacity=capacity,
                 non_blocking=non_blocking,
                 pin_memory=should_pin,
+                paging=paging,
             )
-        model.residency._attach_offload_backend(manager)
+        if not paging:
+            model.residency._attach_offload_backend(manager)
         manager._allow_model_apply = True
         try:
             model.to(device=target)
@@ -314,12 +383,16 @@ def enable_expert_offload(
             manager._allow_model_apply = False
         concrete_target = model.lm_head.weight.device
         manager.resolve_target(concrete_target)
-        model.residency.set(initial)
+        if paging:
+            manager.warm(initial)
+        else:
+            model.residency.set(initial)
         manager.install_load_hook()
         _validate_physical_placement(model, banks, concrete_target)
     except BaseException:
         manager.clear()
         setattr(model, "_expert_offload_manager", None)
+        model.residency.restore_state(previous_residency)
         raise
     return manager.telemetry()
 
@@ -380,14 +453,20 @@ def _validate_physical_placement(
         raise RuntimeError(
             f"non-expert inference parameters did not reach {target}: {misplaced_shared}"
         )
-    incoherent = [
-        index
-        for index, bank in enumerate(banks)
-        if bank.cached_expert_ids != model.residency.ids
-        or bank.expert_cache_device != target
-    ]
+    manager = getattr(model, "_expert_offload_manager", None)
+    paging = manager is not None and manager.paging
+    incoherent = []
+    for index, bank in enumerate(banks):
+        wrong_device = bank.expert_cache_device != target
+        wrong_policy = paging != bank.expert_paging_enabled
+        over_capacity = len(bank.cached_expert_ids) > (bank.expert_cache_capacity or 0)
+        wrong_global_set = not paging and bank.cached_expert_ids != model.residency.ids
+        if wrong_device or wrong_policy or over_capacity or wrong_global_set:
+            incoherent.append(index)
     if incoherent:
         raise RuntimeError(f"layer expert caches are incoherent: {incoherent}")
+    if paging and not model.residency.is_full:
+        raise RuntimeError("paged expert offload must start with full-pool routing eligibility")
 
 
 __all__ = [

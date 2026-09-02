@@ -30,10 +30,10 @@ count, sequence length, batch size, and training steps are command-line knobs.
 Training telemetry stored in the checkpoint includes the separate LM loss,
 routing load-balance loss, surprise-calibration loss, predictive entropy, the
 promoted expert identities, and the model's average surprise, alongside the
-corpus SHA-256 and training knobs. `spalmer generate ... --dynamic-residency`
-lets the inference residency controller grow the resident candidate set from
-the configured minimum while the prompt's surprise stays above that average;
-the configured per-token top-k remains independent.
+corpus SHA-256 and training knobs. CUDA generation defaults to full-pool
+logical routing with bounded layer-local expert paging. The legacy experimental
+`spalmer generate ... --dynamic-residency` mode instead grows one prompt-global
+resident candidate set while preserving the configured per-token top-k.
 The corpus `--kind` is saved and reused for prompt tokenization; pass
 `spalmer generate ... --kind prose|code|mixed` to override it.
 
@@ -54,16 +54,14 @@ otherwise runs the plain-PyTorch correctness backend.
 - checkpointed expert-wide adaptive potentiation using one coherent promotion
   mask across every layer-local expert bank, decided by precision pressure
   (selection frequency times quantization reconstruction error) alone;
-- one request-level resident expert identity set shared by every layer
-  (`model.residency`): per-token top-k routing is restricted to residents, and
-  the C13 controller grows candidate capacity independently by adding explicit
-  expert ids (starting from the two-expert minimum, recomputing effective NLL
-  after each bounded increment at the same top-k, and rolling back expansions
-  that do not pay) while
-  `model.parameter_accounting()` reports exact resident and per-token active
-  parameter counts. `model.enable_expert_offload(device)` keeps every complete
-  layer-local expert master bank on CPU and stages only those coherent
-  resident identities in bounded, non-checkpointed device caches;
+- full-pool per-token routing with bounded layer-local expert paging:
+  `model.enable_expert_offload(device)` keeps every complete layer-local expert
+  master bank on CPU while independently caching only the rows selected in each
+  layer. Long prefills are tiled when their distinct routes exceed cache
+  capacity, so physical residency does not alter the trained top-k decision.
+  The older prompt-global `model.residency` controller remains available with
+  `paging=False` for explicit experiments, and `model.parameter_accounting()`
+  reports logical resident and per-token active parameter counts;
 - an always-on shared SwiGLU channel path beside the routed micro-experts
   (`shared_inter_dim`), with grouped batched expert execution and a per-expert
   loop reference path;
@@ -139,14 +137,17 @@ size.
 The surprise-calibration target is mixture-level realized NLL attributed by
 routing responsibility. It is not a measured counterfactual NLL for every
 individual or unselected expert. The active expert count is fixed during
-training; the current inference residency controller also preserves that
-per-token top-k while changing the request-level candidate set at prefill.
-CUDA generation enables physical expert offload by default: full expert masters
-remain on CPU while a bounded fixed or dynamically expanded identity set is
-cached on CUDA across every layer. Pass
-`--no-expert-offload` for all-resident CUDA inference, or
-`--expert-cache-size N` to set the physical identity ceiling. The current
-override and cache are model-global and therefore assume serial generation.
+training. CUDA generation enables physical expert offload by default: full
+expert masters remain on CPU, the router scores the complete trained pool, and
+selected rows are paged through an independent bounded cache in each layer.
+`--expert-cache-size N` sets that physical per-layer ceiling without masking
+router choices; long prefills tile all required experts through it. Cache
+replacement is transactional and keeps at most `N` published rows per layer,
+though the brief allocate-before-publish window can hold roughly `2N` rows.
+Pass `--no-expert-offload` for all-resident CUDA inference.
+`--dynamic-residency` explicitly selects the older prompt-global masked policy
+and is experimental for checkpoints trained with full-pool routing. The cache
+runtime assumes serial generation.
 Legacy v1/v2 checkpoints have no calibrated average-surprise state unless one
 was recorded in metadata, so dynamic residency on those bundles uses the
 documented zero-baseline cold start.

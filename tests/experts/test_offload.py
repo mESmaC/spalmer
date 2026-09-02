@@ -67,6 +67,7 @@ def test_model_api_keeps_full_masters_on_cpu_and_only_resident_rows_in_cache() -
         cache_size=4,
         resident_ids=(1, 4),
         pin_memory=False,
+        paging=False,
     )
 
     assert model.execution_device == torch.device("meta")
@@ -99,7 +100,7 @@ def test_model_api_keeps_full_masters_on_cpu_and_only_resident_rows_in_cache() -
 
 def test_default_offload_residency_is_bounded_for_fixed_inference() -> None:
     model = _tiny_model()
-    telemetry = model.enable_expert_offload("meta", pin_memory=False)
+    telemetry = model.enable_expert_offload("meta", pin_memory=False, paging=False)
 
     assert telemetry.capacity == model.residency.config.resident_cap
     assert telemetry.resident_expert_ids == (0, 1)
@@ -111,7 +112,7 @@ def test_default_offload_residency_is_bounded_for_fixed_inference() -> None:
 def test_residency_commits_stage_and_evict_the_same_global_ids_in_every_layer() -> None:
     model = _tiny_model()
     initial = model.enable_expert_offload(
-        "meta", cache_size=3, resident_ids=(0, 1), pin_memory=False
+        "meta", cache_size=3, resident_ids=(0, 1), pin_memory=False, paging=False
     )
     layer_count = len(_banks(model))
     assert initial.transferred_expert_rows == 2 * layer_count
@@ -144,7 +145,7 @@ def test_capacity_failure_and_partial_layer_failure_leave_prior_state_executable
 ) -> None:
     model = _tiny_model()
     model.enable_expert_offload(
-        "meta", cache_size=3, resident_ids=(0, 1), pin_memory=False
+        "meta", cache_size=3, resident_ids=(0, 1), pin_memory=False, paging=False
     )
     before = model.expert_offload_telemetry()
     assert before is not None
@@ -175,7 +176,7 @@ def test_state_dict_load_refreshes_detached_resident_caches() -> None:
     state = source.state_dict()
     model = _tiny_model()
     model.enable_expert_offload(
-        "meta", cache_size=3, resident_ids=(2, 4), pin_memory=False
+        "meta", cache_size=3, resident_ids=(2, 4), pin_memory=False, paging=False
     )
     before = model.expert_offload_telemetry()
     assert before is not None
@@ -250,6 +251,7 @@ def test_cuda_forward_uses_cpu_masters_and_bounded_resident_caches() -> None:
         cache_size=4,
         resident_ids=resident_ids,
         pin_memory=True,
+        paging=False,
     )
     with torch.inference_mode():
         actual = model(input_ids.to(model.execution_device)).logits.cpu()

@@ -5,8 +5,10 @@ Each layer's channel update is the sum of two paths:
 - an always-on **shared** SwiGLU path (general capacity that does not depend
   on which experts are resident), and
 - the **routed** path: every token is sent to the ``active_experts``
-  least-surprised experts among the currently *resident* identities, and the
-  weighted combination of their updates is returned.
+  least-surprised eligible experts, and the weighted combination of their
+  updates is returned. Ordinary/request-resident execution limits eligibility
+  to its logical resident set. Paged offload preserves the trained full-pool
+  decision and treats device residency only as a physical cache concern.
 
 The result is a :class:`spalmer.modeling.ChannelMixerOutput`, ready to drop
 into a ``SPALMERBlock`` channel-mixer slot; the residual addition stays with
@@ -141,7 +143,7 @@ class MicroExpertChannelMixer(nn.Module):
         return self.shared is not None
 
     def forward(self, hidden_states: Tensor, *, state: Any = None) -> ChannelMixerOutput:
-        """Run the shared path, route to resident experts, and combine.
+        """Run the shared path, route to eligible experts, and combine.
 
         Args:
             hidden_states: ``[batch, seq, d_model]`` layer inputs.
@@ -171,16 +173,20 @@ class MicroExpertChannelMixer(nn.Module):
         num_active = self.active_experts
         residency = self.residency
         resident_mask = residency.resident_mask
-        full_pool = residency.is_full
-        if not full_pool and residency.size < num_active:
+        paging = self.experts.expert_paging_enabled
+        # Paging never defines logical eligibility. Enabling it resets this
+        # state to the full pool; an explicit later residency restriction is
+        # still honored rather than silently contradicted by metrics.
+        full_pool_routing = residency.is_full
+        if not full_pool_routing and residency.size < num_active:
             raise ValueError(
                 f"{residency.size} resident experts cannot serve a per-token top-{num_active}"
             )
-        resident_ids = None if full_pool else residency.resident_ids
+        resident_ids = None if full_pool_routing else residency.resident_ids
 
         scores = self.router(hidden_states)
         expert_ids, routing_weights = select_least_surprised_experts(
-            scores, num_active, None if full_pool else resident_mask
+            scores, num_active, None if full_pool_routing else resident_mask
         )
 
         flat_hidden = hidden_states.reshape(batch * seq_len, d_model)
@@ -202,7 +208,11 @@ class MicroExpertChannelMixer(nn.Module):
 
         utilization = expert_utilization(expert_ids, self.config.num_experts)
         quantization_error = self.experts.quantization_error(expert_ids, resident_ids)
-        auxiliary_loss = load_balance_loss(scores, expert_ids, None if full_pool else resident_mask)
+        auxiliary_loss = load_balance_loss(
+            scores,
+            expert_ids,
+            None if full_pool_routing else resident_mask,
+        )
         execution_metrics = _expert_execution_metrics(
             expert_ids,
             num_experts=self.config.num_experts,
@@ -216,6 +226,8 @@ class MicroExpertChannelMixer(nn.Module):
             "expert_quantization_error": quantization_error,
             "promoted_experts": controller.promoted_mask.detach().clone(),
             "resident_experts": resident_mask.detach().clone(),
+            "expert_paging": paging,
+            "routing_full_pool": full_pool_routing,
             "active_experts_per_token": num_active,
             # Distinct experts executed this pass, kept on device (no sync).
             "num_active_experts": (utilization > 0).sum(),
