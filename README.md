@@ -53,9 +53,22 @@ otherwise runs the plain-PyTorch correctness backend.
 - checkpointed expert-wide adaptive potentiation using one coherent promotion
   mask across every layer-local expert bank, decided by precision pressure
   (selection frequency times quantization reconstruction error) alone;
-- a request-level inference residency controller that starts at the two-expert
-  minimum and expands by bounded increments, recomputing effective NLL after
-  each step and rolling back expansions that do not pay.
+- one request-level resident expert identity set shared by every layer
+  (`model.residency`): per-token top-k routing is restricted to residents, and
+  the C13 controller grows capacity by adding explicit expert ids (starting
+  from the two-expert minimum, recomputing effective NLL after each bounded
+  increment, rolling back expansions that do not pay) while
+  `model.parameter_accounting()` reports exact resident and per-token active
+  parameter counts;
+- an always-on shared SwiGLU channel path beside the routed micro-experts
+  (`shared_inter_dim`), with grouped batched expert execution and a per-expert
+  loop reference path;
+- feature-gated C16 lateral mixing with peer-aware active silencing
+  (`directional_config`) and feature-gated ATXY exact memory (`atxy_config`,
+  acting only on forward calls that pass an `ATXYRequest`);
+- `spalmer.presets` shape hooks for 10M/50M/100M-class non-embedding budgets
+  at any vocabulary size, with analytic parameter estimates that match the
+  measured accounting.
 
 The project favors the simplest faithful implementation of each drafted
 component and records experimental limitations explicitly.

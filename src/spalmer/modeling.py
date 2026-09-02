@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from torch import Tensor, nn
@@ -13,6 +14,11 @@ from torch.nn import functional as F
 from spalmer.config import SPALMERConfig
 from spalmer.embeddings import AlternatingPLE
 from spalmer.nn import RMSNorm
+
+if TYPE_CHECKING:
+    from spalmer.experts.accounting import ParameterAccounting
+    from spalmer.experts.residency import ExpertResidency
+    from spalmer.memory import ATXYInjection, ATXYRequest
 
 
 @dataclass(slots=True)
@@ -60,6 +66,9 @@ class SPALMERBlock(nn.Module):
     Token mixers must accept ``state=...`` and return either an update tensor or
     ``(update, new_state)``. Stateful decode uses an explicit ``step`` method.
     Channel mixers may return a same-shaped tensor or :class:`ChannelMixerOutput`.
+    An optional directional mixer (ledger C16) runs as a third pre-norm residual
+    branch after the channel mixer; when it is absent the block behaves exactly
+    as before.
     """
 
     def __init__(
@@ -68,6 +77,7 @@ class SPALMERBlock(nn.Module):
         token_mixer: nn.Module,
         channel_mixer: nn.Module,
         *,
+        directional_mixer: nn.Module | None = None,
         norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -75,6 +85,10 @@ class SPALMERBlock(nn.Module):
         self.token_mixer = token_mixer
         self.channel_norm = RMSNorm(d_model, eps=norm_eps)
         self.channel_mixer = channel_mixer
+        self.directional_norm = (
+            None if directional_mixer is None else RMSNorm(d_model, eps=norm_eps)
+        )
+        self.directional_mixer = directional_mixer
 
     def forward(
         self,
@@ -133,6 +147,15 @@ class SPALMERBlock(nn.Module):
         if auxiliary_loss is not None and not isinstance(auxiliary_loss, Tensor):
             raise TypeError("channel mixer auxiliary_loss must be a tensor or None")
         hidden_states = hidden_states + channel_update
+
+        if self.directional_mixer is not None:
+            directional_update = self.directional_mixer(self.directional_norm(hidden_states))
+            _require_same_shape("directional mixer", directional_update, hidden_states)
+            hidden_states = hidden_states + directional_update
+            directional_metrics = getattr(self.directional_mixer, "last_metrics", {})
+            if directional_metrics:
+                metrics = {**metrics, "directional": dict(directional_metrics)}
+
         return BlockOutput(
             hidden_states=hidden_states,
             token_mixer_state=new_state,
@@ -143,7 +166,19 @@ class SPALMERBlock(nn.Module):
 
 
 class SPALMERBackbone(nn.Module):
-    """Inject per-layer lexical identity and execute composable decoder blocks."""
+    """Inject per-layer lexical identity and execute composable decoder blocks.
+
+    An optional :class:`~spalmer.memory.ATXYInjection` (ledger C03/C04) adds
+    the factorized address embedding at the input, where every KDA/MLA
+    projection can see it, and performs the exact value lookup after its
+    configured block boundary. Both happen only when an
+    :class:`~spalmer.memory.ATXYRequest` is supplied; without the module or
+    without a request the backbone is a plain stack of blocks, so ATXY is
+    never a required data dependency.
+
+    Per-layer auxiliary losses are averaged over the layers that report one, so
+    the total does not scale with layer count.
+    """
 
     def __init__(
         self,
@@ -151,16 +186,28 @@ class SPALMERBackbone(nn.Module):
         blocks: Sequence[SPALMERBlock],
         *,
         embeddings: AlternatingPLE | None = None,
+        atxy: ATXYInjection | None = None,
     ) -> None:
         super().__init__()
         if len(blocks) != config.n_layers:
             raise ValueError(f"expected {config.n_layers} blocks, got {len(blocks)}")
+        if atxy is not None:
+            if atxy.config.d_model != config.d_model:
+                raise ValueError(
+                    f"ATXY d_model={atxy.config.d_model} does not match d_model={config.d_model}"
+                )
+            if not 0 <= atxy.config.injection_layer < config.n_layers:
+                raise ValueError(
+                    f"ATXY injection_layer={atxy.config.injection_layer} is outside "
+                    f"[0, {config.n_layers})"
+                )
         self.config = config
         self.embeddings = embeddings or AlternatingPLE(config.ple_config())
         if self.embeddings.config != config.ple_config():
             raise ValueError("embedding configuration does not match the model configuration")
         self.blocks = nn.ModuleList(blocks)
         self.final_norm = RMSNorm(config.d_model, eps=config.norm_eps)
+        self.atxy = atxy
 
     def forward(
         self,
@@ -172,6 +219,7 @@ class SPALMERBackbone(nn.Module):
         attention_mask: Tensor | None = None,
         state_reset_mask: Tensor | None = None,
         layer_mixer_kwargs: Sequence[Mapping[str, Any] | None] | None = None,
+        atxy: ATXYRequest | None = None,
     ) -> BackboneOutput:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must have shape [batch, sequence], got {input_ids.shape}")
@@ -179,6 +227,15 @@ class SPALMERBackbone(nn.Module):
             raise ValueError("decode mode requires exactly one token per sequence")
         _validate_mask("attention_mask", attention_mask, input_ids)
         _validate_mask("state_reset_mask", state_reset_mask, input_ids)
+        if atxy is not None:
+            if self.atxy is None:
+                raise ValueError("an ATXY request was supplied but the backbone has no ATXY module")
+            _validate_mask("atxy.mask", atxy.mask, input_ids)
+            if atxy.addresses.shape[:2] != input_ids.shape:
+                raise ValueError(
+                    f"atxy.addresses must start with the input_ids shape {tuple(input_ids.shape)}, "
+                    f"got {tuple(atxy.addresses.shape)}"
+                )
 
         token_states = _states_or_none(
             "token mixer",
@@ -200,9 +257,13 @@ class SPALMERBackbone(nn.Module):
             per_layer_kwargs = layer_mixer_kwargs
 
         hidden_states = self.embeddings(input_ids, layer_index=0)
+        if atxy is not None:
+            # C03: the semantic coordinate enters the residual stream at the
+            # input so the KDA/MLA projections of every block can read it.
+            hidden_states = self.atxy.embed_addresses(hidden_states, atxy.addresses, atxy.mask)
         new_token_states: list[Any] = []
         new_channel_states: list[Any] = []
-        auxiliary_loss: Tensor | None = None
+        auxiliary_losses: list[Tensor] = []
         layer_metrics: list[Mapping[str, Any]] = []
         layer_inputs = zip(
             self.blocks,
@@ -226,15 +287,24 @@ class SPALMERBackbone(nn.Module):
                 mixer_kwargs=layer_kwargs,
             )
             hidden_states = block_output.hidden_states
+            if atxy is not None and layer_index == self.atxy.config.injection_layer:
+                # C04: exact lookup and gated value injection at one boundary.
+                hidden_states = self.atxy.inject_values(
+                    hidden_states,
+                    atxy.addresses,
+                    atxy.mask,
+                    atxy.store,
+                    atxy.expected_store_version,
+                )
             new_token_states.append(block_output.token_mixer_state)
             new_channel_states.append(block_output.channel_mixer_state)
             layer_metrics.append(block_output.metrics)
             if block_output.auxiliary_loss is not None:
-                if auxiliary_loss is None:
-                    auxiliary_loss = block_output.auxiliary_loss
-                else:
-                    auxiliary_loss = auxiliary_loss + block_output.auxiliary_loss
+                auxiliary_losses.append(block_output.auxiliary_loss)
 
+        auxiliary_loss = None
+        if auxiliary_losses:
+            auxiliary_loss = torch.stack(auxiliary_losses).mean()
         return BackboneOutput(
             hidden_states=self.final_norm(hidden_states),
             token_mixer_states=tuple(new_token_states),
@@ -253,6 +323,7 @@ class SPALMERCausalLM(nn.Module):
         backbone: SPALMERBackbone,
         *,
         potentiation_controller: nn.Module | None = None,
+        residency: ExpertResidency | None = None,
     ) -> None:
         super().__init__()
         if backbone.config != config:
@@ -262,6 +333,10 @@ class SPALMERCausalLM(nn.Module):
         self.config = config
         self.backbone = backbone
         self.potentiation_controller = potentiation_controller
+        # The one resident identity set shared by every routed channel mixer
+        # (ledger C13). Registered here so it moves with the model; its buffers
+        # are non-persistent because residency is request-level state.
+        self.residency = residency
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         nn.init.normal_(self.lm_head.weight, mean=0.0, std=config.initializer_range)
         # Shared "average surprise" telemetry (ledger C08/C13): the EMA of
@@ -312,7 +387,7 @@ class SPALMERCausalLM(nn.Module):
 
     @property
     def active_experts_override(self) -> int | None:
-        """Residency override applied to the routed mixers, or ``None``."""
+        """Per-token top-``k`` override applied to the routed mixers, or ``None``."""
 
         for block in self.backbone.blocks:
             mixer = block.channel_mixer
@@ -321,12 +396,53 @@ class SPALMERCausalLM(nn.Module):
         return None
 
     def set_active_experts(self, count: int | None) -> None:
-        """Apply one inference residency decision to every routed channel mixer."""
+        """Override the per-token top-``k`` on every routed channel mixer.
+
+        Any call also ends an open controller-managed residency request (the
+        resident set returns to what it was before that request), and ``None``
+        additionally clears every request-level override: the top-``k`` returns
+        to its configured value and the resident set to the full pool.
+        Capacity for a request is grown through :attr:`residency` (explicit
+        expert ids), never through this knob.
+        """
 
         for block in self.backbone.blocks:
             setter = getattr(block.channel_mixer, "set_active_experts", None)
             if callable(setter):
                 setter(count)
+        if self.residency is not None:
+            self.residency.end_request()
+            if count is None:
+                self.residency.reset()
+
+    @property
+    def resident_expert_ids(self) -> tuple[int, ...]:
+        """Exact resident expert ids shared by every layer (all ids when unrouted)."""
+
+        if self.residency is not None:
+            return self.residency.ids
+        for block in self.backbone.blocks:
+            bank = getattr(block.channel_mixer, "experts", None)
+            if bank is not None:
+                return tuple(range(bank.num_experts))
+        return ()
+
+    @contextmanager
+    def residency_session(self, ids: Sequence[int] | None = None) -> Iterator[SPALMERCausalLM]:
+        """Scope request-level residency; the prior resident set is restored on exit."""
+
+        if self.residency is None:
+            yield self
+            return
+        with self.residency.session(ids):
+            yield self
+
+    def parameter_accounting(self) -> ParameterAccounting:
+        """Exact per-component, resident, and per-token parameter counts."""
+
+        from spalmer.experts.accounting import account_parameters
+
+        return account_parameters(self)
 
     def forward(
         self,
@@ -339,6 +455,7 @@ class SPALMERCausalLM(nn.Module):
         attention_mask: Tensor | None = None,
         state_reset_mask: Tensor | None = None,
         layer_mixer_kwargs: Sequence[Mapping[str, Any] | None] | None = None,
+        atxy: ATXYRequest | None = None,
     ) -> CausalLMOutput:
         backbone_output = self.backbone(
             input_ids,
@@ -348,6 +465,7 @@ class SPALMERCausalLM(nn.Module):
             attention_mask=attention_mask,
             state_reset_mask=state_reset_mask,
             layer_mixer_kwargs=layer_mixer_kwargs,
+            atxy=atxy,
         )
         logits = self.lm_head(backbone_output.hidden_states)
         loss = None

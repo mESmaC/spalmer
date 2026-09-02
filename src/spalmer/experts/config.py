@@ -11,16 +11,37 @@ from typing import Literal
 class MicroExpertsConfig:
     """Configuration of one layer-local micro-expert bank and its router.
 
+    Two counts govern expert execution and must not be confused:
+
+    - ``active_experts`` is the per-token top-``k``: how many experts one token
+      executes, chosen among the currently *resident* experts.
+    - the resident set (ledger C13) is one request-level identity set shared by
+      every layer; its size moves between ``min_resident_experts`` and
+      ``max_resident_experts`` by adding explicit expert ids, never by changing
+      ``k``. Outside a residency session every expert is resident.
+
     Args:
         d_model: Residual-stream width shared with the surrounding block.
         num_experts: Number of experts in the bank. The nominal C07 value is
             about 200; tiny tests may use far fewer.
         expert_inter_dim: Hidden width of each expert. ``None`` means
             ``d_model // 2`` (deliberately small experts).
-        active_experts: Experts executed per token (C13 starts at 2).
+        shared_inter_dim: Hidden width of the always-on shared SwiGLU channel
+            path that runs beside the routed experts. ``None`` means
+            ``2 * d_model``; ``0`` removes the shared path (routed only).
+        active_experts: Experts executed per token (top-``k`` among residents).
         min_active_experts: Lower bound enforced on ``active_experts``.
-        max_active_experts: Nominal upper bound (the soft 10% cap of ~20
-            experts for a 200-expert pool).
+        max_active_experts: Upper bound enforced on ``active_experts`` and on
+            its runtime override.
+        min_resident_experts: Residents a request starts with (C13 begins with
+            two). ``None`` resolves to ``max(2, active_experts)``; an explicit
+            value must be at least ``active_experts``.
+        max_resident_experts: Soft residency cap for the expansion controller
+            (the ledger's ~10% of a 200-expert pool). Bounded by
+            ``num_experts``.
+        expert_execution: ``grouped`` executes every resident expert's tokens
+            with padded batched matmuls (no per-expert Python loop);
+            ``loop`` is the per-expert reference path.
         expert_quant_bits: Fake-quantized reference substrate width.
         expert_fake_quantization: Enable the reference low-bit expert substrate.
         expert_stochastic_rounding: Apply stochastic rounding to the low-bit
@@ -38,20 +59,24 @@ class MicroExpertsConfig:
             non-negative; ``identity`` exists only to reproduce legacy
             checkpoints trained with raw router logits.
         router_bias: Learnable bias on the router projection.
-        residency_increment: Experts added per expansion step of the C13
+        residency_increment: Expert ids added per expansion step of the C13
             inference residency controller.
         residency_min_gain: Smallest drop in effective NLL (nats per token)
             that an expansion step must buy to be retained; otherwise the
-            controller rolls back to the previous active count.
+            controller rolls back to the previous resident set.
         initializer_range: Standard deviation of the normal initializations.
     """
 
     d_model: int
     num_experts: int = 200
     expert_inter_dim: int | None = None
+    shared_inter_dim: int | None = None
     active_experts: int = 2
     min_active_experts: int = 2
     max_active_experts: int = 20
+    min_resident_experts: int | None = None
+    max_resident_experts: int = 20
+    expert_execution: Literal["grouped", "loop"] = "grouped"
     expert_quant_bits: int = 4
     expert_fake_quantization: bool = True
     expert_stochastic_rounding: bool = True
@@ -71,8 +96,16 @@ class MicroExpertsConfig:
         _require_positive("num_experts", self.num_experts)
         _require_positive("min_active_experts", self.min_active_experts)
         _require_positive("max_active_experts", self.max_active_experts)
+        if self.min_resident_experts is None:
+            object.__setattr__(self, "min_resident_experts", max(2, self.active_experts))
+        _require_positive("min_resident_experts", self.min_resident_experts)
+        _require_positive("max_resident_experts", self.max_resident_experts)
         if self.expert_inter_dim is not None and self.expert_inter_dim <= 0:
             raise ValueError("expert_inter_dim must be positive when provided")
+        if self.shared_inter_dim is not None and self.shared_inter_dim < 0:
+            raise ValueError("shared_inter_dim must be non-negative when provided")
+        if self.expert_execution not in {"grouped", "loop"}:
+            raise ValueError("expert_execution must be 'grouped' or 'loop'")
         if not 2 <= self.expert_quant_bits <= 8:
             raise ValueError("expert_quant_bits must be between 2 and 8")
         if not 0 <= self.potentiation_budget <= self.num_experts:
@@ -109,6 +142,21 @@ class MicroExpertsConfig:
                 f"active_experts must be in [{self.min_active_experts}, "
                 f"{effective_max}]; got {self.active_experts}"
             )
+        if self.min_resident_experts < self.active_experts:
+            raise ValueError(
+                f"min_resident_experts ({self.min_resident_experts}) cannot be below "
+                f"active_experts ({self.active_experts}): every token needs k residents"
+            )
+        if self.min_resident_experts > self.num_experts:
+            raise ValueError(
+                f"min_resident_experts ({self.min_resident_experts}) cannot exceed "
+                f"num_experts ({self.num_experts})"
+            )
+        if self.min_resident_experts > self.resident_cap:
+            raise ValueError(
+                f"min_resident_experts ({self.min_resident_experts}) cannot exceed the "
+                f"resident cap ({self.resident_cap})"
+            )
 
     @property
     def resolved_inter_dim(self) -> int:
@@ -117,6 +165,38 @@ class MicroExpertsConfig:
         if self.expert_inter_dim is not None:
             return self.expert_inter_dim
         return max(1, self.d_model // 2)
+
+    @property
+    def resolved_shared_inter_dim(self) -> int:
+        """Effective shared-path hidden width (``0`` disables the shared path)."""
+
+        if self.shared_inter_dim is not None:
+            return self.shared_inter_dim
+        return 2 * self.d_model
+
+    @property
+    def resident_cap(self) -> int:
+        """Largest resident set the expansion controller may reach."""
+
+        return min(self.max_resident_experts, self.num_experts)
+
+    @property
+    def expert_parameters_per_layer(self) -> int:
+        """Exact parameter count of one expert in one layer (gate, up, down)."""
+
+        return 3 * self.d_model * self.resolved_inter_dim
+
+    @property
+    def shared_parameters_per_layer(self) -> int:
+        """Exact parameter count of the shared SwiGLU path in one layer."""
+
+        return 3 * self.d_model * self.resolved_shared_inter_dim
+
+    @property
+    def expert_pool_parameters_per_layer(self) -> int:
+        """Exact parameter count of the whole expert bank in one layer."""
+
+        return self.num_experts * self.expert_parameters_per_layer
 
 
 def _require_positive(name: str, value: int) -> None:
