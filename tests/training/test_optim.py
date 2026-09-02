@@ -119,6 +119,112 @@ def test_bf16_optimizer_load_preserves_fp32_moment_values() -> None:
     torch.testing.assert_close(optimizer.state[parameter]["exp_avg_sq"], expected_variance)
 
 
+def test_cpu_offloaded_bf16_moments_update_in_bounded_chunks_and_resume() -> None:
+    parameter = nn.Parameter(torch.zeros(5, dtype=torch.bfloat16))
+    optimizer = BF16MasterAdamW(
+        [parameter],
+        lr=1e-2,
+        betas=(0.9, 0.99),
+        eps=1e-8,
+        stochastic_rounding=False,
+        update_chunk_size=2,
+        state_offload="cpu",
+    )
+    parameter.grad = torch.tensor([1, 2, 3, 4, 5], dtype=torch.bfloat16)
+
+    optimizer.step()
+
+    state = optimizer.state[parameter]
+    assert parameter.dtype == torch.bfloat16
+    assert parameter.device.type == "cpu"
+    assert state["exp_avg"].device.type == "cpu"
+    assert state["exp_avg_sq"].device.type == "cpu"
+    assert state["exp_avg"].dtype == torch.float32
+    assert state["exp_avg_sq"].dtype == torch.float32
+    placement = optimizer.state_placement()
+    assert placement["policy"] == "cpu"
+    assert placement["configured_device"] == "cpu"
+    assert placement["moment_tensors"] == 2
+    assert placement["update_chunk_sizes"] == [2]
+    assert placement["parameter_devices"] == ["cpu"]
+    assert placement["parameter_dtypes"] == ["bfloat16"]
+
+    payload = optimizer.state_dict()
+    restored_parameter = nn.Parameter(parameter.detach().clone())
+    restored = BF16MasterAdamW(
+        [restored_parameter],
+        lr=1e-2,
+        betas=(0.9, 0.99),
+        eps=1e-8,
+        stochastic_rounding=False,
+        update_chunk_size=2,
+        state_offload="cpu",
+    )
+    restored.load_state_dict(payload)
+
+    restored_state = restored.state[restored_parameter]
+    assert restored_state["step"] == 1
+    assert restored_state["exp_avg"].device.type == "cpu"
+    assert restored_state["exp_avg_sq"].device.type == "cpu"
+    torch.testing.assert_close(restored_state["exp_avg"], state["exp_avg"])
+    torch.testing.assert_close(restored_state["exp_avg_sq"], state["exp_avg_sq"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_parameters_keep_fp32_moments_in_pinned_cpu_storage() -> None:
+    parameter = nn.Parameter(torch.zeros(5, dtype=torch.bfloat16, device="cuda"))
+    optimizer = BF16MasterAdamW(
+        [parameter],
+        lr=1e-2,
+        betas=(0.9, 0.99),
+        eps=1e-8,
+        stochastic_rounding=False,
+        update_chunk_size=2,
+        state_offload="cpu",
+    )
+    parameter.grad = torch.ones_like(parameter)
+
+    optimizer.step()
+
+    state = optimizer.state[parameter]
+    assert parameter.device.type == "cuda"
+    assert parameter.dtype == torch.bfloat16
+    assert state["exp_avg"].device.type == "cpu"
+    assert state["exp_avg_sq"].device.type == "cpu"
+    assert state["exp_avg"].dtype == torch.float32
+    assert state["exp_avg_sq"].dtype == torch.float32
+    assert state["exp_avg"].is_pinned()
+    assert state["exp_avg_sq"].is_pinned()
+    placement = optimizer.state_placement()
+    assert placement["devices"] == ["cpu"]
+    assert placement["cpu_pinned"] is True
+    assert placement["parameter_devices"] == ["cuda:0"]
+
+
+def test_cpu_offload_policy_is_selected_by_training_config() -> None:
+    model = nn.Linear(4, 4).to(dtype=torch.bfloat16)
+    config = TrainingConfig(
+        max_steps=2,
+        micro_batch_size=1,
+        sequence_length=8,
+        device="cpu",
+        require_cuda=False,
+        compute_dtype="float32",
+        parameter_dtype="bfloat16",
+        optimizer_state_offload="cpu",
+        optimizer_update_chunk_size=3,
+        fused_adamw="off",
+    )
+
+    bundle = build_optimizers(model, config)
+
+    assert isinstance(bundle.dense, BF16MasterAdamW)
+    assert bundle.dense.optimizer_state_offload == "cpu"
+    assert bundle.dense.state_placement()["update_chunk_sizes"] == [3]
+    assert bundle.state_placement()["dense"]["policy"] == "cpu"
+    assert bundle.state_placement()["sparse"] is None
+
+
 def test_bf16_stochastic_writeback_saturates_finite_overflow_symmetrically() -> None:
     values = torch.tensor([torch.finfo(torch.float32).max, -torch.finfo(torch.float32).max])
     rounded = _stochastic_round_bfloat16(values)
@@ -146,4 +252,33 @@ def test_injected_optimizer_cannot_weaken_bf16_moment_contract() -> None:
     )
 
     with pytest.raises(ValueError, match="BF16MasterAdamW"):
+        _validate_optimizer_precision_contract(incompatible, config)
+
+
+def test_injected_bf16_optimizer_must_match_offload_policy() -> None:
+    parameter = nn.Parameter(torch.zeros(2, dtype=torch.bfloat16))
+    incompatible = OptimizerBundle(
+        dense=BF16MasterAdamW(
+            [parameter],
+            lr=1e-3,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            stochastic_rounding=False,
+            update_chunk_size=2,
+            state_offload="none",
+        ),
+        sparse=None,
+    )
+    config = TrainingConfig(
+        max_steps=1,
+        micro_batch_size=1,
+        sequence_length=8,
+        warmup_steps=0,
+        device="cpu",
+        require_cuda=False,
+        parameter_dtype="bfloat16",
+        optimizer_state_offload="cpu",
+    )
+
+    with pytest.raises(ValueError, match="offload policy"):
         _validate_optimizer_precision_contract(incompatible, config)

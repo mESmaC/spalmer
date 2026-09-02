@@ -59,7 +59,9 @@ otherwise runs the plain-PyTorch correctness backend.
   from the two-expert minimum, recomputing effective NLL after each bounded
   increment, rolling back expansions that do not pay) while
   `model.parameter_accounting()` reports exact resident and per-token active
-  parameter counts;
+  parameter counts. `model.enable_expert_offload(device)` keeps every complete
+  layer-local expert master bank on CPU and stages only those coherent
+  resident identities in bounded, non-checkpointed device caches;
 - an always-on shared SwiGLU channel path beside the routed micro-experts
   (`shared_inter_dim`), with grouped batched expert execution and a per-expert
   loop reference path;
@@ -112,6 +114,10 @@ an ordinary token. The training engine moves only the current mmap sample batch
 to the GPU. Base pretraining keeps one BF16 parameter/master payload and BF16
 gradients; Adam moments remain independent FP32 state. Stochastic BF16 writeback
 preserves small updates without creating a duplicate FP32 master weight copy.
+CPU optimizer-state offload is available as an explicit training policy: FP32
+Adam moments remain in pinned host memory when available, while bounded moment
+chunks visit the accelerator for each update. Same-device moments remain the
+default.
 
 ## Reference-backend boundary
 
@@ -132,8 +138,12 @@ The surprise-calibration target is mixture-level realized NLL attributed by
 routing responsibility. It is not a measured counterfactual NLL for every
 individual or unselected expert. The active expert count is fixed during
 training; at inference the residency controller changes it per request at
-prefill, not per decoded token, and does not yet move experts between devices.
-The current override is model-global and therefore assumes serial generation.
+prefill, not per decoded token. CUDA generation enables physical expert
+offload by default: full expert masters remain on CPU while a bounded fixed or
+dynamically expanded identity set is cached on CUDA across every layer. Pass
+`--no-expert-offload` for all-resident CUDA inference, or
+`--expert-cache-size N` to set the physical identity ceiling. The current
+override and cache are model-global and therefore assume serial generation.
 Legacy v1/v2 checkpoints have no calibrated average-surprise state unless one
 was recorded in metadata, so dynamic residency on those bundles uses the
 documented zero-baseline cold start.

@@ -335,6 +335,11 @@ def _validate_optimizer_precision_contract(
             "BF16 base pretraining requires BF16MasterAdamW with FP32 moments "
             "and no sparse optimizer lane"
         )
+    if optimizer.dense.optimizer_state_offload != config.optimizer_state_offload:
+        raise ValueError(
+            "BF16 base pretraining optimizer-state offload policy does not match "
+            "TrainingConfig"
+        )
 
 
 def _move_optional(value: Tensor | None, device: torch.device) -> Tensor | None:

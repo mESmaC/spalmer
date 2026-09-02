@@ -36,6 +36,7 @@ class TrainingConfig:
     compute_dtype: Literal["bfloat16", "float32"] = "bfloat16"
     parameter_dtype: Literal["bfloat16", "float32"] = "bfloat16"
     optimizer_state_dtype: Literal["float32"] = "float32"
+    optimizer_state_offload: Literal["none", "cpu"] = "none"
     stochastic_parameter_rounding: bool = True
     optimizer_update_chunk_size: int = 1_048_576
     fused_adamw: Literal["auto", "on", "off"] = "auto"
@@ -82,6 +83,12 @@ class TrainingConfig:
             raise ValueError(f"unsupported parameter_dtype: {self.parameter_dtype!r}")
         if self.optimizer_state_dtype != "float32":
             raise ValueError("the current optimizer-state lane must remain float32")
+        if self.optimizer_state_offload not in {"none", "cpu"}:
+            raise ValueError("optimizer_state_offload must be 'none' or 'cpu'")
+        if self.optimizer_state_offload == "cpu" and self.parameter_dtype != "bfloat16":
+            raise ValueError(
+                "CPU optimizer-state offload currently requires the BF16 master-weight lane"
+            )
         if self.optimizer_update_chunk_size <= 0:
             raise ValueError("optimizer_update_chunk_size must be positive")
         if self.parameter_dtype == "bfloat16" and self.fused_adamw == "on":

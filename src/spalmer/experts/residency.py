@@ -27,8 +27,10 @@ Two objects implement it:
   non-resident experts by their predicted surprise on the prompt, adds a
   bounded increment of ids, recomputes, and retains or rolls back.
 
-This is logical residency only: which identities may execute. Physical
-CPU/GPU migration, prefetch, and eviction are deferred.
+When inference expert offload is enabled, this same logical commit boundary
+also stages the selected identities in every layer-local accelerator cache.
+That keeps expansion, recomputation, and rollback atomic at the global expert
+identity level while the complete checkpoint-visible banks remain on CPU.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
+from weakref import ReferenceType, ref
 
 import torch
 from torch import Tensor, nn
@@ -71,6 +74,7 @@ class ExpertResidency(nn.Module):
         self._ids: tuple[int, ...] = tuple(range(config.num_experts))
         self._active_experts_override: int | None = None
         self._request_previous: ResidencyState | None = None
+        self._offload_backend_ref: ReferenceType[Any] | None = None
         self.register_buffer(
             "resident_mask",
             torch.ones(config.num_experts, dtype=torch.bool),
@@ -125,6 +129,32 @@ class ExpertResidency(nn.Module):
         """Largest per-token execution capacity supported by this expert pool."""
 
         return min(self.config.max_active_experts, self.num_experts)
+
+    @property
+    def offload_capacity(self) -> int | None:
+        """Physical cache capacity when inference offload is attached."""
+
+        backend = self._offload_backend()
+        return None if backend is None else int(backend.capacity)
+
+    def _attach_offload_backend(self, backend: Any) -> None:
+        """Attach the model-owned physical cache to this commit boundary."""
+
+        current = self._offload_backend()
+        if current is not None and current is not backend:
+            raise RuntimeError("a different expert offload backend is already attached")
+        self._offload_backend_ref = ref(backend)
+
+    def _detach_offload_backend(self, backend: Any) -> None:
+        """Detach ``backend`` without changing the logical resident set."""
+
+        current = self._offload_backend()
+        if current is backend:
+            self._offload_backend_ref = None
+
+    def _offload_backend(self) -> Any | None:
+        reference = self._offload_backend_ref
+        return None if reference is None else reference()
 
     def reset(self) -> None:
         """Make every expert resident (the training / no-request state)."""
@@ -250,6 +280,11 @@ class ExpertResidency(nn.Module):
             self.restore_state(previous)
 
     def _commit(self, ids: tuple[int, ...]) -> None:
+        backend = self._offload_backend()
+        if backend is not None:
+            # Stage before publishing logical state.  Failed transfers leave
+            # routing masks and the previously executable cache unchanged.
+            backend.stage(ids)
         self._ids = ids
         device = self.resident_mask.device
         # Buffers are rebuilt as ordinary tensors even when the caller runs
@@ -403,6 +438,7 @@ def choose_inference_residency(
     cap = min(
         max(config.resident_cap, previous_per_token),
         residency.max_active_experts,
+        residency.offload_capacity or residency.num_experts,
     )
     average = model.average_surprise
 

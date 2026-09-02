@@ -195,6 +195,20 @@ def _generate_parser() -> argparse.ArgumentParser:
             "configured minimum while the prompt's surprise stays above average"
         ),
     )
+    parser.add_argument(
+        "--expert-offload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "keep complete expert banks on CPU and stage only resident rows on the "
+            "inference device (default: enabled for all CUDA generation)"
+        ),
+    )
+    parser.add_argument(
+        "--expert-cache-size",
+        type=int,
+        help="maximum expert identities staged per layer (default: checkpoint resident cap)",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser
 
@@ -467,8 +481,19 @@ def _run_generate(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     model, tokenizer, metadata = load_checkpoint(args.checkpoint, map_location="cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    model.to(device=device, dtype=dtype)
+    # Cast on CPU first so enabling offload never transiently materializes the
+    # complete expert pool on the accelerator.
+    model.to(dtype=dtype)
     model.eval()
+    use_expert_offload = (
+        device.type == "cuda" if args.expert_offload is None else args.expert_offload
+    )
+    if use_expert_offload:
+        if device.type == "cpu":
+            raise ValueError("--expert-offload requires a non-CPU --device")
+        model.enable_expert_offload(device, cache_size=args.expert_cache_size)
+    else:
+        model.to(device=device)
 
     prompt_kind = args.kind or metadata.get("kind", "mixed")
     if isinstance(tokenizer, Vocab):

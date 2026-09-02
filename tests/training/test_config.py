@@ -18,6 +18,7 @@ def test_token_budget_includes_accumulation() -> None:
     assert config.token_budget == 15_360
     assert config.parameter_dtype == "bfloat16"
     assert config.optimizer_state_dtype == "float32"
+    assert config.optimizer_state_offload == "none"
 
 
 def test_schedule_warms_then_decays_to_floor() -> None:
@@ -38,3 +39,24 @@ def test_schedule_warms_then_decays_to_floor() -> None:
 def test_invalid_warmup_is_rejected() -> None:
     with pytest.raises(ValueError, match="warmup_steps"):
         TrainingConfig(max_steps=5, micro_batch_size=1, sequence_length=8, warmup_steps=5)
+
+
+def test_cpu_optimizer_state_offload_is_an_explicit_bf16_policy() -> None:
+    config = TrainingConfig(
+        max_steps=2,
+        micro_batch_size=1,
+        sequence_length=8,
+        optimizer_state_offload="cpu",
+    )
+
+    assert config.optimizer_state_offload == "cpu"
+    assert config.to_dict()["optimizer_state_offload"] == "cpu"
+
+    with pytest.raises(ValueError, match="requires the BF16 master-weight lane"):
+        TrainingConfig(
+            max_steps=2,
+            micro_batch_size=1,
+            sequence_length=8,
+            parameter_dtype="float32",
+            optimizer_state_offload="cpu",
+        )

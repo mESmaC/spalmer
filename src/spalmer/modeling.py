@@ -17,6 +17,7 @@ from spalmer.nn import RMSNorm
 
 if TYPE_CHECKING:
     from spalmer.experts.accounting import ParameterAccounting
+    from spalmer.experts.offload import ExpertOffloadManager, ExpertOffloadTelemetry
     from spalmer.experts.residency import ExpertResidency
     from spalmer.memory import ATXYInjection, ATXYRequest
 
@@ -337,6 +338,9 @@ class SPALMERCausalLM(nn.Module):
         # (ledger C13). Registered here so it moves with the model; its buffers
         # are non-persistent because residency is request-level state.
         self.residency = residency
+        # Plain runtime state: physical cache tensors are deliberately absent
+        # from the module tree and checkpoint schema.
+        self._expert_offload_manager: ExpertOffloadManager | None = None
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         nn.init.normal_(self.lm_head.weight, mean=0.0, std=config.initializer_range)
         # Shared "average surprise" telemetry (ledger C08/C13): the EMA of
@@ -345,11 +349,79 @@ class SPALMERCausalLM(nn.Module):
         self.register_buffer("surprise_observations", torch.zeros((), dtype=torch.long))
 
     def _apply(self, fn):
+        manager = self._expert_offload_manager
+        if manager is not None and not manager.allow_model_apply:
+            raise RuntimeError(
+                "model.to/cpu/cuda/dtype casts are disabled while expert offload is active; "
+                "call disable_expert_offload(...) first"
+            )
         super()._apply(fn)
         # Module-wide low-precision casts are for weights, not for a slowly
         # moving average that a bf16 update step would silently round away.
         self._buffers["surprise_ema"] = self._buffers["surprise_ema"].float()
         return self
+
+    def train(self, mode: bool = True):
+        """Keep detached inference caches out of all training paths."""
+
+        if mode and self._expert_offload_manager is not None:
+            raise RuntimeError(
+                "expert offload is inference-only; disable it before entering training mode"
+            )
+        return super().train(mode)
+
+    @property
+    def expert_offload_enabled(self) -> bool:
+        """Whether complete expert banks are CPU-backed with resident device caches."""
+
+        return self._expert_offload_manager is not None
+
+    @property
+    def execution_device(self) -> torch.device:
+        """Authoritative device for input tensors and non-expert execution."""
+
+        manager = self._expert_offload_manager
+        return self.lm_head.weight.device if manager is None else manager.target_device
+
+    def enable_expert_offload(
+        self,
+        device: torch.device | str,
+        *,
+        cache_size: int | None = None,
+        resident_ids: Sequence[int] | None = None,
+        non_blocking: bool = True,
+        pin_memory: bool | None = None,
+    ) -> ExpertOffloadTelemetry:
+        """Selectively place this eval model for bounded expert inference.
+
+        Call this instead of ``model.to(device)``.  Shared weights move to the
+        inference device, complete expert masters stay on CPU, and only the
+        fixed/request-resident expert rows are staged on the device.
+        """
+
+        from spalmer.experts.offload import enable_expert_offload
+
+        return enable_expert_offload(
+            self,
+            device,
+            cache_size=cache_size,
+            resident_ids=resident_ids,
+            non_blocking=non_blocking,
+            pin_memory=pin_memory,
+        )
+
+    def disable_expert_offload(self, *, device: torch.device | str = "cpu") -> None:
+        """Drop inference caches and restore ordinary full-bank placement."""
+
+        from spalmer.experts.offload import disable_expert_offload
+
+        disable_expert_offload(self, device=device)
+
+    def expert_offload_telemetry(self) -> ExpertOffloadTelemetry | None:
+        """Return current physical placement/traffic telemetry, if enabled."""
+
+        manager = self._expert_offload_manager
+        return None if manager is None else manager.telemetry()
 
     @property
     def average_surprise(self) -> float:

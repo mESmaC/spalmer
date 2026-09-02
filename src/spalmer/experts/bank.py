@@ -51,6 +51,20 @@ class MicroExpertBank(nn.Module):
         self.gate_proj = nn.Parameter(torch.randn(num_experts, d_model, inter_dim) * std)
         self.up_proj = nn.Parameter(torch.randn(num_experts, d_model, inter_dim) * std)
         self.down_proj = nn.Parameter(torch.randn(num_experts, inter_dim, d_model) * std)
+        # Inference offload deliberately keeps the checkpoint-visible master
+        # parameters above on CPU.  These attributes are plain tensors rather
+        # than buffers: the resident execution copy is request-local cache
+        # state and must never appear in ``state_dict`` or be moved by a later
+        # recursive ``Module.to`` call.
+        self._offload_target: torch.device | None = None
+        self._offload_capacity: int | None = None
+        self._offload_non_blocking = True
+        self._cached_expert_ids: tuple[int, ...] = ()
+        self._cached_slot_by_id: dict[int, int] = {}
+        self._cached_slot_map: Tensor | None = None
+        self._cached_gate_proj: Tensor | None = None
+        self._cached_up_proj: Tensor | None = None
+        self._cached_down_proj: Tensor | None = None
         resolved_weight_format = (
             "mxfp4" if config.expert_weight_format == "legacy_int" else config.expert_weight_format
         )
@@ -84,6 +98,247 @@ class MicroExpertBank(nn.Module):
 
         return self.gate_proj[0].numel() + self.up_proj[0].numel() + self.down_proj[0].numel()
 
+    @property
+    def expert_offload_enabled(self) -> bool:
+        """Whether this bank executes from a request-resident device cache."""
+
+        return self._offload_target is not None
+
+    @property
+    def cached_expert_ids(self) -> tuple[int, ...]:
+        """Global expert identities currently staged in this layer."""
+
+        return self._cached_expert_ids
+
+    @property
+    def expert_cache_device(self) -> torch.device | None:
+        """Device holding resident execution rows, or ``None`` when disabled."""
+
+        return self._offload_target
+
+    @property
+    def expert_master_device(self) -> torch.device:
+        """Device holding the complete checkpoint-visible expert bank."""
+
+        devices = {parameter.device for parameter in self.parameters(recurse=False)}
+        if len(devices) != 1:
+            raise RuntimeError(
+                f"expert master projections span devices: {sorted(map(str, devices))}"
+            )
+        return next(iter(devices))
+
+    @property
+    def expert_master_bytes(self) -> int:
+        """Physical bytes in the complete persistent expert bank."""
+
+        return sum(
+            parameter.numel() * parameter.element_size()
+            for parameter in self.parameters(recurse=False)
+        )
+
+    @property
+    def expert_masters_pinned(self) -> bool:
+        """Whether every CPU master projection uses page-locked storage."""
+
+        parameters = tuple(self.parameters(recurse=False))
+        return bool(parameters) and all(parameter.is_pinned() for parameter in parameters)
+
+    @property
+    def expert_cache_bytes(self) -> int:
+        """Physical bytes in staged expert weights (excluding the tiny id map)."""
+
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (
+                self._cached_gate_proj,
+                self._cached_up_proj,
+                self._cached_down_proj,
+            )
+            if tensor is not None
+        )
+
+    @property
+    def expert_cache_index_bytes(self) -> int:
+        """Physical bytes in the global-id-to-cache-slot lookup."""
+
+        mapping = self._cached_slot_map
+        return 0 if mapping is None else mapping.numel() * mapping.element_size()
+
+    def _apply(self, fn, recurse: bool = True):
+        # ``SPALMERCausalLM.enable_expert_offload`` uses an ordinary recursive
+        # model placement for the shared base.  Once prepared, an expert bank
+        # must opt out or that operation would first materialize all expert
+        # rows on the accelerator and defeat offload before the cache exists.
+        if self.expert_offload_enabled:
+            return self
+        return super()._apply(fn, recurse=recurse)
+
+    @torch.no_grad()
+    def _prepare_expert_offload(
+        self,
+        target_device: torch.device,
+        *,
+        capacity: int,
+        non_blocking: bool,
+        pin_memory: bool,
+    ) -> None:
+        """Keep masters on CPU and prepare an empty inference cache."""
+
+        if self.training:
+            raise RuntimeError("expert offload is inference-only; put the model in eval mode first")
+        if self.expert_offload_enabled:
+            raise RuntimeError("expert offload is already enabled for this bank")
+        if not 1 <= capacity <= self.num_experts:
+            raise ValueError(
+                f"expert cache capacity must lie in [1, {self.num_experts}]; got {capacity}"
+            )
+        # Do this before setting ``_offload_target`` so our _apply override
+        # does not intercept the CPU migration.  Parameter identity and names
+        # remain unchanged, preserving optimizers/checkpoints after offload is
+        # explicitly disabled.
+        self.to(device="cpu")
+        if pin_memory:
+            for parameter in self.parameters(recurse=False):
+                try:
+                    parameter.data = parameter.detach().pin_memory()
+                    if parameter.grad is not None:
+                        parameter.grad.data = parameter.grad.detach().pin_memory()
+                except RuntimeError:
+                    # Page locking is an optimization, not a correctness
+                    # requirement. Telemetry reports the resulting mixed or
+                    # pageable state truthfully and ``Tensor.to`` falls back
+                    # to a synchronous host transfer where necessary.
+                    break
+        self._offload_target = target_device
+        self._offload_capacity = capacity
+        self._offload_non_blocking = non_blocking
+
+    @torch.no_grad()
+    def _stage_expert_rows(
+        self,
+        expert_ids: tuple[int, ...],
+        *,
+        force: bool = False,
+    ) -> tuple[int, int, int]:
+        """Atomically stage exact global ids and return rows-in, rows-out, bytes-in."""
+
+        target = self._offload_target
+        capacity = self._offload_capacity
+        if target is None or capacity is None:
+            raise RuntimeError("expert offload has not been prepared for this bank")
+        if not expert_ids:
+            raise ValueError("at least one expert must be staged")
+        if len(expert_ids) > capacity:
+            raise ValueError(
+                f"{len(expert_ids)} resident experts exceed cache capacity {capacity}"
+            )
+        if tuple(sorted(set(expert_ids))) != expert_ids:
+            raise ValueError("staged expert ids must be unique and sorted")
+        if expert_ids[0] < 0 or expert_ids[-1] >= self.num_experts:
+            raise ValueError(f"expert ids must lie in [0, {self.num_experts})")
+        if any(parameter.device.type != "cpu" for parameter in self.parameters(recurse=False)):
+            raise RuntimeError("offloaded expert master parameters must remain on CPU")
+        if not force and expert_ids == self._cached_expert_ids:
+            return 0, 0, 0
+
+        old_ids = self._cached_expert_ids
+        old_slots = self._cached_slot_by_id
+        retained = () if force else tuple(expert for expert in expert_ids if expert in old_slots)
+        incoming = tuple(expert for expert in expert_ids if expert not in set(retained))
+        evicted = tuple(expert for expert in old_ids if expert not in set(expert_ids))
+        new_slots = {expert: slot for slot, expert in enumerate(expert_ids)}
+
+        def stage_projection(parameter: Tensor, cached: Tensor | None) -> Tensor:
+            shape = (len(expert_ids), *parameter.shape[1:])
+            staged = torch.empty(shape, dtype=parameter.dtype, device=target)
+            if retained:
+                assert cached is not None
+                old_index = torch.tensor(
+                    [old_slots[expert] for expert in retained],
+                    dtype=torch.long,
+                    device=target,
+                )
+                new_index = torch.tensor(
+                    [new_slots[expert] for expert in retained],
+                    dtype=torch.long,
+                    device=target,
+                )
+                staged.index_copy_(0, new_index, cached.index_select(0, old_index))
+            if incoming:
+                source_index = torch.tensor(incoming, dtype=torch.long, device=parameter.device)
+                transferred = parameter.detach().index_select(0, source_index).to(
+                    device=target,
+                    non_blocking=self._offload_non_blocking,
+                )
+                destination_index = torch.tensor(
+                    [new_slots[expert] for expert in incoming],
+                    dtype=torch.long,
+                    device=target,
+                )
+                staged.index_copy_(0, destination_index, transferred)
+            return staged
+
+        # Construct every projection before publishing any of them.  A failed
+        # allocation/transfer therefore leaves the prior executable cache
+        # intact for manager-level rollback across layers.
+        gate = stage_projection(self.gate_proj, self._cached_gate_proj)
+        up = stage_projection(self.up_proj, self._cached_up_proj)
+        down = stage_projection(self.down_proj, self._cached_down_proj)
+        slot_map = torch.full(
+            (self.num_experts,),
+            -1,
+            dtype=torch.long,
+            device=target,
+        )
+        id_tensor = torch.tensor(expert_ids, dtype=torch.long, device=target)
+        slot_map[id_tensor] = torch.arange(len(expert_ids), dtype=torch.long, device=target)
+
+        self._cached_gate_proj = gate
+        self._cached_up_proj = up
+        self._cached_down_proj = down
+        self._cached_slot_map = slot_map
+        self._cached_expert_ids = expert_ids
+        self._cached_slot_by_id = new_slots
+        bytes_per_row = self.parameters_per_expert * self.gate_proj.element_size()
+        return len(incoming), len(evicted), len(incoming) * bytes_per_row
+
+    def _set_expert_offload_target(self, target_device: torch.device) -> None:
+        """Resolve an index-less target before the first cache allocation."""
+
+        if self._cached_expert_ids:
+            raise RuntimeError("cannot change an expert cache target after staging")
+        if not self.expert_offload_enabled:
+            raise RuntimeError("expert offload has not been prepared for this bank")
+        self._offload_target = target_device
+
+    def _clear_expert_offload(self) -> None:
+        """Drop request-local cache tensors while leaving CPU masters intact."""
+
+        self._cached_gate_proj = None
+        self._cached_up_proj = None
+        self._cached_down_proj = None
+        self._cached_slot_map = None
+        self._cached_expert_ids = ()
+        self._cached_slot_by_id = {}
+        self._offload_target = None
+        self._offload_capacity = None
+
+    def _cached_projection_rows(self, name: str, expert_ids: Tensor) -> Tensor:
+        cache = getattr(self, f"_cached_{name}")
+        slot_map = self._cached_slot_map
+        target = self._offload_target
+        if cache is None or slot_map is None or target is None:
+            raise RuntimeError("resident expert cache is not populated")
+        if expert_ids.device != target:
+            raise RuntimeError(
+                f"expert ids are on {expert_ids.device}, but the resident cache is on {target}"
+            )
+        slots = slot_map[expert_ids]
+        if target.type != "meta" and bool((slots < 0).any()):
+            missing = expert_ids[slots < 0].detach().cpu().tolist()
+            raise RuntimeError(f"experts {missing} are not resident in the device cache")
+        return cache.index_select(0, slots)
+
     def expert_forward(
         self,
         hidden_states: Tensor,
@@ -93,9 +348,26 @@ class MicroExpertBank(nn.Module):
         """Apply a single expert to ``[tokens, d_model]`` hidden states."""
 
         promoted = None if promoted_mask is None else promoted_mask[expert_index]
-        gate_weight = self._effective_weight(self.gate_proj[expert_index], promoted)
-        up_weight = self._effective_weight(self.up_proj[expert_index], promoted)
-        down_weight = self._effective_weight(self.down_proj[expert_index], promoted)
+        if self.expert_offload_enabled:
+            try:
+                slot = self._cached_slot_by_id[expert_index]
+            except KeyError as error:
+                raise RuntimeError(
+                    f"expert {expert_index} is not resident in the device cache"
+                ) from error
+            assert self._cached_gate_proj is not None
+            assert self._cached_up_proj is not None
+            assert self._cached_down_proj is not None
+            gate_shadow = self._cached_gate_proj[slot]
+            up_shadow = self._cached_up_proj[slot]
+            down_shadow = self._cached_down_proj[slot]
+        else:
+            gate_shadow = self.gate_proj[expert_index]
+            up_shadow = self.up_proj[expert_index]
+            down_shadow = self.down_proj[expert_index]
+        gate_weight = self._effective_weight(gate_shadow, promoted)
+        up_weight = self._effective_weight(up_shadow, promoted)
+        down_weight = self._effective_weight(down_shadow, promoted)
         expert_input = self._effective_activation(hidden_states)
         gate = F.silu(expert_input @ gate_weight)
         up = expert_input @ up_weight
@@ -187,13 +459,26 @@ class MicroExpertBank(nn.Module):
         the potentiation controller treats as "not measured".
         """
 
-        errors = torch.zeros(self.num_experts, dtype=torch.float32, device=self.gate_proj.device)
+        error_device = (
+            self._offload_target if self.expert_offload_enabled else self.gate_proj.device
+        )
+        assert error_device is not None
+        errors = torch.zeros(self.num_experts, dtype=torch.float32, device=error_device)
         if not self.config.expert_fake_quantization:
             return errors
         squared_error: Tensor | None = None
         squared_weight: Tensor | None = None
-        for parameter in (self.gate_proj, self.up_proj, self.down_proj):
-            shadow = parameter if resident_ids is None else parameter[resident_ids]
+        for name, parameter in (
+            ("gate_proj", self.gate_proj),
+            ("up_proj", self.up_proj),
+            ("down_proj", self.down_proj),
+        ):
+            if self.expert_offload_enabled:
+                if resident_ids is None:
+                    raise RuntimeError("offloaded execution requires explicit resident expert ids")
+                shadow = self._cached_projection_rows(name, resident_ids)
+            else:
+                shadow = parameter if resident_ids is None else parameter[resident_ids]
             if self.config.expert_weight_format == "legacy_int":
                 low = fake_quantize_low_bit(
                     shadow,
@@ -328,7 +613,16 @@ class MicroExpertBank(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Effective (quantized / promoted) weights of the given experts, stacked."""
 
-        if group_ids is None:
+        if self.expert_offload_enabled:
+            if group_ids is None:
+                raise RuntimeError("offloaded execution requires explicit resident expert ids")
+            promoted = None if promoted_mask is None else promoted_mask[group_ids]
+            stacks = (
+                self._cached_projection_rows("gate_proj", group_ids),
+                self._cached_projection_rows("up_proj", group_ids),
+                self._cached_projection_rows("down_proj", group_ids),
+            )
+        elif group_ids is None:
             promoted = promoted_mask
             stacks = (self.gate_proj, self.up_proj, self.down_proj)
         else:

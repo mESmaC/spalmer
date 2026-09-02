@@ -82,6 +82,8 @@ class BF16MasterAdamW(torch.optim.Optimizer):
     Updates are formed a bounded chunk at a time in FP32, then written directly
     to the sole BF16 parameter payload. Optional stochastic rounding preserves
     sub-ULP updates in expectation without retaining a full-sized FP32 master.
+    When ``state_offload='cpu'``, moment tensors remain in CPU storage and only
+    one bounded pair of moment chunks visits the parameter device at a time.
     """
 
     def __init__(
@@ -93,6 +95,7 @@ class BF16MasterAdamW(torch.optim.Optimizer):
         eps: float,
         stochastic_rounding: bool,
         update_chunk_size: int,
+        state_offload: str = "none",
     ) -> None:
         if lr < 0:
             raise ValueError("learning rate cannot be negative")
@@ -100,6 +103,8 @@ class BF16MasterAdamW(torch.optim.Optimizer):
             raise ValueError("epsilon must be positive")
         if update_chunk_size <= 0:
             raise ValueError("update_chunk_size must be positive")
+        if state_offload not in {"none", "cpu"}:
+            raise ValueError("state_offload must be 'none' or 'cpu'")
         beta1, beta2 = betas
         if not 0 <= beta1 < 1 or not 0 <= beta2 < 1:
             raise ValueError("Adam betas must be in [0, 1)")
@@ -109,8 +114,50 @@ class BF16MasterAdamW(torch.optim.Optimizer):
             "eps": eps,
             "stochastic_rounding": stochastic_rounding,
             "update_chunk_size": update_chunk_size,
+            "state_offload": state_offload,
         }
         super().__init__(params, defaults)
+        self._state_offload = state_offload
+
+    @property
+    def optimizer_state_offload(self) -> str:
+        """Configured moment placement policy (``none`` or ``cpu``)."""
+
+        return self._state_offload
+
+    def state_placement(self) -> dict[str, Any]:
+        """Return observed optimizer-state placement for receipts and UI telemetry."""
+
+        parameters = [
+            parameter
+            for group in self.param_groups
+            for parameter in group["params"]
+        ]
+        moments = [
+            value
+            for state in self.state.values()
+            for name in ("exp_avg", "exp_avg_sq")
+            if isinstance((value := state.get(name)), Tensor)
+        ]
+        cpu_moments = [value for value in moments if value.device.type == "cpu"]
+        pinned = [value.is_pinned() for value in cpu_moments]
+        return {
+            "policy": self._state_offload,
+            "configured_device": "cpu" if self._state_offload == "cpu" else "parameter",
+            "moment_dtype": "float32",
+            "initialized": bool(moments),
+            "moment_tensors": len(moments),
+            "moment_bytes": sum(value.numel() * value.element_size() for value in moments),
+            "devices": sorted({str(value.device) for value in moments}),
+            "cpu_pinned": all(pinned) if pinned else None,
+            "parameter_devices": sorted({str(value.device) for value in parameters}),
+            "parameter_dtypes": sorted(
+                {str(value.dtype).removeprefix("torch.") for value in parameters}
+            ),
+            "update_chunk_sizes": sorted(
+                {int(group["update_chunk_size"]) for group in self.param_groups}
+            ),
+        }
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -118,100 +165,138 @@ class BF16MasterAdamW(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        for group in self.param_groups:
-            lr = float(group["lr"])
-            beta1, beta2 = group["betas"]
-            eps = float(group["eps"])
-            weight_decay = float(group.get("weight_decay", 0.0))
-            stochastic = bool(group["stochastic_rounding"])
-            chunk_size = int(group["update_chunk_size"])
-            for parameter in group["params"]:
-                gradient = parameter.grad
-                if gradient is None:
-                    continue
-                if gradient.is_sparse:
-                    raise RuntimeError("BF16MasterAdamW does not accept sparse gradients")
-                if parameter.dtype != torch.bfloat16:
-                    raise TypeError(
-                        "BF16MasterAdamW requires BF16 parameters; "
-                        f"received {parameter.dtype}"
+        pending_cuda_devices: set[torch.device] = set()
+        try:
+            for group in self.param_groups:
+                if group.get("state_offload", "none") != self._state_offload:
+                    raise RuntimeError(
+                        "optimizer parameter groups disagree on state offload policy"
                     )
-                state = self.state[parameter]
-                if not state:
-                    state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(
+                lr = float(group["lr"])
+                beta1, beta2 = group["betas"]
+                eps = float(group["eps"])
+                weight_decay = float(group.get("weight_decay", 0.0))
+                stochastic = bool(group["stochastic_rounding"])
+                chunk_size = int(group["update_chunk_size"])
+                for parameter in group["params"]:
+                    gradient = parameter.grad
+                    if gradient is None:
+                        continue
+                    if gradient.is_sparse:
+                        raise RuntimeError("BF16MasterAdamW does not accept sparse gradients")
+                    if parameter.dtype != torch.bfloat16:
+                        raise TypeError(
+                            "BF16MasterAdamW requires BF16 parameters; "
+                            f"received {parameter.dtype}"
+                        )
+                    state = self.state[parameter]
+                    if not state:
+                        state["step"] = 0
+                        state["exp_avg"] = _new_moment_tensor(
+                            parameter,
+                            state_offload=self._state_offload,
+                        )
+                        state["exp_avg_sq"] = _new_moment_tensor(
+                            parameter,
+                            state_offload=self._state_offload,
+                        )
+                    _validate_moment_state(
                         parameter,
-                        dtype=torch.float32,
-                        memory_format=torch.preserve_format,
+                        state,
+                        state_offload=self._state_offload,
                     )
-                    state["exp_avg_sq"] = torch.zeros_like(
-                        parameter,
-                        dtype=torch.float32,
-                        memory_format=torch.preserve_format,
-                    )
-                state["step"] += 1
-                step = int(state["step"])
-                exp_avg = state["exp_avg"]
-                exp_avg_sq = state["exp_avg_sq"]
-                bias_correction1 = 1.0 - beta1**step
-                bias_correction2 = 1.0 - beta2**step
-                step_size = lr / bias_correction1
-                correction2_sqrt = bias_correction2**0.5
+                    state["step"] += 1
+                    step = int(state["step"])
+                    exp_avg = state["exp_avg"]
+                    exp_avg_sq = state["exp_avg_sq"]
+                    bias_correction1 = 1.0 - beta1**step
+                    bias_correction2 = 1.0 - beta2**step
+                    step_size = lr / bias_correction1
+                    correction2_sqrt = bias_correction2**0.5
 
-                parameter_flat = parameter.view(-1)
-                gradient_flat = gradient.contiguous().view(-1)
-                exp_avg_flat = exp_avg.view(-1)
-                exp_avg_sq_flat = exp_avg_sq.view(-1)
-                for start in range(0, parameter.numel(), chunk_size):
-                    stop = min(parameter.numel(), start + chunk_size)
-                    grad = gradient_flat[start:stop].float()
-                    mean = exp_avg_flat[start:stop]
-                    variance = exp_avg_sq_flat[start:stop]
-                    mean.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-                    variance.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                    parameter_flat = parameter.view(-1)
+                    gradient_flat = gradient.contiguous().view(-1)
+                    exp_avg_flat = exp_avg.view(-1)
+                    exp_avg_sq_flat = exp_avg_sq.view(-1)
+                    for start in range(0, parameter.numel(), chunk_size):
+                        stop = min(parameter.numel(), start + chunk_size)
+                        grad = gradient_flat[start:stop].float()
+                        mean_storage = exp_avg_flat[start:stop]
+                        variance_storage = exp_avg_sq_flat[start:stop]
+                        moments_staged = mean_storage.device != parameter.device
+                        mean, non_blocking = _stage_moment_chunk(
+                            mean_storage,
+                            parameter.device,
+                        )
+                        variance, variance_non_blocking = _stage_moment_chunk(
+                            variance_storage,
+                            parameter.device,
+                        )
+                        non_blocking = non_blocking and variance_non_blocking
+                        if non_blocking:
+                            pending_cuda_devices.add(parameter.device)
+                        mean.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                        variance.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
 
-                    updated = parameter_flat[start:stop].float()
-                    if weight_decay:
-                        updated.mul_(1.0 - lr * weight_decay)
-                    denominator = variance.sqrt().div_(correction2_sqrt).add_(eps)
-                    updated.addcdiv_(mean, denominator, value=-step_size)
-                    rounded = (
-                        _stochastic_round_bfloat16(updated)
-                        if stochastic
-                        else updated.to(torch.bfloat16)
-                    )
-                    parameter_flat[start:stop].copy_(rounded)
+                        updated = parameter_flat[start:stop].float()
+                        if weight_decay:
+                            updated.mul_(1.0 - lr * weight_decay)
+                        denominator = variance.sqrt().div_(correction2_sqrt).add_(eps)
+                        updated.addcdiv_(mean, denominator, value=-step_size)
+                        rounded = (
+                            _stochastic_round_bfloat16(updated)
+                            if stochastic
+                            else updated.to(torch.bfloat16)
+                        )
+                        parameter_flat[start:stop].copy_(rounded)
+                        if moments_staged:
+                            mean_storage.copy_(mean, non_blocking=non_blocking)
+                            variance_storage.copy_(variance, non_blocking=non_blocking)
+        finally:
+            # A CPU consumer (checkpointing, telemetry, or the next host-side
+            # update) cannot observe pinned destinations until D2H copies end.
+            for device in pending_cuda_devices:
+                torch.cuda.current_stream(device).synchronize()
         return loss
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        # ``Optimizer.load_state_dict`` normally casts floating state tensors
-        # to the parameter dtype. Preserve references to the original FP32
-        # moments so that loading a BF16 parameter optimizer cannot quantize
-        # them before we restore the optimizer-state contract below.
-        saved_moments: list[tuple[nn.Parameter, dict[str, Any]]] = []
+        # PyTorch normally casts floating optimizer state to the parameter's
+        # dtype/device. Strip the two moments before delegating so resume never
+        # creates full-sized BF16 moment copies on the accelerator, then restore
+        # their exact FP32 values directly into the configured storage lane.
         saved_groups = state_dict.get("param_groups", [])
-        if len(saved_groups) == len(self.param_groups):
-            for saved_group, current_group in zip(
-                saved_groups,
-                self.param_groups,
-                strict=True,
-            ):
-                saved_ids = saved_group.get("params", [])
-                current_parameters = current_group.get("params", [])
-                if len(saved_ids) != len(current_parameters):
-                    break
-                saved_moments.extend(
-                    (
-                        parameter,
-                        state_dict.get("state", {}).get(saved_id, {}),
-                    )
-                    for saved_id, parameter in zip(
-                        saved_ids,
-                        current_parameters,
-                        strict=True,
-                    )
+        saved_state = state_dict.get("state", {})
+        stripped_groups = [dict(group) for group in saved_groups]
+        for group in stripped_groups:
+            group["state_offload"] = self._state_offload
+        stripped_state = {
+            key: {
+                name: value
+                for name, value in value.items()
+                if name not in {"exp_avg", "exp_avg_sq"}
+            }
+            for key, value in saved_state.items()
+        }
+        super().load_state_dict(
+            {
+                **state_dict,
+                "state": stripped_state,
+                "param_groups": stripped_groups,
+            }
+        )
+        saved_moments: list[tuple[nn.Parameter, dict[str, Any]]] = []
+        for saved_group, current_group in zip(saved_groups, self.param_groups, strict=True):
+            saved_moments.extend(
+                (
+                    parameter,
+                    saved_state.get(saved_id, {}),
                 )
-        super().load_state_dict(state_dict)
+                for saved_id, parameter in zip(
+                    saved_group.get("params", []),
+                    current_group.get("params", []),
+                    strict=True,
+                )
+            )
         for parameter, saved_state in saved_moments:
             state = self.state.get(parameter)
             if state is None:
@@ -219,20 +304,88 @@ class BF16MasterAdamW(torch.optim.Optimizer):
             for name in ("exp_avg", "exp_avg_sq"):
                 value = saved_state.get(name)
                 if isinstance(value, Tensor):
-                    state[name] = value.detach().to(
-                        device=parameter.device,
-                        dtype=torch.float32,
-                        copy=True,
+                    state[name] = _restore_moment_tensor(
+                        value,
+                        parameter,
+                        state_offload=self._state_offload,
                     )
-        invalid = [
-            name
-            for state in self.state.values()
-            for name in ("exp_avg", "exp_avg_sq")
-            if isinstance(state.get(name), Tensor)
-            and state[name].dtype != torch.float32
-        ]
-        if invalid:
-            raise ValueError("loaded BF16MasterAdamW moments must remain FP32")
+            if state:
+                _validate_moment_state(
+                    parameter,
+                    state,
+                    state_offload=self._state_offload,
+                )
+
+
+def _new_moment_tensor(parameter: nn.Parameter, *, state_offload: str) -> Tensor:
+    if state_offload == "none":
+        return torch.zeros_like(
+            parameter,
+            dtype=torch.float32,
+            memory_format=torch.preserve_format,
+        )
+    prefer_pinned = parameter.device.type == "cuda"
+    try:
+        return torch.zeros(
+            tuple(parameter.shape),
+            dtype=torch.float32,
+            device="cpu",
+            pin_memory=prefer_pinned,
+        )
+    except (RuntimeError, TypeError):
+        # CUDA can be present while the pinned allocator is unavailable or its
+        # quota is exhausted. Pageable CPU state remains correct, just slower.
+        return torch.zeros(tuple(parameter.shape), dtype=torch.float32, device="cpu")
+
+
+def _stage_moment_chunk(moment: Tensor, parameter_device: torch.device) -> tuple[Tensor, bool]:
+    if moment.device == parameter_device:
+        return moment, False
+    non_blocking = (
+        parameter_device.type == "cuda"
+        and moment.device.type == "cpu"
+        and moment.is_pinned()
+    )
+    return moment.to(device=parameter_device, non_blocking=non_blocking), non_blocking
+
+
+def _restore_moment_tensor(
+    value: Tensor,
+    parameter: nn.Parameter,
+    *,
+    state_offload: str,
+) -> Tensor:
+    if tuple(value.shape) != tuple(parameter.shape):
+        raise ValueError("loaded BF16MasterAdamW moment shape does not match its parameter")
+    if state_offload == "none":
+        return value.detach().to(device=parameter.device, dtype=torch.float32, copy=True)
+    restored = _new_moment_tensor(parameter, state_offload="cpu")
+    non_blocking = value.device.type == "cuda" and restored.is_pinned()
+    restored.copy_(value.detach(), non_blocking=non_blocking)
+    if non_blocking:
+        torch.cuda.current_stream(value.device).synchronize()
+    return restored
+
+
+def _validate_moment_state(
+    parameter: nn.Parameter,
+    state: dict[str, Any],
+    *,
+    state_offload: str,
+) -> None:
+    expected_device = torch.device("cpu") if state_offload == "cpu" else parameter.device
+    for name in ("exp_avg", "exp_avg_sq"):
+        value = state.get(name)
+        if not isinstance(value, Tensor):
+            raise ValueError(f"BF16MasterAdamW state is missing {name}")
+        if value.dtype != torch.float32:
+            raise ValueError("BF16MasterAdamW moments must remain FP32")
+        if value.device != expected_device:
+            raise ValueError(
+                f"BF16MasterAdamW {name} must reside on {expected_device}, found {value.device}"
+            )
+        if tuple(value.shape) != tuple(parameter.shape):
+            raise ValueError(f"BF16MasterAdamW {name} shape does not match its parameter")
 
 
 def _stochastic_round_bfloat16(values: Tensor) -> Tensor:
@@ -302,6 +455,14 @@ class OptimizerBundle:
         _load_optional_optimizer("dense", self.dense, state.get("dense"))
         _load_optional_optimizer("sparse", self.sparse, state.get("sparse"))
 
+    def state_placement(self) -> dict[str, dict[str, Any] | None]:
+        """Report configured and observed placement for every optimizer lane."""
+
+        return {
+            "dense": _optimizer_state_placement(self.dense),
+            "sparse": _optimizer_state_placement(self.sparse),
+        }
+
     def set_learning_rate(self, value: float) -> None:
         if value < 0:
             raise ValueError("learning rate cannot be negative")
@@ -344,6 +505,7 @@ def build_optimizers(model: nn.Module, config: TrainingConfig) -> OptimizerBundl
                 eps=config.adam_epsilon,
                 stochastic_rounding=config.stochastic_parameter_rounding,
                 update_chunk_size=config.optimizer_update_chunk_size,
+                state_offload=config.optimizer_state_offload,
             )
         else:
             requested_fused = config.fused_adamw == "on" or (
@@ -391,6 +553,46 @@ def gradients_are_finite(parameters: tuple[nn.Parameter, ...] | list[nn.Paramete
     if not checks:
         return True
     return bool(torch.stack(checks).all())
+
+
+def _optimizer_state_placement(
+    optimizer: torch.optim.Optimizer | None,
+) -> dict[str, Any] | None:
+    if optimizer is None:
+        return None
+    reporter = getattr(optimizer, "state_placement", None)
+    if callable(reporter):
+        return dict(reporter())
+    parameters = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    moments = [
+        value
+        for state in optimizer.state.values()
+        for name in ("exp_avg", "exp_avg_sq")
+        if isinstance((value := state.get(name)), Tensor)
+    ]
+    cpu_moments = [value for value in moments if value.device.type == "cpu"]
+    pinned = [value.is_pinned() for value in cpu_moments]
+    return {
+        "policy": "none",
+        "configured_device": "parameter",
+        "moment_dtype": (
+            None if not moments else str(moments[0].dtype).removeprefix("torch.")
+        ),
+        "initialized": bool(moments),
+        "moment_tensors": len(moments),
+        "moment_bytes": sum(value.numel() * value.element_size() for value in moments),
+        "devices": sorted({str(value.device) for value in moments}),
+        "cpu_pinned": all(pinned) if pinned else None,
+        "parameter_devices": sorted({str(value.device) for value in parameters}),
+        "parameter_dtypes": sorted(
+            {str(value.dtype).removeprefix("torch.") for value in parameters}
+        ),
+        "update_chunk_sizes": None,
+    }
 
 
 def _load_optional_optimizer(

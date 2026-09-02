@@ -198,7 +198,9 @@ def generate_tokens(
     if temperature < 0:
         raise ValueError("temperature cannot be negative")
 
-    device = next(model.parameters()).device
+    # Expert-offloaded models intentionally have parameters on both CPU and
+    # the accelerator; never infer execution placement from parameter order.
+    device = model.execution_device
     generated = prompt_ids.to(device=device, dtype=torch.long)
     if max_new_tokens == 0:
         return generated
