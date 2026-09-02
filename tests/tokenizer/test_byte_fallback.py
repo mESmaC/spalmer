@@ -24,7 +24,7 @@ def test_unclaimed_text_falls_to_byte_tier():
 
 def test_byte_fallback_mixes_with_higher_tiers():
     encoder = Encoder(precedence_vocab())
-    result = encoder.encode_with_tiers("ab\u00e9")
+    result = encoder.encode_with_tiers("==\u00e9")
     tiers = [tier for _, tier in result]
     assert tiers[0] is Tier.LEXER
     assert tiers[1:] and all(tier is Tier.BYTE for tier in tiers[1:])

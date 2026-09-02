@@ -17,6 +17,11 @@ class TrainResult:
     losses: list[float]
     tokens_seen: int
     elapsed_seconds: float
+    final_model_loss: float
+    final_auxiliary_loss: float | None
+    final_surprise_calibration_loss: float | None
+    final_predictive_entropy: float
+    promoted_experts: tuple[int, ...]
 
 
 def train_token_stream(
@@ -28,6 +33,7 @@ def train_token_stream(
     sequence_length: int,
     learning_rate: float = 3e-4,
     auxiliary_loss_weight: float = 0.01,
+    surprise_calibration_weight: float = 0.05,
     gradient_clip: float | None = 1.0,
     seed: int = 0,
     log: Callable[[int, float], None] | None = None,
@@ -40,12 +46,18 @@ def train_token_stream(
         raise ValueError("token stream must be longer than sequence_length")
     if min(steps, batch_size, sequence_length) <= 0:
         raise ValueError("steps, batch_size, and sequence_length must be positive")
+    if auxiliary_loss_weight < 0 or surprise_calibration_weight < 0:
+        raise ValueError("auxiliary loss weights must be non-negative")
 
     device = next(model.parameters()).device
     stream = token_ids.to(device=device, dtype=torch.long)
     generator = torch.Generator(device=device).manual_seed(seed)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     losses: list[float] = []
+    final_model_loss = float("nan")
+    final_auxiliary_loss: float | None = None
+    final_surprise_calibration_loss: float | None = None
+    final_predictive_entropy = float("nan")
     started = time.perf_counter()
     model.train()
 
@@ -68,12 +80,32 @@ def train_token_stream(
         objective = output.loss
         if output.auxiliary_loss is not None:
             objective = objective + auxiliary_loss_weight * output.auxiliary_loss
+        if output.surprise_calibration_loss is not None:
+            objective = (
+                objective
+                + surprise_calibration_weight * output.surprise_calibration_loss
+            )
         objective.backward()
         if gradient_clip is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
         optimizer.step()
+        promoted_experts = model.update_potentiation(output.layer_metrics)
 
         value = float(objective.detach())
+        final_model_loss = float(output.loss.detach())
+        final_auxiliary_loss = (
+            None
+            if output.auxiliary_loss is None
+            else float(output.auxiliary_loss.detach())
+        )
+        final_surprise_calibration_loss = (
+            None
+            if output.surprise_calibration_loss is None
+            else float(output.surprise_calibration_loss.detach())
+        )
+        if output.predictive_entropy is None:
+            raise RuntimeError("model did not return predictive entropy telemetry")
+        final_predictive_entropy = float(output.predictive_entropy.mean())
         losses.append(value)
         if log is not None:
             log(step, value)
@@ -82,6 +114,11 @@ def train_token_stream(
         losses=losses,
         tokens_seen=steps * batch_size * sequence_length,
         elapsed_seconds=time.perf_counter() - started,
+        final_model_loss=final_model_loss,
+        final_auxiliary_loss=final_auxiliary_loss,
+        final_surprise_calibration_loss=final_surprise_calibration_loss,
+        final_predictive_entropy=final_predictive_entropy,
+        promoted_experts=promoted_experts,
     )
 
 

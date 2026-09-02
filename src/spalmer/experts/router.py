@@ -43,7 +43,12 @@ class SurpriseRouter(nn.Module):
                 f"expected trailing dimension {self.config.d_model}, "
                 f"got {hidden_states.shape[-1]}"
             )
-        return self.proj(hidden_states)
+        scores = self.proj(hidden_states)
+        if self.config.router_score_transform == "identity":
+            return scores
+        # Surprise is an NLL-like non-negative quantity. Calibration against
+        # realized next-token NLL happens at the language-model boundary.
+        return F.softplus(scores)
 
 
 def select_least_surprised_experts(

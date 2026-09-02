@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
 
 from spalmer.attention import KDAConfig, MLAConfig
-from spalmer.checkpoint import save_checkpoint
+from spalmer.checkpoint import load_checkpoint, save_checkpoint
 from spalmer.config import SPALMERConfig
 from spalmer.experts import MicroExpertsConfig
 from spalmer.factory import build_spalmer_model
@@ -21,9 +24,31 @@ _SMOKE_TEXT = (
     "causal access. The model learns next-token prediction from a versioned tokenizer. "
 ) * 96
 
+_HYBRID_CYCLE = ("kda", "kda", "kda", "mla")
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train a small SPALMER prototype")
+
+def main(argv: Sequence[str] | None = None) -> None:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["generate"]:
+        args = _generate_parser().parse_args(arguments[1:])
+        _run_generate(args)
+        return
+
+    parser = _training_parser()
+    args = parser.parse_args(arguments)
+    if args.smoke and args.text_file is not None:
+        parser.error("use either a corpus path or --smoke, not both")
+    if not args.smoke and args.text_file is None:
+        parser.error("provide a UTF-8 corpus path or use --smoke")
+    _run(args)
+
+
+def _training_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="spalmer",
+        description="Train a small SPALMER prototype",
+        epilog="Use 'spalmer generate --help' to generate from a saved checkpoint.",
+    )
     parser.add_argument("text_file", type=Path, nargs="?")
     parser.add_argument(
         "--smoke",
@@ -43,15 +68,29 @@ def main() -> None:
     parser.add_argument("--experts", type=int, default=16)
     parser.add_argument("--active-experts", type=int, default=2)
     parser.add_argument("--expert-width", type=int)
+    parser.add_argument("--expert-quant-bits", type=int, default=4)
+    parser.add_argument("--potentiation-budget", type=int, default=2)
+    parser.add_argument("--potentiation-warmup-steps", type=int, default=4)
+    parser.add_argument("--potentiation-hold-steps", type=int, default=8)
+    parser.add_argument("--surprise-loss-weight", type=float, default=0.05)
     parser.add_argument("--ple-expansion", type=int, default=2)
     parser.add_argument("--new-tokens", type=int, default=32)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
-    if args.smoke and args.text_file is not None:
-        parser.error("use either a corpus path or --smoke, not both")
-    if not args.smoke and args.text_file is None:
-        parser.error("provide a UTF-8 corpus path or use --smoke")
-    _run(args)
+    return parser
+
+
+def _generate_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="spalmer generate",
+        description="Generate text from a saved SPALMER checkpoint",
+    )
+    parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--new-tokens", type=int, default=32)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-k", type=int)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    return parser
 
 
 def _run(args: argparse.Namespace) -> None:
@@ -59,6 +98,8 @@ def _run(args: argparse.Namespace) -> None:
         raise ValueError("d-model must be divisible by heads")
     if args.experts < 2:
         raise ValueError("the SPALMER prototype requires at least two experts")
+    if args.layers <= 0 or args.layers % len(_HYBRID_CYCLE):
+        raise ValueError("layers must be a positive multiple of 4 for the 3:1 KDA/MLA cycle")
 
     if args.smoke:
         text = _SMOKE_TEXT
@@ -89,6 +130,7 @@ def _run(args: argparse.Namespace) -> None:
         tokenizer_version=vocab.version,
         tokenizer_fingerprint=vocab.fingerprint,
         ple_expansion_factor=args.ple_expansion,
+        token_mixer_pattern=_HYBRID_CYCLE,
     )
     kda_config = KDAConfig(
         hidden_size=args.d_model,
@@ -111,6 +153,10 @@ def _run(args: argparse.Namespace) -> None:
         expert_inter_dim=args.expert_width,
         active_experts=args.active_experts,
         max_active_experts=min(20, args.experts),
+        expert_quant_bits=args.expert_quant_bits,
+        potentiation_budget=args.potentiation_budget,
+        potentiation_warmup_steps=args.potentiation_warmup_steps,
+        potentiation_hold_steps=args.potentiation_hold_steps,
     )
     model = build_spalmer_model(config, kda_config, mla_config, experts_config)
     device = torch.device(args.device)
@@ -129,6 +175,7 @@ def _run(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         sequence_length=args.sequence_length,
         learning_rate=args.learning_rate,
+        surprise_calibration_weight=args.surprise_loss_weight,
         log=report,
     )
     destination = save_checkpoint(
@@ -141,7 +188,19 @@ def _run(args: argparse.Namespace) -> None:
         metadata={
             "tokens_seen": result.tokens_seen,
             "final_loss": result.losses[-1],
+            "final_model_loss": result.final_model_loss,
+            "final_auxiliary_loss": result.final_auxiliary_loss,
+            "final_surprise_calibration_loss": result.final_surprise_calibration_loss,
+            "final_predictive_entropy": result.final_predictive_entropy,
+            "promoted_experts": list(result.promoted_experts),
             "source": source,
+            "corpus_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "kind": args.kind,
+            "steps": args.steps,
+            "batch_size": args.batch_size,
+            "sequence_length": args.sequence_length,
+            "learning_rate": args.learning_rate,
+            "seed": 0,
         },
     )
 
@@ -153,9 +212,32 @@ def _run(args: argparse.Namespace) -> None:
     parameters = sum(parameter.numel() for parameter in model.parameters())
     print(
         f"saved={destination} parameters={parameters:,} vocab={len(vocab):,} "
-        f"tokens_seen={result.tokens_seen:,} seconds={result.elapsed_seconds:.2f}"
+        f"tokens_seen={result.tokens_seen:,} seconds={result.elapsed_seconds:.2f} "
+        f"promoted={list(result.promoted_experts)}"
     )
     print(generated)
+
+
+def _run_generate(args: argparse.Namespace) -> None:
+    device = torch.device(args.device)
+    model, vocab, _ = load_checkpoint(args.checkpoint, map_location="cpu")
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    model.to(device=device, dtype=dtype)
+    model.eval()
+
+    encoder = Encoder(vocab)
+    prompt_ids = torch.tensor(encoder.encode(args.prompt), dtype=torch.long)
+    if prompt_ids.numel() == 0:
+        raise ValueError("prompt must encode to at least one token")
+    generated_ids = generate_tokens(
+        model,
+        prompt_ids,
+        max_new_tokens=args.new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+    )
+    payload = b"".join(vocab.get(int(token)).payload() for token in generated_ids[0])
+    print(payload.decode("utf-8", errors="replace"))
 
 
 if __name__ == "__main__":

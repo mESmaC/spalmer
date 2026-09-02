@@ -41,10 +41,33 @@ def longest_match_in(
             continue
         end = min(len(text), pos + max_lens[tier])
         for stop in range(end, pos, -1):
-            token_id = table.get(text[pos:stop])
-            if token_id is not None:
-                return token_id, tier, text[pos:stop]
+            surface = text[pos:stop]
+            token_id = table.get(surface)
+            if token_id is not None and _is_eligible_match(tier, surface, text, pos, stop):
+                return token_id, tier, surface
     return None
+
+
+def _is_eligible_match(tier: Tier, surface: str, text: str, start: int, stop: int) -> bool:
+    """Keep identifier-like lexer entries on identifier boundaries.
+
+    Operators and delimiters retain ordinary maximal-munch behavior. Python
+    keywords, however, must not claim a prefix inside a larger prose word or
+    source identifier (for example, ``in`` in ``inside`` or ``for`` in
+    ``format``).
+    """
+
+    if tier is not Tier.LEXER or not surface.isidentifier():
+        return True
+    if start > 0 and _is_identifier_continue(text[start - 1]):
+        return False
+    return stop >= len(text) or not _is_identifier_continue(text[stop])
+
+
+def _is_identifier_continue(character: str) -> bool:
+    """Return whether one character can continue a Python identifier."""
+
+    return ("a" + character).isidentifier()
 
 
 class Encoder:

@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
@@ -47,6 +48,9 @@ class CausalLMOutput:
     channel_mixer_states: tuple[Any, ...]
     loss: Tensor | None = None
     auxiliary_loss: Tensor | None = None
+    token_nll: Tensor | None = None
+    surprise_calibration_loss: Tensor | None = None
+    predictive_entropy: Tensor | None = None
     layer_metrics: tuple[Mapping[str, Any], ...] = ()
 
 
@@ -243,7 +247,13 @@ class SPALMERBackbone(nn.Module):
 class SPALMERCausalLM(nn.Module):
     """Untied vocabulary projection and ordinary next-token objective."""
 
-    def __init__(self, config: SPALMERConfig, backbone: SPALMERBackbone) -> None:
+    def __init__(
+        self,
+        config: SPALMERConfig,
+        backbone: SPALMERBackbone,
+        *,
+        potentiation_controller: nn.Module | None = None,
+    ) -> None:
         super().__init__()
         if backbone.config != config:
             raise ValueError(
@@ -251,6 +261,7 @@ class SPALMERCausalLM(nn.Module):
             )
         self.config = config
         self.backbone = backbone
+        self.potentiation_controller = potentiation_controller
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         nn.init.normal_(self.lm_head.weight, mean=0.0, std=config.initializer_range)
 
@@ -277,25 +288,112 @@ class SPALMERCausalLM(nn.Module):
         )
         logits = self.lm_head(backbone_output.hidden_states)
         loss = None
+        token_nll = None
+        surprise_calibration = None
+        layer_metrics = backbone_output.layer_metrics
         if labels is not None:
             if labels.shape != input_ids.shape:
                 raise ValueError("labels must have the same shape as input_ids")
             if input_ids.shape[1] < 2:
                 raise ValueError("next-token loss requires a sequence length of at least two")
             shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
+            token_nll = F.cross_entropy(
                 logits[:, :-1].transpose(1, 2),
                 shift_labels,
                 ignore_index=-100,
+                reduction="none",
             )
+            valid = shift_labels != -100
+            if not bool(valid.any()):
+                raise ValueError("next-token loss requires at least one non-ignored target")
+            loss = token_nll[valid].mean()
+            layer_metrics, surprise_calibration = _attach_surprise_telemetry(
+                layer_metrics,
+                token_nll,
+                valid,
+            )
+
+        with torch.no_grad():
+            final_log_probabilities = F.log_softmax(logits[:, -1].detach().float(), dim=-1)
+            predictive_entropy = -(
+                final_log_probabilities.exp() * final_log_probabilities
+            ).sum(dim=-1)
         return CausalLMOutput(
             logits=logits,
             token_mixer_states=backbone_output.token_mixer_states,
             channel_mixer_states=backbone_output.channel_mixer_states,
             loss=loss,
             auxiliary_loss=backbone_output.auxiliary_loss,
-            layer_metrics=backbone_output.layer_metrics,
+            token_nll=token_nll,
+            surprise_calibration_loss=surprise_calibration,
+            predictive_entropy=predictive_entropy,
+            layer_metrics=layer_metrics,
         )
+
+    @torch.no_grad()
+    def update_potentiation(
+        self,
+        layer_metrics: Sequence[Mapping[str, Any]],
+    ) -> tuple[int, ...]:
+        """Apply one shared expert-group promotion decision across all layers."""
+
+        controller = self.potentiation_controller
+        if controller is None:
+            return self.promoted_expert_ids()
+        telemetry = [
+            (
+                metric.get("potentiation_utilization"),
+                metric.get("expert_attributed_nll"),
+                metric.get("expert_quantization_error"),
+            )
+            for metric in layer_metrics
+        ]
+        complete = [
+            values
+            for values in telemetry
+            if all(isinstance(value, Tensor) for value in values)
+        ]
+        if not complete:
+            return self.promoted_expert_ids()
+        utilization_by_layer = torch.stack(
+            [values[0].float() for values in complete]
+        )
+        attributed_nll_by_layer = torch.stack(
+            [values[1].float() for values in complete]
+        )
+        quantization_error_by_layer = torch.stack(
+            [values[2].float() for values in complete]
+        )
+        utilization = utilization_by_layer.mean(dim=0)
+        responsibility = utilization_by_layer.sum(dim=0)
+        attributed_nll = (
+            attributed_nll_by_layer * utilization_by_layer
+        ).sum(dim=0) / responsibility.clamp_min(1e-8)
+        attributed_nll = torch.where(
+            responsibility > 0,
+            attributed_nll,
+            torch.zeros_like(attributed_nll),
+        )
+        measured = quantization_error_by_layer > 0
+        quantization_error = quantization_error_by_layer.sum(dim=0) / measured.sum(
+            dim=0
+        ).clamp_min(1)
+        observe = getattr(controller, "observe", None)
+        if not callable(observe):
+            raise TypeError("potentiation_controller must implement observe(...)")
+        observe(utilization, attributed_nll, quantization_error)
+        return self.promoted_expert_ids()
+
+    def promoted_expert_ids(self) -> tuple[int, ...]:
+        """Return the coherent promoted identity set from the first expert bank."""
+
+        controller = self.potentiation_controller
+        if controller is None:
+            return ()
+        promoted_ids = getattr(controller, "promoted_ids", None)
+        if not callable(promoted_ids):
+            raise TypeError("potentiation_controller must implement promoted_ids()")
+        return promoted_ids()
 
 
 def _require_same_shape(name: str, update: Any, hidden_states: Tensor) -> None:
@@ -322,3 +420,77 @@ def _validate_mask(name: str, mask: Tensor | None, input_ids: Tensor) -> None:
             f"{name} must have the same [batch, sequence] shape as input_ids; "
             f"got {tuple(mask.shape)} and {tuple(input_ids.shape)}"
         )
+
+
+def _attach_surprise_telemetry(
+    layer_metrics: Sequence[Mapping[str, Any]],
+    token_nll: Tensor,
+    valid: Tensor,
+) -> tuple[tuple[Mapping[str, Any], ...], Tensor | None]:
+    enriched: list[Mapping[str, Any]] = []
+    calibration_losses: list[Tensor] = []
+    for metrics in layer_metrics:
+        scores = metrics.get("router_scores")
+        expert_ids = metrics.get("expert_ids")
+        routing_weights = metrics.get("routing_weights")
+        if not all(
+            isinstance(value, Tensor)
+            for value in (scores, expert_ids, routing_weights)
+        ):
+            enriched.append(metrics)
+            continue
+
+        selected_surprise = scores.gather(-1, expert_ids)[:, :-1]
+        # This v0 target calibrates the selected mixture's scalar estimate. The
+        # downstream LM NLL is not a counterfactual measurement for each expert.
+        predicted_mixture_surprise = (
+            selected_surprise * routing_weights[:, :-1]
+        ).sum(dim=-1)
+        calibration = F.smooth_l1_loss(
+            predicted_mixture_surprise,
+            token_nll.detach(),
+            reduction="none",
+        )
+        calibration_losses.append(calibration[valid].mean())
+
+        num_experts = scores.shape[-1]
+        attributed_nll, responsibility_utilization = _attribute_nll_to_experts(
+            expert_ids[:, :-1],
+            routing_weights[:, :-1],
+            token_nll.detach(),
+            valid,
+            num_experts,
+        )
+        updated = dict(metrics)
+        updated["expert_attributed_nll"] = attributed_nll
+        updated["potentiation_utilization"] = responsibility_utilization
+        enriched.append(updated)
+
+    total_calibration = None
+    if calibration_losses:
+        total_calibration = torch.stack(calibration_losses).mean()
+    return tuple(enriched), total_calibration
+
+
+def _attribute_nll_to_experts(
+    expert_ids: Tensor,
+    routing_weights: Tensor,
+    token_nll: Tensor,
+    valid: Tensor,
+    num_experts: int,
+) -> tuple[Tensor, Tensor]:
+    ids = expert_ids.reshape(-1)
+    weights = routing_weights.float() * valid.unsqueeze(-1)
+    flat_weights = weights.reshape(-1)
+    weighted_nll = (weights * token_nll.float().unsqueeze(-1)).reshape(-1)
+    totals = torch.zeros(num_experts, device=ids.device, dtype=torch.float32)
+    counts = torch.zeros_like(totals)
+    totals.scatter_add_(0, ids, weighted_nll)
+    counts.scatter_add_(0, ids, flat_weights)
+    attributed_nll = torch.where(
+        counts > 0,
+        totals / counts.clamp_min(1e-8),
+        torch.zeros_like(totals),
+    )
+    utilization = counts / valid.sum().float().clamp_min(1.0)
+    return attributed_nll, utilization

@@ -10,6 +10,7 @@ caller.
 from __future__ import annotations
 
 from typing import Any
+from weakref import ref
 
 import torch
 from torch import Tensor, nn
@@ -17,6 +18,7 @@ from torch import Tensor, nn
 from spalmer.experts.bank import MicroExpertBank
 from spalmer.experts.config import MicroExpertsConfig
 from spalmer.experts.losses import expert_utilization, load_balance_loss
+from spalmer.experts.potentiation import ExpertPotentiationController
 from spalmer.experts.router import SurpriseRouter, select_least_surprised_experts
 from spalmer.modeling import ChannelMixerOutput
 
@@ -32,7 +34,13 @@ class MicroExpertChannelMixer(nn.Module):
             to agree on ``num_experts``.
     """
 
-    def __init__(self, config: MicroExpertsConfig, *, router: SurpriseRouter | None = None):
+    def __init__(
+        self,
+        config: MicroExpertsConfig,
+        *,
+        router: SurpriseRouter | None = None,
+        potentiation_controller: ExpertPotentiationController | None = None,
+    ) -> None:
         super().__init__()
         if router is not None:
             if router.num_experts != config.num_experts:
@@ -48,10 +56,26 @@ class MicroExpertChannelMixer(nn.Module):
         self.config = config
         self.router = router if router is not None else SurpriseRouter(config)
         self.experts = MicroExpertBank(config)
+        if potentiation_controller is None:
+            self._owned_potentiation_controller = ExpertPotentiationController(config)
+            potentiation_controller = self._owned_potentiation_controller
+        elif potentiation_controller.config != config:
+            raise ValueError("potentiation controller configuration does not match this bank")
+        # A factory-built model owns one authoritative controller at the LM
+        # boundary. The weak reference prevents registering the same state under
+        # every layer-local bank.
+        object.__setattr__(self, "_potentiation_controller_ref", ref(potentiation_controller))
 
     @property
     def active_experts(self) -> int:
         return self.config.active_experts
+
+    @property
+    def potentiation_controller(self) -> ExpertPotentiationController:
+        controller = self._potentiation_controller_ref()
+        if controller is None:
+            raise RuntimeError("the shared potentiation controller no longer exists")
+        return controller
 
     def forward(
         self, hidden_states: Tensor, *, state: Any = None
@@ -94,15 +118,25 @@ class MicroExpertChannelMixer(nn.Module):
         )
         expert_index = expert_ids.reshape(-1)
         flat_weights = routing_weights.reshape(-1)
-        update = self.experts.execute_routing(flat_hidden, token_index, expert_index, flat_weights)
+        controller = self.potentiation_controller
+        update = self.experts.execute_routing(
+            flat_hidden,
+            token_index,
+            expert_index,
+            flat_weights,
+            promoted_mask=controller.promoted_mask,
+        )
 
         utilization = expert_utilization(expert_ids, self.config.num_experts)
+        quantization_error = self.experts.quantization_error(expert_ids)
         auxiliary_loss = load_balance_loss(scores, expert_ids)
         metrics: dict[str, Any] = {
             "expert_ids": expert_ids,
             "routing_weights": routing_weights,
             "router_scores": scores,
             "expert_utilization": utilization,
+            "expert_quantization_error": quantization_error,
+            "promoted_experts": controller.promoted_mask.detach().clone(),
             "num_active_experts": int(expert_index.unique().numel()),
         }
         return ChannelMixerOutput(

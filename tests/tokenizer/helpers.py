@@ -46,11 +46,10 @@ def build_demo_vocab() -> Vocab:
 
 def precedence_vocab() -> Vocab:
     vocab = Vocab("precedence")
-    vocab.append(Tier.LEXER, "ab")
-    vocab.append(Tier.WORD, "abc")
-    vocab.append(Tier.ATOM, "a")
-    vocab.append(Tier.ATOM, "b")
-    vocab.append(Tier.ATOM, "c")
+    vocab.append(Tier.LEXER, "==")
+    vocab.append(Tier.WORD, "==x")
+    vocab.append(Tier.ATOM, "=")
+    vocab.append(Tier.ATOM, "x")
     append_byte_backstop(vocab)
     return vocab
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from helpers import build_demo_vocab, precedence_vocab, within_tier_vocab
 
 from spalmer.tokenizer import Encoder, Tier, Vocab
@@ -20,8 +21,8 @@ def test_encode_is_deterministic(tmp_path):
 def test_higher_tier_beats_longer_lower_tier_match():
     vocab = precedence_vocab()
     encoder = Encoder(vocab)
-    result = encoder.encode_with_tiers("abc")
-    assert [vocab.get(t).surface for t, _ in result] == ["ab", "c"]
+    result = encoder.encode_with_tiers("==x")
+    assert [vocab.get(t).surface for t, _ in result] == ["==", "x"]
     assert result[0][1] is Tier.LEXER
     assert result[1][1] is Tier.ATOM
 
@@ -48,3 +49,35 @@ def test_multi_char_operator_outmatches_its_prefix():
     result = encoder.encode_with_tiers("a == b")
     surfaces = [(vocab.get(t).surface, tier) for t, tier in result]
     assert ("==", Tier.LEXER) in surfaces
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "inside format island ordinary assertion notable android",
+        "x_in in_value for2 2for className returnValue",
+    ],
+)
+def test_identifier_like_lexer_tokens_do_not_match_inside_words(text):
+    vocab = build_demo_vocab()
+    encoder = Encoder(vocab)
+    result = encoder.encode_with_tiers(text)
+
+    identifier_lexer_matches = [
+        vocab.get(token_id).surface
+        for token_id, tier in result
+        if tier is Tier.LEXER and vocab.get(token_id).surface.isidentifier()
+    ]
+    assert identifier_lexer_matches == []
+    assert encoder.decode(token_id for token_id, _ in result) == text
+
+
+def test_identifier_like_lexer_tokens_still_match_at_boundaries():
+    vocab = build_demo_vocab()
+    result = Encoder(vocab).encode_with_tiers("if x in items: for item in items: return item")
+    keyword_matches = [
+        vocab.get(token_id).surface
+        for token_id, tier in result
+        if tier is Tier.LEXER and vocab.get(token_id).surface.isidentifier()
+    ]
+    assert keyword_matches == ["if", "in", "for", "in", "return"]

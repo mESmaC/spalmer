@@ -7,7 +7,12 @@ from torch.nn import functional as F
 
 from spalmer.attention import KDAConfig, KDATokenMixer, MLAConfig, MLATokenMixer
 from spalmer.config import SPALMERConfig
-from spalmer.experts import MicroExpertChannelMixer, MicroExpertsConfig, SurpriseRouter
+from spalmer.experts import (
+    ExpertPotentiationController,
+    MicroExpertChannelMixer,
+    MicroExpertsConfig,
+    SurpriseRouter,
+)
 from spalmer.modeling import SPALMERBackbone, SPALMERBlock, SPALMERCausalLM
 
 
@@ -87,6 +92,7 @@ def build_spalmer_model(
         raise ValueError(f"component widths must equal d_model={config.d_model}; got {detail}")
 
     shared_router = SurpriseRouter(experts_config)
+    potentiation_controller = ExpertPotentiationController(experts_config)
     blocks: list[SPALMERBlock] = []
     for layer_index in range(config.n_layers):
         mixer_name = config.token_mixer_for_layer(layer_index)
@@ -96,7 +102,11 @@ def build_spalmer_model(
             token_mixer = MLATokenMixer(mla_config)
         else:  # SPALMERConfig validates this, but keep the assembly boundary closed.
             raise ValueError(f"unsupported token mixer: {mixer_name}")
-        channel_mixer = MicroExpertChannelMixer(experts_config, router=shared_router)
+        channel_mixer = MicroExpertChannelMixer(
+            experts_config,
+            router=shared_router,
+            potentiation_controller=potentiation_controller,
+        )
         blocks.append(
             SPALMERBlock(
                 config.d_model,
@@ -105,7 +115,11 @@ def build_spalmer_model(
                 norm_eps=config.norm_eps,
             )
         )
-    return SPALMERCausalLM(config, SPALMERBackbone(config, blocks))
+    return SPALMERCausalLM(
+        config,
+        SPALMERBackbone(config, blocks),
+        potentiation_controller=potentiation_controller,
+    )
 
 
 __all__ = ["DenseSwiGLU", "build_kda_bootstrap_model", "build_spalmer_model"]

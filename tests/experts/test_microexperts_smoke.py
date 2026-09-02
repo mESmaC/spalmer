@@ -65,6 +65,8 @@ def test_least_surprise_is_preferred():
     ids = result.metrics["expert_ids"]
     weights = result.metrics["routing_weights"]
     expected_ids = scores.topk(2, dim=-1, largest=False).indices
+    assert torch.isfinite(scores).all()
+    assert (scores >= 0).all()
     torch.testing.assert_close(ids, expected_ids)
     # ids are ordered by ascending predicted surprise, weights descending
     selected_surprise = scores.gather(-1, ids)
