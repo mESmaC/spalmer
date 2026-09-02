@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
+from collections.abc import Mapping
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
@@ -10,14 +13,21 @@ import torch
 
 from spalmer.attention import KDAConfig, MLAConfig
 from spalmer.config import SPALMERConfig
+from spalmer.experiment.state import (
+    CheckpointBinding,
+    RunStateEnvelope,
+    tensor_state_sha256,
+)
 from spalmer.experts import MicroExpertsConfig
 from spalmer.factory import build_spalmer_model
 from spalmer.modeling import SPALMERCausalLM
 from spalmer.tokenizer import Vocab
 
 FORMAT_NAME = "spalmer.prototype.checkpoint"
-FORMAT_VERSION = 3
-_SUPPORTED_FORMAT_VERSIONS = {1, 2, FORMAT_VERSION}
+FORMAT_VERSION = 4
+_SUPPORTED_FORMAT_VERSIONS = {1, 2, 3, FORMAT_VERSION}
+CHECKPOINT_BINDING_METADATA_KEY = "_spalmer_checkpoint_binding"
+_CHECKPOINT_BINDING_ATTRIBUTE = "_spalmer_checkpoint_binding"
 # Version 3 added the shared average-surprise buffers on the language model and
 # the C13 residency fields of the expert configuration.
 _VERSION_3_EXPERT_FIELDS = {"residency_increment", "residency_min_gain"}
@@ -44,8 +54,10 @@ def save_checkpoint(
     mla_config: MLAConfig,
     experts_config: MicroExpertsConfig,
     metadata: dict[str, Any] | None = None,
+    run_state: RunStateEnvelope | None = None,
+    checkpoint_binding: CheckpointBinding | None = None,
 ) -> Path:
-    """Persist model weights, all construction configs, and exact vocabulary."""
+    """Persist model weights, construction inputs, and an optional run-state binding."""
 
     model.config.assert_tokenizer_compatible(
         version=vocab.version,
@@ -56,21 +68,81 @@ def save_checkpoint(
     _validate_potentiation_state(model, experts_config)
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "format": FORMAT_NAME,
-            "format_version": FORMAT_VERSION,
-            "model_config": model.config.to_dict(),
-            "kda_config": asdict(kda_config),
-            "mla_config": asdict(mla_config),
-            "experts_config": asdict(experts_config),
-            "vocab": vocab.to_dict(),
-            "model_state": model.state_dict(),
-            "metadata": dict(metadata or {}),
-        },
-        destination,
+    caller_metadata = dict(metadata or {})
+    if CHECKPOINT_BINDING_METADATA_KEY in caller_metadata:
+        raise ValueError(f"checkpoint metadata key {CHECKPOINT_BINDING_METADATA_KEY!r} is reserved")
+    model_state = model.state_dict()
+    binding = _resolve_checkpoint_binding(
+        model_state,
+        run_state=run_state,
+        checkpoint_binding=checkpoint_binding,
     )
+    payload = {
+        "format": FORMAT_NAME,
+        "format_version": FORMAT_VERSION,
+        "model_config": model.config.to_dict(),
+        "kda_config": asdict(kda_config),
+        "mla_config": asdict(mla_config),
+        "experts_config": asdict(experts_config),
+        "vocab": vocab.to_dict(),
+        "model_state": model_state,
+        "checkpoint_binding": None if binding is None else binding.to_dict(),
+        "metadata": caller_metadata,
+    }
+    _atomic_torch_save(payload, destination)
+    object.__setattr__(model, _CHECKPOINT_BINDING_ATTRIBUTE, binding)
     return destination
+
+
+def _resolve_checkpoint_binding(
+    model_state: Mapping[str, Any],
+    *,
+    run_state: RunStateEnvelope | None,
+    checkpoint_binding: CheckpointBinding | None,
+) -> CheckpointBinding | None:
+    if run_state is not None:
+        if run_state.checkpoint_binding is None:
+            raise ValueError("run state has no checkpoint binding")
+        if checkpoint_binding is not None and checkpoint_binding != run_state.checkpoint_binding:
+            raise ValueError("explicit checkpoint binding disagrees with run state")
+        checkpoint_binding = run_state.checkpoint_binding
+    if checkpoint_binding is None:
+        return None
+    observed_digest = tensor_state_sha256(model_state)
+    if checkpoint_binding.model_state_sha256 != observed_digest:
+        raise ValueError("checkpoint binding does not match the model state")
+    if run_state is not None and checkpoint_binding.step != run_state.progress.step:
+        raise ValueError("checkpoint binding step disagrees with run progress")
+    return checkpoint_binding
+
+
+def _atomic_torch_save(payload: dict[str, Any], destination: Path) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            torch.save(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        _flush_directory(destination.parent)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _flush_directory(directory: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def load_checkpoint(
@@ -86,6 +158,21 @@ def load_checkpoint(
     checkpoint_version = payload.get("format_version")
     if checkpoint_version not in _SUPPORTED_FORMAT_VERSIONS:
         raise ValueError(f"unsupported checkpoint version: {payload.get('format_version')}")
+
+    raw_binding = payload.get("checkpoint_binding")
+    if checkpoint_version >= 4 and "checkpoint_binding" not in payload:
+        raise ValueError("version-4 checkpoint is missing its binding field")
+    binding = (
+        None
+        if raw_binding is None
+        else CheckpointBinding.from_dict(_require_mapping(raw_binding, "checkpoint binding"))
+    )
+    if binding is not None:
+        observed_digest = tensor_state_sha256(
+            _require_mapping(payload["model_state"], "model state")
+        )
+        if observed_digest != binding.model_state_sha256:
+            raise ValueError("checkpoint model state does not match its binding digest")
 
     raw_model_config = dict(payload["model_config"])
     required_model = {field.name for field in fields(SPALMERConfig)}
@@ -125,7 +212,7 @@ def load_checkpoint(
         )
 
     model = build_spalmer_model(config, kda_config, mla_config, experts_config)
-    if checkpoint_version == FORMAT_VERSION:
+    if checkpoint_version >= 3:
         model.load_state_dict(payload["model_state"], strict=True)
     else:
         # Older bundles predate some buffers; everything else must still match.
@@ -156,7 +243,29 @@ def load_checkpoint(
             model.surprise_ema.fill_(float(metadata["average_surprise"]))
             model.surprise_observations.fill_(1)
     _validate_potentiation_state(model, experts_config)
-    return model, vocab, dict(payload.get("metadata") or {})
+    object.__setattr__(model, _CHECKPOINT_BINDING_ATTRIBUTE, binding)
+    metadata = dict(payload.get("metadata") or {})
+    metadata.pop(CHECKPOINT_BINDING_METADATA_KEY, None)
+    if binding is not None:
+        metadata[CHECKPOINT_BINDING_METADATA_KEY] = binding.to_dict()
+    return model, vocab, metadata
+
+
+def checkpoint_binding_from_metadata(
+    metadata: dict[str, Any],
+) -> CheckpointBinding | None:
+    """Extract the authoritative binding returned by :func:`load_checkpoint`."""
+
+    raw = metadata.get(CHECKPOINT_BINDING_METADATA_KEY)
+    if raw is None:
+        return None
+    return CheckpointBinding.from_dict(_require_mapping(raw, "checkpoint binding metadata"))
+
+
+def _require_mapping(value: Any, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{name} must be a mapping")
+    return value
 
 
 def _validate_model_experts_config(
@@ -216,4 +325,11 @@ def _validate_potentiation_state(
         raise ValueError("dense legacy expert execution cannot carry promoted experts")
 
 
-__all__ = ["FORMAT_NAME", "FORMAT_VERSION", "load_checkpoint", "save_checkpoint"]
+__all__ = [
+    "CHECKPOINT_BINDING_METADATA_KEY",
+    "FORMAT_NAME",
+    "FORMAT_VERSION",
+    "checkpoint_binding_from_metadata",
+    "load_checkpoint",
+    "save_checkpoint",
+]

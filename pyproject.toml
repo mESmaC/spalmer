@@ -10,12 +10,16 @@ authors = [
 ]
 dependencies = [
     "torch>=2.6",
+    "zstandard>=0.23",
 ]
 
 [project.scripts]
 spalmer = "spalmer.__main__:main"
 
 [project.optional-dependencies]
+hf = [
+    "transformers>=4.46",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.11",

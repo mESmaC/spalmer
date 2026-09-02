@@ -60,6 +60,42 @@ otherwise runs the plain-PyTorch correctness backend.
 The project favors the simplest faithful implementation of each drafted
 component and records experimental limitations explicitly.
 
+## Plan scales and prepare data
+
+Model size and vocabulary size are independent experiment inputs. A ladder can
+therefore increase vocabulary with model capacity without constructing a model.
+The default search keeps the architecture's 200 expert identities fixed and
+changes expert width and the dense shape to approach each target:
+
+```shell
+spalmer plan 10m 50m 100m --vocab-size 4096 8192 16384
+```
+
+Approved JSONL exports can be filtered to English plus the six most represented
+code languages, exactly/normalization deduplicated, split by content identity,
+and encoded into immutable mmap-backed uint32 shards with a pre-existing RPD or
+Hugging Face tokenizer:
+
+```shell
+python -m pip install -e ".[hf]"
+spalmer prepare-data path/to/approved-jsonl \
+  --name first-experiment \
+  --tokenizer-hf path/to/tokenizer \
+  --local-files-only \
+  --output-directory data/first-experiment
+```
+
+The generated manifest, tokenizer identity, shard checksums, deterministic
+weighted-sampler state, RNG state, optimizer/controller payloads, and evaluation
+accumulators provide the non-model pieces needed for bound resume and held-out
+English/per-language NLL, perplexity, repetition, and router telemetry. Exact
+bits-per-byte is reported only when a prepared shard carries exact target-byte
+metadata; it is never inferred from a lossy token decode. RPD preparation gives
+EOD a reserved model-only ID after the content vocabulary rather than relabeling
+an ordinary token. The training engine moves only the current mmap sample batch
+to the GPU and keeps persistent parameters and optimizer state in FP32 while
+using BF16 autocast for supported accelerator operations.
+
 ## Reference-backend boundary
 
 The initial PLE and expert implementations are fake-quantization correctness

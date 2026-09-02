@@ -1,0 +1,9 @@
+{"document_id":"en-a","source":"manual","kind":"prose","language":"en","approved":true,"text":"Hello   useful world.\n","quality":0.9}
+{"document_id":"en-b","source":"mirror","kind":"prose","language":"English","approved":true,"text":" hello useful WORLD. ","quality":0.8}
+{"document_id":"en-c","source":"mirror-two","kind":"prose","language":"en","approved":true,"text":"Hello   useful world.\n","quality":0.7}
+{"document_id":"fr-a","source":"manual","kind":"prose","language":"fr","approved":true,"text":"Bonjour le monde."}
+{"document_id":"py-a","source":"code-one","kind":"code","language":"py","approved":true,"text":"def alpha(value):\n    return value + 1\n"}
+{"document_id":"py-b","source":"code-two","kind":"code","language":"python","approved":true,"text":"def beta(items):\n    return [item * 2 for item in items]\n"}
+{"document_id":"rs-a","source":"code-one","kind":"code","language":"rs","approved":true,"text":"fn main() { println!(\"hello\"); }\n"}
+{"document_id":"js-a","source":"code-three","kind":"code","language":"js","approved":true,"text":"let x = 1;\n"}
+{"document_id":"ignored","source":"manual","kind":"prose","language":"en","approved":false,"text":"Do not include this row."}

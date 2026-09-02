@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -13,10 +15,17 @@ import torch
 from spalmer.attention import KDAConfig, MLAConfig
 from spalmer.checkpoint import load_checkpoint, save_checkpoint
 from spalmer.config import SPALMERConfig
+from spalmer.data import JsonlAdapterConfig, prepare_approved_jsonl
+from spalmer.experiment import ExplicitVocabularyPolicy, plan_ladder
 from spalmer.experts import MicroExpertsConfig
 from spalmer.factory import build_spalmer_model
 from spalmer.runtime import generate_tokens, train_token_stream
 from spalmer.tokenizer import Encoder, Sample, TrainerConfig, train
+from spalmer.tokenizer.backends import (
+    HFTokenizerAdapter,
+    RPDTokenizerAdapter,
+    SpecialTokenIds,
+)
 
 _SMOKE_TEXT = (
     "SPALMER routes each token through small experts predicted to be least surprised. "
@@ -29,6 +38,14 @@ _HYBRID_CYCLE = ("kda", "kda", "kda", "mla")
 
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["plan"]:
+        args = _plan_parser().parse_args(arguments[1:])
+        _run_plan(args)
+        return
+    if arguments[:1] == ["prepare-data"]:
+        args = _prepare_data_parser().parse_args(arguments[1:])
+        _run_prepare_data(args)
+        return
     if arguments[:1] == ["generate"]:
         args = _generate_parser().parse_args(arguments[1:])
         _run_generate(args)
@@ -41,6 +58,57 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not args.smoke and args.text_file is None:
         parser.error("provide a UTF-8 corpus path or use --smoke")
     _run(args)
+
+
+def _plan_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="spalmer plan",
+        description="Plan scale-aware model shapes without constructing or training a model",
+    )
+    parser.add_argument(
+        "targets",
+        metavar="TARGET",
+        nargs="+",
+        type=_parameter_count,
+        help="total parameter targets such as 10m 50m 100m",
+    )
+    parser.add_argument(
+        "--vocab-size",
+        dest="vocab_sizes",
+        metavar="N",
+        nargs="+",
+        type=int,
+        required=True,
+        help="one explicit vocabulary size per target, in the same order",
+    )
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    return parser
+
+
+def _prepare_data_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="spalmer prepare-data",
+        description="Convert approved JSONL documents into immutable mmap token shards",
+    )
+    parser.add_argument("inputs", type=Path, nargs="+")
+    parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--name", required=True)
+    tokenizer = parser.add_mutually_exclusive_group(required=True)
+    tokenizer.add_argument("--tokenizer-rpd", type=Path)
+    tokenizer.add_argument("--tokenizer-hf")
+    parser.add_argument("--tokenizer-revision")
+    parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--eod-token-id", type=int)
+    parser.add_argument("--approved-field")
+    parser.add_argument("--text-field", default="text")
+    parser.add_argument("--id-field", default="document_id")
+    parser.add_argument("--source-field", default="source")
+    parser.add_argument("--kind-field", default="domain")
+    parser.add_argument("--language-field", default="lang")
+    parser.add_argument("--default-kind", choices=("prose", "code"), default="prose")
+    parser.add_argument("--top-code-languages", type=int, default=6)
+    parser.add_argument("--documents-per-shard", type=int, default=20_000)
+    return parser
 
 
 def _training_parser() -> argparse.ArgumentParser:
@@ -107,6 +175,119 @@ def _generate_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser
+
+
+def _run_plan(args: argparse.Namespace) -> None:
+    if len(args.targets) != len(args.vocab_sizes):
+        raise SystemExit("provide exactly one --vocab-size value for every target")
+    if args.targets != sorted(args.targets) or len(set(args.targets)) != len(args.targets):
+        raise SystemExit("targets must be unique and listed from smallest to largest")
+    if any(size <= 0 for size in args.vocab_sizes):
+        raise SystemExit("vocabulary sizes must be positive")
+    if len(args.vocab_sizes) > 1 and any(
+        right <= left for left, right in zip(args.vocab_sizes, args.vocab_sizes[1:])
+    ):
+        raise SystemExit("vocabulary size must increase at every larger model target")
+    policy = ExplicitVocabularyPolicy(tuple(zip(args.targets, args.vocab_sizes, strict=True)))
+    plans = plan_ladder(tuple(args.targets), policy)
+    if args.json:
+        print(json.dumps([plan.to_dict() for plan in plans], indent=2))
+        return
+    header = (
+        f"{'target':>12} {'planned':>12} {'error':>9} {'vocab':>8} "
+        f"{'d':>5} {'L':>3} {'h':>3} {'E':>4} {'expert':>7} {'PLE':>4} "
+        f"{'ref GiB':>9} {'packed GiB':>11}"
+    )
+    print(header)
+    print("-" * len(header))
+    for plan in plans:
+        shape = plan.config
+        memory = plan.memory
+        print(
+            f"{plan.target_parameters:12,d} {plan.parameters.total:12,d} "
+            f"{plan.relative_error:+8.2%} {shape.vocab_size:8,d} {shape.d_model:5d} "
+            f"{shape.n_layers:3d} {shape.num_heads:3d} {shape.num_experts:4d} "
+            f"{shape.expert_width:7d} {shape.ple_expansion:4d} "
+            f"{memory.gib(memory.reference_training_bytes):9.3f} "
+            f"{memory.gib(memory.packed_training_bytes):11.3f}"
+        )
+
+
+def _run_prepare_data(args: argparse.Namespace) -> None:
+    if args.tokenizer_rpd is not None:
+        content_adapter = RPDTokenizerAdapter.from_file(args.tokenizer_rpd)
+        reserved_eod_id = (
+            content_adapter.content_vocab_size
+            if args.eod_token_id is None
+            else args.eod_token_id
+        )
+        adapter = RPDTokenizerAdapter(
+            content_adapter.vocab,
+            special_tokens=SpecialTokenIds(eod_id=reserved_eod_id),
+            source=content_adapter.identity.source,
+        )
+    else:
+        adapter = HFTokenizerAdapter.from_pretrained(
+            args.tokenizer_hf,
+            revision=args.tokenizer_revision,
+            local_files_only=args.local_files_only,
+            trust_remote_code=False,
+        )
+    if args.eod_token_id is not None and isinstance(adapter, HFTokenizerAdapter):
+        known_special_ids = set(adapter.special_tokens.assigned)
+        known_special_ids.update(
+            int(token_id)
+            for token_id in (getattr(adapter.tokenizer, "all_special_ids", ()) or ())
+        )
+        if args.eod_token_id not in known_special_ids:
+            raise SystemExit(
+                "--eod-token-id must identify a token already registered as special by "
+                "the Hugging Face tokenizer"
+            )
+        special = replace(adapter.special_tokens, eod_id=args.eod_token_id)
+        adapter = HFTokenizerAdapter.from_tokenizer(
+            adapter.tokenizer,
+            source=adapter.identity.source,
+            revision=adapter.identity.revision,
+            artifact_fingerprint=adapter.identity.artifact_fingerprint,
+            special_tokens=special,
+        )
+    prepared = prepare_approved_jsonl(
+        [str(path) for path in args.inputs],
+        args.output_directory,
+        adapter,
+        name=args.name,
+        adapter_config=JsonlAdapterConfig(
+            text_field=args.text_field,
+            id_field=args.id_field,
+            source_field=args.source_field,
+            kind_field=args.kind_field,
+            language_field=args.language_field,
+            approved_field=args.approved_field,
+            default_kind=args.default_kind,
+        ),
+        top_code_languages=args.top_code_languages,
+        documents_per_shard=args.documents_per_shard,
+        eod_token_id=args.eod_token_id,
+    )
+    print(json.dumps(prepared.to_dict(), indent=2))
+
+
+def _parameter_count(value: str) -> int:
+    text = value.strip().lower().replace("_", "").replace(",", "")
+    multipliers = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
+    suffix = text[-1:] if text else ""
+    multiplier = multipliers.get(suffix, 1)
+    if multiplier != 1:
+        text = text[:-1]
+    try:
+        parsed = float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid parameter count: {value!r}") from exc
+    count = int(parsed * multiplier)
+    if count <= 0 or parsed * multiplier != count:
+        raise argparse.ArgumentTypeError("parameter counts must resolve to positive integers")
+    return count
 
 
 def _run(args: argparse.Namespace) -> None:

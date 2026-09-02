@@ -6,6 +6,18 @@
 
 from __future__ import annotations
 
+from .backends import (
+    CompatibleTokenizerAdapter,
+    ExactByteMappingUnavailable,
+    ExactByteTokenizerBackend,
+    HFTokenizerAdapter,
+    LocalSerializedTokenizerAdapter,
+    RPDTokenizerAdapter,
+    SpecialTokenIds,
+    TokenizerBackend,
+    TokenizerIdentity,
+    fingerprint_local_artifact,
+)
 from .encoder import Encoder, build_tier_tables, longest_match_in
 from .evaluation import VocabEvaluation, evaluate_vocab
 from .proxy import ProxyCharModel
@@ -24,13 +36,22 @@ from .vocab import (
 __all__ = [
     "FORMAT_NAME",
     "FORMAT_VERSION",
+    "CompatibleTokenizerAdapter",
+    "ExactByteMappingUnavailable",
+    "ExactByteTokenizerBackend",
     "Encoder",
+    "HFTokenizerAdapter",
+    "LocalSerializedTokenizerAdapter",
     "ProxyCharModel",
+    "RPDTokenizerAdapter",
     "Sample",
+    "SpecialTokenIds",
     "TIER_LABELS",
     "TIER_ORDER",
     "Tier",
     "TokenEntry",
+    "TokenizerBackend",
+    "TokenizerIdentity",
     "TrainerConfig",
     "Vocab",
     "VocabEvaluation",
@@ -39,6 +60,7 @@ __all__ = [
     "build_tier_tables",
     "byte_surface",
     "evaluate_vocab",
+    "fingerprint_local_artifact",
     "lexer_surfaces",
     "longest_match_in",
     "split_identifier",

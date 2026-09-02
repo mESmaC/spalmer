@@ -1,0 +1,86 @@
+"""Corpus manifests, immutable token shards, and deterministic batch sampling."""
+
+from .contracts import (
+    DOCUMENT_FORMAT,
+    DOCUMENT_VERSION,
+    MANIFEST_FORMAT,
+    MANIFEST_VERSION,
+    CodeLanguageStat,
+    CorpusManifest,
+    DocumentKind,
+    DocumentRecord,
+    ManifestDocument,
+    SplitPolicy,
+)
+from .discovery import (
+    DiscoveredInput,
+    JsonlAdapterConfig,
+    discover_jsonl,
+    iter_approved_jsonl,
+    load_approved_jsonl,
+)
+from .manifest import (
+    build_corpus_manifest,
+    canonical_language,
+    normalize_for_dedup,
+    stratum_key,
+)
+from .prepare import PreparedCorpus, prepare_approved_jsonl
+from .sampling import (
+    SAMPLER_STATE_FORMAT,
+    SAMPLER_STATE_VERSION,
+    SamplerState,
+    TokenBatch,
+    WeightedWindowSampler,
+    WindowEligibility,
+    WindowSample,
+)
+from .shards import (
+    SHARD_FORMAT,
+    SHARD_VERSION,
+    MMapTokenShard,
+    TokenizedDocument,
+    TokenShardDescriptor,
+    TokenShardDocument,
+    sha256_file,
+    write_token_shard,
+)
+
+__all__ = [
+    "CodeLanguageStat",
+    "CorpusManifest",
+    "DOCUMENT_FORMAT",
+    "DOCUMENT_VERSION",
+    "DiscoveredInput",
+    "DocumentKind",
+    "DocumentRecord",
+    "JsonlAdapterConfig",
+    "MANIFEST_FORMAT",
+    "MANIFEST_VERSION",
+    "ManifestDocument",
+    "MMapTokenShard",
+    "PreparedCorpus",
+    "SAMPLER_STATE_FORMAT",
+    "SAMPLER_STATE_VERSION",
+    "SHARD_FORMAT",
+    "SHARD_VERSION",
+    "SamplerState",
+    "SplitPolicy",
+    "TokenBatch",
+    "TokenShardDescriptor",
+    "TokenShardDocument",
+    "TokenizedDocument",
+    "WeightedWindowSampler",
+    "WindowEligibility",
+    "WindowSample",
+    "build_corpus_manifest",
+    "canonical_language",
+    "discover_jsonl",
+    "iter_approved_jsonl",
+    "load_approved_jsonl",
+    "normalize_for_dedup",
+    "prepare_approved_jsonl",
+    "sha256_file",
+    "stratum_key",
+    "write_token_shard",
+]
