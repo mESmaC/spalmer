@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar
 
@@ -128,6 +128,150 @@ class TrainerProgress:
         }
 
 
+@dataclass(slots=True)
+class _LayerPotentiationTotals:
+    """Small detached sufficient statistics for one routed-expert layer."""
+
+    responsibility: Tensor
+    weighted_nll: Tensor
+    quantization_error: Tensor
+    quantization_observations: Tensor
+
+
+class _PotentiationAccumulator:
+    """Combine microbatch telemetry into one optimizer-step observation.
+
+    The model reports utilization normalized by the number of supervised
+    targets in each microbatch and an NLL mean for each expert. Multiplying
+    those values back into responsibility counts makes aggregation independent
+    of microbatch size and label masking. Quantization error is deterministic
+    for an expert between optimizer updates, so averaging its non-zero
+    observations preserves the existing "selected this pass" semantics.
+    """
+
+    _FIELDS = (
+        "potentiation_utilization",
+        "expert_attributed_nll",
+        "expert_quantization_error",
+    )
+
+    def __init__(self) -> None:
+        self._layers: list[_LayerPotentiationTotals | None] | None = None
+        self._availability: tuple[bool, ...] | None = None
+        self._target_tokens = 0
+
+    def add(self, layer_metrics: Sequence[Mapping[str, Any]], *, target_tokens: int) -> None:
+        if target_tokens < 0:
+            raise ValueError("target_tokens cannot be negative")
+        availability: list[bool] = []
+        values_by_layer: list[tuple[Tensor, Tensor, Tensor] | None] = []
+        for layer_index, metrics in enumerate(layer_metrics):
+            values = tuple(metrics.get(name) for name in self._FIELDS)
+            present = tuple(isinstance(value, Tensor) for value in values)
+            if any(present) and not all(present):
+                missing = [name for name, exists in zip(self._FIELDS, present) if not exists]
+                raise RuntimeError(
+                    f"layer {layer_index} has incomplete potentiation telemetry: {missing}"
+                )
+            complete = all(present)
+            availability.append(complete)
+            if complete:
+                utilization, attributed_nll, quantization_error = values
+                assert isinstance(utilization, Tensor)
+                assert isinstance(attributed_nll, Tensor)
+                assert isinstance(quantization_error, Tensor)
+                values_by_layer.append((utilization, attributed_nll, quantization_error))
+            else:
+                values_by_layer.append(None)
+
+        observed_availability = tuple(availability)
+        if self._layers is None:
+            self._availability = observed_availability
+            self._layers = [None] * len(layer_metrics)
+        elif len(layer_metrics) != len(self._layers):
+            raise RuntimeError(
+                "layer count changed between gradient-accumulation microbatches: "
+                f"{len(self._layers)} != {len(layer_metrics)}"
+            )
+        elif observed_availability != self._availability:
+            raise RuntimeError(
+                "potentiation telemetry availability changed between "
+                "gradient-accumulation microbatches"
+            )
+
+        self._target_tokens += target_tokens
+        assert self._layers is not None
+        for layer_index, values in enumerate(values_by_layer):
+            if values is None:
+                continue
+            utilization, attributed_nll, quantization_error = (
+                value.detach().float() for value in values
+            )
+            if not (
+                utilization.shape == attributed_nll.shape == quantization_error.shape
+            ):
+                raise RuntimeError(
+                    f"layer {layer_index} potentiation vectors must have one common shape"
+                )
+            responsibility = utilization * float(target_tokens)
+            weighted_nll = attributed_nll * responsibility
+            quantization_observations = (quantization_error > 0).to(torch.long)
+            totals = self._layers[layer_index]
+            if totals is None:
+                self._layers[layer_index] = _LayerPotentiationTotals(
+                    responsibility=responsibility.clone(),
+                    weighted_nll=weighted_nll.clone(),
+                    quantization_error=quantization_error.clone(),
+                    quantization_observations=quantization_observations,
+                )
+                continue
+            for name, value in (
+                ("responsibility", responsibility),
+                ("weighted_nll", weighted_nll),
+                ("quantization_error", quantization_error),
+                ("quantization_observations", quantization_observations),
+            ):
+                current = getattr(totals, name)
+                if current.shape != value.shape or current.device != value.device:
+                    raise RuntimeError(
+                        f"layer {layer_index} {name} changed shape or device between microbatches"
+                    )
+                current.add_(value)
+
+    def finish(self) -> tuple[Mapping[str, Any], ...]:
+        if self._layers is None:
+            return ()
+        aggregated: list[Mapping[str, Any]] = []
+        target_denominator = float(max(self._target_tokens, 1))
+        for totals in self._layers:
+            if totals is None:
+                aggregated.append({})
+                continue
+            responsibility = totals.responsibility
+            utilization = responsibility / target_denominator
+            attributed_nll = torch.where(
+                responsibility > 0,
+                totals.weighted_nll / responsibility.clamp_min(1e-8),
+                torch.zeros_like(totals.weighted_nll),
+            )
+            quantization_error = torch.where(
+                totals.quantization_observations > 0,
+                totals.quantization_error
+                / totals.quantization_observations.clamp_min(1).to(
+                    totals.quantization_error.dtype
+                ),
+                torch.zeros_like(totals.quantization_error),
+            )
+            aggregated.append(
+                {
+                    "potentiation_utilization": utilization,
+                    "expert_attributed_nll": attributed_nll,
+                    "expert_quantization_error": quantization_error,
+                }
+            )
+        return tuple(aggregated)
+
+
 CheckpointCallback = Callable[["ExperimentTrainer", TrainStepMetrics], None]
 ValidationCallback = Callable[[SPALMERCausalLM, int, int], Mapping[str, float]]
 TelemetryCallback = Callable[[TrainStepMetrics], None]
@@ -198,8 +342,12 @@ class ExperimentTrainer:
         rate = self.config.learning_rate * self.config.learning_rate_multiplier(step_index)
         self.optimizer.set_learning_rate(rate)
         self.optimizer.zero_grad(set_to_none=True)
-        outputs: list[CausalLMOutput] = []
         objectives: list[float] = []
+        model_losses: list[float] = []
+        auxiliary_losses: list[float] = []
+        calibration_losses: list[float] = []
+        predictive_entropies: list[float] = []
+        potentiation = _PotentiationAccumulator()
         targets = 0
         for _ in range(self.config.gradient_accumulation_steps):
             host_batch = self.batches.next_batch(
@@ -207,7 +355,8 @@ class ExperimentTrainer:
                 sequence_length=self.config.sequence_length,
             )
             batch = host_batch.to(self.runtime.device)
-            targets += batch.target_tokens
+            batch_targets = batch.target_tokens
+            targets += batch_targets
             with _autocast(self.runtime):
                 output = self.model(
                     batch.input_ids,
@@ -218,13 +367,20 @@ class ExperimentTrainer:
                 objective = _objective(output, self.config)
                 scaled = objective / self.config.gradient_accumulation_steps
             scaled.backward()
-            outputs.append(output)
             objectives.append(float(objective.detach()))
+            _append_optional_scalar(model_losses, output.loss)
+            _append_optional_scalar(auxiliary_losses, output.auxiliary_loss)
+            _append_optional_scalar(calibration_losses, output.surprise_calibration_loss)
+            _append_optional_scalar(predictive_entropies, output.predictive_entropy)
             if output.token_nll is not None:
                 self.model.observe_surprise(
                     output.token_nll,
                     batch.resolved_labels[:, 1:] != -100,
                 )
+            potentiation.add(output.layer_metrics, target_tokens=batch_targets)
+            # Do not keep logits, router scores, recurrent states, or their
+            # already-backwarded graphs alive across accumulation microbatches.
+            del output, objective, scaled, batch, host_batch
 
         parameters = tuple(
             parameter for parameter in self.model.parameters() if parameter.requires_grad
@@ -235,18 +391,24 @@ class ExperimentTrainer:
         gradient_norm = _clip_gradients(parameters, self.config.gradient_clip)
         self.optimizer.step()
 
-        last = outputs[-1]
-        promoted = self.model.update_potentiation(last.layer_metrics)
+        promoted = self.model.update_potentiation(potentiation.finish())
         self.progress.completed_steps += 1
         self.progress.tokens_seen += targets
         metrics = TrainStepMetrics(
             step=self.progress.completed_steps,
             tokens_seen=self.progress.tokens_seen,
             objective=sum(objectives) / len(objectives),
-            model_loss=_mean_optional(outputs, "loss", required=True),
-            auxiliary_loss=_mean_optional(outputs, "auxiliary_loss"),
-            surprise_calibration_loss=_mean_optional(outputs, "surprise_calibration_loss"),
-            predictive_entropy=_mean_optional(outputs, "predictive_entropy", required=True),
+            model_loss=_mean_scalars(model_losses, "loss", required=True),
+            auxiliary_loss=_mean_scalars(auxiliary_losses, "auxiliary_loss"),
+            surprise_calibration_loss=_mean_scalars(
+                calibration_losses,
+                "surprise_calibration_loss",
+            ),
+            predictive_entropy=_mean_scalars(
+                predictive_entropies,
+                "predictive_entropy",
+                required=True,
+            ),
             learning_rate=rate,
             gradient_norm=gradient_norm,
             elapsed_seconds=time.time() - self.progress.started_at,
@@ -348,19 +510,17 @@ def _move_optional(value: Tensor | None, device: torch.device) -> Tensor | None:
     return value.to(device=device, non_blocking=True)
 
 
-def _mean_optional(
-    outputs: list[CausalLMOutput],
-    attribute: str,
-    *,
-    required: bool = False,
-) -> float | None:
-    values = [getattr(output, attribute) for output in outputs]
-    present = [value for value in values if isinstance(value, Tensor)]
-    if not present:
+def _append_optional_scalar(destination: list[float], value: Any) -> None:
+    if isinstance(value, Tensor):
+        destination.append(float(value.detach().float().mean()))
+
+
+def _mean_scalars(values: list[float], name: str, *, required: bool = False) -> float | None:
+    if not values:
         if required:
-            raise RuntimeError(f"model did not return required {attribute}")
+            raise RuntimeError(f"model did not return required {name}")
         return None
-    return sum(float(value.detach().float().mean()) for value in present) / len(present)
+    return sum(values) / len(values)
 
 
 def _clip_gradients(parameters: tuple[nn.Parameter, ...], maximum: float | None) -> float | None:

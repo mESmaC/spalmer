@@ -292,6 +292,11 @@ def test_checkpoint_restores_one_authoritative_controller_and_effective_logits(
     for name in list(legacy_payload["model_state"]):
         if name.startswith("potentiation_controller."):
             legacy_payload["model_state"].pop(name)
+        # Version-1 checkpoints predate the shared expert channel entirely;
+        # remove those tensors as well as the corresponding config field when
+        # constructing the synthetic legacy payload.
+        elif ".channel_mixer.shared." in name:
+            legacy_payload["model_state"].pop(name)
     for name in (
         "expert_fake_quantization",
         "expert_quant_bits",

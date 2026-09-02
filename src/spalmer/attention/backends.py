@@ -104,6 +104,10 @@ class FlaKdaBackend:
     Requires the current fla-core KDA API (``fla-core >= 0.4``): the kernels
     take raw ``g``/``beta`` with ``use_gate_in_kernel`` /
     ``use_beta_sigmoid_in_kernel`` flags and ``A_log``/``dt_bias`` tensors.
+    SPALMER keeps ``dt_bias`` as ``[H, K]`` for the reference implementation,
+    while fla-core's fused kernels require the same values flattened to
+    ``[H * K]``.  The adapter performs that shape-only conversion at the
+    boundary so gradients still return to the canonical parameter shape.
     SPALMER keeps the ordinary ``[B, H, K, V]`` state layout, so
     ``state_v_first`` remains disabled at this boundary.
     """
@@ -153,7 +157,7 @@ class FlaKdaBackend:
             g=f,
             beta=beta_raw,
             A_log=A_log,
-            dt_bias=dt_bias,
+            dt_bias=dt_bias.reshape(-1),
             initial_state=None if state is None else state.float(),
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
@@ -186,7 +190,7 @@ class FlaKdaBackend:
             g=f,
             beta=beta_raw,
             A_log=A_log,
-            dt_bias=dt_bias,
+            dt_bias=dt_bias.reshape(-1),
             initial_state=None if state is None else state.float(),
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
