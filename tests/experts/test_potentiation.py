@@ -299,6 +299,11 @@ def test_checkpoint_restores_one_authoritative_controller_and_effective_logits(
         "router_score_transform",
         "residency_increment",
         "residency_min_gain",
+        # Fields introduced with the shared-path / residency architecture.
+        "shared_inter_dim",
+        "min_resident_experts",
+        "max_resident_experts",
+        "expert_execution",
     ):
         legacy_payload["experts_config"].pop(name, None)
     legacy_path = tmp_path / "legacy-v1.pt"

@@ -38,7 +38,8 @@ def test_output_shapes():
     assert out.metrics["routing_weights"].shape == (2, 5, 2)
     assert out.metrics["router_scores"].shape == (2, 5, 6)
     assert out.metrics["expert_utilization"].shape == (6,)
-    assert isinstance(out.metrics["num_active_experts"], int)
+    # Kept on device so the forward pass never synchronizes with the host.
+    assert int(out.metrics["num_active_experts"]) >= 1
 
 
 def test_selected_expert_count_and_validity():
@@ -86,7 +87,7 @@ def test_two_hundred_experts_supported():
     torch.testing.assert_close(
         result.metrics["expert_utilization"].sum(), torch.tensor(1.0)
     )
-    assert 1 <= result.metrics["num_active_experts"] <= 2 * 3 * 2
+    assert 1 <= int(result.metrics["num_active_experts"]) <= 2 * 3 * 2
 
 
 def test_gradients_reach_router_and_selected_experts():

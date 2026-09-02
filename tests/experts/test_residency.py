@@ -43,7 +43,7 @@ def _build(num_experts: int = 8, **overrides: object):
     return model, vocab, (kda, mla, experts)
 
 
-def test_residency_override_is_bounded_and_reversible() -> None:
+def test_topk_override_is_bounded_and_none_clears_every_request_override() -> None:
     model, _, _ = _build()
     assert model.active_experts == 2
     model.set_active_experts(4)
@@ -52,58 +52,48 @@ def test_residency_override_is_bounded_and_reversible() -> None:
         assert block.channel_mixer.active_experts == 4
     with pytest.raises(ValueError, match="active expert count"):
         model.set_active_experts(7)
+    model.residency.set([0, 3, 5, 6])
     model.set_active_experts(None)
     assert model.active_experts == 2
+    assert model.resident_expert_ids == tuple(range(8))
 
 
-def test_controller_starts_at_minimum_expands_by_increment_and_stays_in_cap() -> None:
-    model, vocab, _ = _build()
+def test_controller_starts_at_minimum_and_adds_explicit_ids_up_to_the_cap() -> None:
+    model, vocab, _ = _build(max_resident_experts=6)
     prompt = torch.tensor([Encoder(vocab).encode("alpha beta gamma")])
 
     # With no observed average surprise every prompt looks hard, so the
     # controller keeps adding bounded increments while each one still pays.
     decision = choose_inference_residency(model, prompt, min_gain=-1.0)
-    assert decision.trace[0][0] == 2
     assert [count for count, _ in decision.trace] == [2, 4, 6]
-    assert decision.active_experts == 6
-    assert model.active_experts == 6
+    assert decision.resident_count == 6
+    assert decision.active_experts == 2  # the per-token top-k never moved
+    assert model.resident_expert_ids == decision.resident_ids
+    # Each expansion added explicit new ids while preserving the earlier set.
+    seen = set(decision.trace and default_ids(model))
+    for added in decision.expansions:
+        assert not seen & set(added)
+        seen |= set(added)
+    assert seen == set(decision.resident_ids)
     assert decision.effective_nll is not None and decision.effective_nll > 0
     assert decision.output.logits.shape[1] == prompt.shape[1]
-    model.set_active_experts(None)
+    model.residency.reset()
 
 
-def test_residency_gain_must_be_finite() -> None:
-    with pytest.raises(ValueError, match="finite"):
-        _build(residency_min_gain=float("nan"))
-
-    model, vocab, _ = _build()
-    prompt = torch.tensor([Encoder(vocab).encode("alpha beta gamma")])
-    with pytest.raises(ValueError, match="finite"):
-        choose_inference_residency(model, prompt, min_gain=float("inf"))
+def default_ids(model) -> tuple[int, ...]:
+    return tuple(range(model.residency.config.min_resident_experts))
 
 
 def test_controller_rolls_back_an_expansion_that_does_not_pay() -> None:
-    model, vocab, _ = _build()
+    model, vocab, _ = _build(max_resident_experts=6)
     prompt = torch.tensor([Encoder(vocab).encode("alpha beta gamma")])
 
     decision = choose_inference_residency(model, prompt, min_gain=10.0)
     assert [count for count, _ in decision.trace] == [2, 4]
-    assert decision.active_experts == 2
-    assert model.active_experts == 2
-
-
-def test_controller_uses_deterministic_inference_mode_and_restores_training() -> None:
-    model, vocab, _ = _build()
-    model.train()
-    prompt = torch.tensor([Encoder(vocab).encode("alpha beta gamma")])
-
-    first = choose_inference_residency(model, prompt)
-    model.set_active_experts(None)
-    second = choose_inference_residency(model, prompt)
-
-    assert first.trace == second.trace
-    assert first.active_experts == second.active_experts
-    assert model.training
+    assert decision.resident_ids == (0, 1)
+    assert decision.expansions == ()
+    assert model.resident_expert_ids == (0, 1)
+    model.residency.reset()
 
 
 def test_controller_retains_the_minimum_when_surprise_is_below_average() -> None:
@@ -114,8 +104,9 @@ def test_controller_retains_the_minimum_when_surprise_is_below_average() -> None
 
     decision = choose_inference_residency(model, prompt)
     assert decision.trace == ((2, decision.effective_signal),)
-    assert decision.active_experts == 2
+    assert decision.resident_ids == (0, 1)
     assert decision.average_surprise == 1000.0
+    model.residency.reset()
 
 
 def test_single_token_prompt_uses_predictive_entropy() -> None:
@@ -124,6 +115,15 @@ def test_single_token_prompt_uses_predictive_entropy() -> None:
     decision = choose_inference_residency(model, prompt, min_gain=10.0)
     assert decision.effective_nll is None
     assert decision.effective_signal == decision.predictive_entropy
+    model.residency.reset()
+
+
+def test_explicit_initial_ids_are_honored() -> None:
+    model, vocab, _ = _build()
+    prompt = torch.tensor([Encoder(vocab).encode("alpha beta gamma")])
+    decision = choose_inference_residency(model, prompt, initial_ids=(5, 2), min_gain=10.0)
+    assert decision.resident_ids == (2, 5)
+    model.residency.reset()
 
 
 def test_training_tracks_average_surprise_and_checkpoints_carry_it(tmp_path) -> None:

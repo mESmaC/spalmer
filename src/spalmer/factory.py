@@ -1,34 +1,23 @@
-"""Small model builders used while the complete SPALMER block is assembled."""
+"""Model builders assembling the SPALMER block from its research components."""
 
 from __future__ import annotations
 
-from torch import Tensor, nn
-from torch.nn import functional as F
-
 from spalmer.attention import KDAConfig, KDATokenMixer, MLAConfig, MLATokenMixer
 from spalmer.config import SPALMERConfig
+from spalmer.directional import DirectionalConfig, LateralSilencingMixer
 from spalmer.experts import (
     ExpertPotentiationController,
+    ExpertResidency,
     MicroExpertChannelMixer,
     MicroExpertsConfig,
     SurpriseRouter,
 )
+from spalmer.memory import ATXYConfig, ATXYInjection
 from spalmer.modeling import SPALMERBackbone, SPALMERBlock, SPALMERCausalLM
+from spalmer.nn import SwiGLU
 
-
-class DenseSwiGLU(nn.Module):
-    """Conventional temporary channel mixer for bootstrap runs."""
-
-    def __init__(self, d_model: int, hidden_size: int) -> None:
-        super().__init__()
-        self.gate_projection = nn.Linear(d_model, hidden_size, bias=False)
-        self.up_projection = nn.Linear(d_model, hidden_size, bias=False)
-        self.down_projection = nn.Linear(hidden_size, d_model, bias=False)
-
-    def forward(self, hidden_states: Tensor) -> Tensor:
-        return self.down_projection(
-            F.silu(self.gate_projection(hidden_states)) * self.up_projection(hidden_states)
-        )
+# The bootstrap model's dense channel mixer; kept under its historical name.
+DenseSwiGLU = SwiGLU
 
 
 def build_kda_bootstrap_model(
@@ -54,9 +43,7 @@ def build_kda_bootstrap_model(
         if config.token_mixer_for_layer(index) != "kda"
     }
     if unsupported:
-        raise ValueError(
-            "the KDA bootstrap builder only accepts a KDA-only token_mixer_pattern"
-        )
+        raise ValueError("the KDA bootstrap builder only accepts a KDA-only token_mixer_pattern")
 
     hidden_size = ffn_hidden_size or 4 * config.d_model
     blocks = [
@@ -76,14 +63,36 @@ def build_spalmer_model(
     kda_config: KDAConfig,
     mla_config: MLAConfig,
     experts_config: MicroExpertsConfig,
+    *,
+    directional_config: DirectionalConfig | None = None,
+    atxy_config: ATXYConfig | None = None,
 ) -> SPALMERCausalLM:
-    """Assemble the first ledger-faithful KDA/MLA and micro-expert model."""
+    """Assemble the ledger-faithful KDA/MLA, shared-path, and micro-expert model.
+
+    One router, one potentiation controller, and one :class:`ExpertResidency`
+    are shared by every layer so that expert identity, promotion, and residency
+    are coherent across depth.
+
+    Feature gates:
+
+    - ``directional_config`` (ledger C16) adds the lateral/silencing mixer as a
+      third pre-norm residual branch in every block when ``enabled``; ``None``
+      or a disabled config leaves the block untouched.
+    - ``atxy_config`` (ledger C03/C04) attaches the ATXY address embedding and
+      exact-value injection; ``None`` keeps the ATXY-free model. Even when
+      attached, ATXY only acts on forward calls that pass an ``ATXYRequest``.
+    """
 
     component_widths = {
         "KDA": kda_config.hidden_size,
         "MLA": mla_config.hidden_size,
         "micro-experts": experts_config.d_model,
     }
+    use_directional = directional_config is not None and directional_config.enabled
+    if use_directional:
+        component_widths["directional"] = directional_config.d_model
+    if atxy_config is not None:
+        component_widths["ATXY"] = atxy_config.d_model
     mismatched = {
         name: width for name, width in component_widths.items() if width != config.d_model
     }
@@ -93,6 +102,7 @@ def build_spalmer_model(
 
     shared_router = SurpriseRouter(experts_config)
     potentiation_controller = ExpertPotentiationController(experts_config)
+    residency = ExpertResidency(experts_config)
     blocks: list[SPALMERBlock] = []
     for layer_index in range(config.n_layers):
         mixer_name = config.token_mixer_for_layer(layer_index)
@@ -106,19 +116,24 @@ def build_spalmer_model(
             experts_config,
             router=shared_router,
             potentiation_controller=potentiation_controller,
+            residency=residency,
         )
+        directional_mixer = LateralSilencingMixer(directional_config) if use_directional else None
         blocks.append(
             SPALMERBlock(
                 config.d_model,
                 token_mixer,
                 channel_mixer,
+                directional_mixer=directional_mixer,
                 norm_eps=config.norm_eps,
             )
         )
+    atxy = None if atxy_config is None else ATXYInjection(atxy_config)
     return SPALMERCausalLM(
         config,
-        SPALMERBackbone(config, blocks),
+        SPALMERBackbone(config, blocks, atxy=atxy),
         potentiation_controller=potentiation_controller,
+        residency=residency,
     )
 
 
