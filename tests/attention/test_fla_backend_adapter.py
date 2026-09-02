@@ -22,7 +22,6 @@ def test_fla_backend_flattens_dt_bias_without_changing_parameter_gradient_shape(
         return output, kwargs["initial_state"]
 
     backend._chunk_kda = fake_kernel
-    backend._fused_recurrent_kda = fake_kernel
 
     batch, heads, key_dim = 2, 2, 3
     q = torch.randn(batch, sequence_length, heads, key_dim)
@@ -47,3 +46,33 @@ def test_fla_backend_flattens_dt_bias_without_changing_parameter_gradient_shape(
     assert dt_bias.grad is not None
     assert dt_bias.grad.shape == dt_bias.shape
     assert torch.isfinite(dt_bias.grad).all()
+
+
+def test_fla_decode_uses_chunk_kernel_for_stable_single_token_recurrence() -> None:
+    backend = object.__new__(FlaKdaBackend)
+    calls: list[int] = []
+
+    def fake_chunk_kernel(**kwargs):
+        calls.append(kwargs["q"].shape[1])
+        return kwargs["q"], kwargs["initial_state"]
+
+    backend._chunk_kda = fake_chunk_kernel
+
+    q = torch.randn(1, 1, 2, 3)
+    state = torch.zeros(1, 2, 3, 3)
+    output, final_state = backend.step(
+        q=q,
+        k=q,
+        v=q,
+        f=q,
+        beta_raw=torch.zeros(1, 1, 2),
+        A_log=torch.zeros(2),
+        dt_bias=torch.zeros(2, 3),
+        state=state,
+        lower_bound=None,
+        allow_neg_eigval=False,
+    )
+
+    assert calls == [1]
+    assert output is q
+    assert final_state is state
