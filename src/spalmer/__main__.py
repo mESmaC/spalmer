@@ -15,10 +15,21 @@ from spalmer.factory import build_spalmer_model
 from spalmer.runtime import generate_tokens, train_token_stream
 from spalmer.tokenizer import Encoder, Sample, TrainerConfig, train
 
+_SMOKE_TEXT = (
+    "SPALMER routes each token through small experts predicted to be least surprised. "
+    "Three KDA layers compress ordinary history and one global MLA layer restores exact "
+    "causal access. The model learns next-token prediction from a versioned tokenizer. "
+) * 96
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a small SPALMER prototype")
-    parser.add_argument("text_file", type=Path)
+    parser.add_argument("text_file", type=Path, nargs="?")
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="train on a built-in sample instead of a corpus file",
+    )
     parser.add_argument("--output", type=Path, default=Path("runs/spalmer-prototype.pt"))
     parser.add_argument("--kind", choices=("prose", "code"), default="prose")
     parser.add_argument("--prompt")
@@ -36,6 +47,10 @@ def main() -> None:
     parser.add_argument("--new-tokens", type=int, default=32)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    if args.smoke and args.text_file is not None:
+        parser.error("use either a corpus path or --smoke, not both")
+    if not args.smoke and args.text_file is None:
+        parser.error("provide a UTF-8 corpus path or use --smoke")
     _run(args)
 
 
@@ -45,11 +60,23 @@ def _run(args: argparse.Namespace) -> None:
     if args.experts < 2:
         raise ValueError("the SPALMER prototype requires at least two experts")
 
-    text = args.text_file.read_text(encoding="utf-8")
+    if args.smoke:
+        text = _SMOKE_TEXT
+        source = "built-in-smoke"
+        corpus_name = "spalmer-smoke"
+    else:
+        if not args.text_file.is_file():
+            raise SystemExit(
+                f"Corpus file not found: {args.text_file}\n"
+                "Pass an existing UTF-8 text file, or run with --smoke."
+            )
+        text = args.text_file.read_text(encoding="utf-8")
+        source = str(args.text_file)
+        corpus_name = args.text_file.stem
     vocab = train(
         [Sample(text=text, kind=args.kind)],
         TrainerConfig(),
-        name=args.text_file.stem,
+        name=corpus_name,
     )
     encoder = Encoder(vocab)
     token_ids = torch.tensor(encoder.encode(text), dtype=torch.long)
@@ -114,7 +141,7 @@ def _run(args: argparse.Namespace) -> None:
         metadata={
             "tokens_seen": result.tokens_seen,
             "final_loss": result.losses[-1],
-            "source": str(args.text_file),
+            "source": source,
         },
     )
 
@@ -133,4 +160,3 @@ def _run(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     main()
-

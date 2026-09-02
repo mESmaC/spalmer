@@ -16,7 +16,8 @@ changed without treating an early implementation as a frozen specification.
 
 ```shell
 python -m pip install -e .
-spalmer corpus.txt --steps 100 --output runs/prototype.pt
+spalmer --smoke --steps 100 --output runs/prototype.pt
+spalmer path/to/your-corpus.txt --steps 100 --output runs/prototype.pt
 ```
 
 That command trains a tokenizer, assembles the 3:1 KDA/MLA model with
