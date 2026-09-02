@@ -1,0 +1,72 @@
+"""Surprise router (SPALMER ledger C08).
+
+The router treats its per-token scores as *predicted expert surprise*.
+Selection prefers the lowest predicted surprise, and combination weights are
+a softmax over negative surprise among the selected experts, so the least
+surprised expert receives the largest weight.
+"""
+
+from __future__ import annotations
+
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from spalmer.experts.config import MicroExpertsConfig
+
+
+class SurpriseRouter(nn.Module):
+    """Learned per-token router emitting predicted surprise for every expert.
+
+    A single router instance may be shared by several layer-local expert
+    banks (one bank per layer, expert identity preserved across layers), as
+    long as every bank has the same ``num_experts``.
+    """
+
+    def __init__(self, config: MicroExpertsConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.num_experts = config.num_experts
+        self.proj = nn.Linear(config.d_model, config.num_experts, bias=config.router_bias)
+        nn.init.normal_(self.proj.weight, mean=0.0, std=config.initializer_range)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+
+    @property
+    def num_features(self) -> int:
+        return self.config.d_model
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        """Return predicted surprise scores of shape ``[batch, seq, experts]``."""
+
+        if hidden_states.shape[-1] != self.config.d_model:
+            raise ValueError(
+                f"expected trailing dimension {self.config.d_model}, "
+                f"got {hidden_states.shape[-1]}"
+            )
+        return self.proj(hidden_states)
+
+
+def select_least_surprised_experts(
+    scores: Tensor, num_active: int
+) -> tuple[Tensor, Tensor]:
+    """Select the ``num_active`` least-surprised experts per token.
+
+    Args:
+        scores: ``[..., experts]`` predicted surprise scores.
+        num_active: Number of experts to select per token.
+
+    Returns:
+        A pair ``(expert_ids, routing_weights)`` of shapes ``[..., k]``.
+        Ids are ordered by ascending predicted surprise (most preferred
+        first), are unique per token, and weights are a softmax over
+        negative surprise among the selected experts, summing to one.
+    """
+
+    if not 1 <= num_active <= scores.shape[-1]:
+        raise ValueError(
+            f"num_active must be in [1, {scores.shape[-1]}]; got {num_active}"
+        )
+    expert_ids = scores.topk(num_active, dim=-1, largest=False).indices
+    selected_scores = scores.gather(-1, expert_ids)
+    routing_weights = F.softmax(-selected_scores, dim=-1)
+    return expert_ids, routing_weights
