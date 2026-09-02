@@ -16,11 +16,10 @@ class MicroExpertsConfig:
     - ``active_experts`` is the per-token top-``k``: how many experts one token
       executes, chosen among the currently *resident* experts.
     - the resident set (ledger C13) is one request-level identity set shared by
-      every layer. Accepted controller expansions add explicit expert ids and
-      raise per-token ``k`` with the resident count, up to
-      ``max_active_experts``; rollback restores both. Outside a residency
-      session every expert is resident and configured ``active_experts`` is
-      used.
+      every layer. Accepted controller expansions add explicit candidate ids
+      without changing per-token ``k``; rollback restores both pieces of state.
+      Outside a residency session every expert is resident and configured
+      ``active_experts`` is used.
 
     Args:
         d_model: Residual-stream width shared with the surrounding block.
@@ -185,11 +184,6 @@ class MicroExpertsConfig:
             raise ValueError(
                 f"active_experts must be in [{self.min_active_experts}, "
                 f"{effective_max}]; got {self.active_experts}"
-            )
-        if self.min_resident_experts > effective_max:
-            raise ValueError(
-                f"min_resident_experts ({self.min_resident_experts}) cannot exceed "
-                f"the controller's maximum active experts ({effective_max})"
             )
         if self.min_resident_experts < self.active_experts:
             raise ValueError(

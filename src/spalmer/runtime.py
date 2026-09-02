@@ -184,9 +184,10 @@ def generate_tokens(
     """Generate with one prefill followed by explicit recurrent decode steps.
 
     With ``dynamic_residency`` the prefill runs the C13 residency controller:
-    the active expert count starts at the configured minimum and expands while
-    the prompt's effective surprise stays above the model's average surprise,
-    and decoding then continues with the count that was retained.
+    the resident candidate set expands while the prompt's effective surprise
+    stays above the model's average surprise. The configured per-token top-k
+    remains fixed, and decoding continues with the resident ids that were
+    retained.
     """
 
     if prompt_ids.ndim == 1:

@@ -31,8 +31,9 @@ Training telemetry stored in the checkpoint includes the separate LM loss,
 routing load-balance loss, surprise-calibration loss, predictive entropy, the
 promoted expert identities, and the model's average surprise, alongside the
 corpus SHA-256 and training knobs. `spalmer generate ... --dynamic-residency`
-lets the inference residency controller grow the active expert set from the
-configured minimum while the prompt's surprise stays above that average.
+lets the inference residency controller grow the resident candidate set from
+the configured minimum while the prompt's surprise stays above that average;
+the configured per-token top-k remains independent.
 The corpus `--kind` is saved and reused for prompt tokenization; pass
 `spalmer generate ... --kind prose|code|mixed` to override it.
 
@@ -55,9 +56,10 @@ otherwise runs the plain-PyTorch correctness backend.
   (selection frequency times quantization reconstruction error) alone;
 - one request-level resident expert identity set shared by every layer
   (`model.residency`): per-token top-k routing is restricted to residents, and
-  the C13 controller grows capacity by adding explicit expert ids (starting
-  from the two-expert minimum, recomputing effective NLL after each bounded
-  increment, rolling back expansions that do not pay) while
+  the C13 controller grows candidate capacity independently by adding explicit
+  expert ids (starting from the two-expert minimum, recomputing effective NLL
+  after each bounded increment at the same top-k, and rolling back expansions
+  that do not pay) while
   `model.parameter_accounting()` reports exact resident and per-token active
   parameter counts. `model.enable_expert_offload(device)` keeps every complete
   layer-local expert master bank on CPU and stages only those coherent
@@ -137,10 +139,11 @@ size.
 The surprise-calibration target is mixture-level realized NLL attributed by
 routing responsibility. It is not a measured counterfactual NLL for every
 individual or unselected expert. The active expert count is fixed during
-training; at inference the residency controller changes it per request at
-prefill, not per decoded token. CUDA generation enables physical expert
-offload by default: full expert masters remain on CPU while a bounded fixed or
-dynamically expanded identity set is cached on CUDA across every layer. Pass
+training; the current inference residency controller also preserves that
+per-token top-k while changing the request-level candidate set at prefill.
+CUDA generation enables physical expert offload by default: full expert masters
+remain on CPU while a bounded fixed or dynamically expanded identity set is
+cached on CUDA across every layer. Pass
 `--no-expert-offload` for all-resident CUDA inference, or
 `--expert-cache-size N` to set the physical identity ceiling. The current
 override and cache are model-global and therefore assume serial generation.

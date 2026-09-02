@@ -158,5 +158,5 @@ def test_legacy_top1_and_decoupled_residency_configs_migrate_to_valid_capacity()
         raw_v4.pop(field)
     raw_v4.update(num_experts=8, max_active_experts=2, min_resident_experts=4)
     migrated_v4 = _migrate_experts_config(raw_v4, 4)
-    assert migrated_v4["min_resident_experts"] == 2
+    assert migrated_v4["min_resident_experts"] == 4
     MicroExpertsConfig(**migrated_v4)

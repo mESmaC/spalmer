@@ -660,15 +660,8 @@ def _migrate_experts_config(
         expert_qat_backend="reference",
         expert_promotion_format="bfloat16",
     )
-    # Pre-v5 residency and execution capacity were independent. The current
-    # controller couples accepted resident expansion to executed top-k, so cap
-    # an old request-start residency at the historical execution ceiling while
-    # preserving the configured default active count.
-    effective_max_active = min(int(migrated["max_active_experts"]), num_experts)
-    migrated["min_resident_experts"] = min(
-        int(migrated["min_resident_experts"]),
-        effective_max_active,
-    )
+    # Pre-v5 residency and per-token execution capacity were independent, as
+    # they are now. Preserve both historical counts exactly.
     if dense_v1:
         migrated.update(
             expert_fake_quantization=False,

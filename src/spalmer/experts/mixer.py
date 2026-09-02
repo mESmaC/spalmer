@@ -116,7 +116,7 @@ class MicroExpertChannelMixer(nn.Module):
         """Override the per-token top-``k``; ``None`` restores the configured value.
 
         This does not change resident identities. The inference controller
-        grows identities and this shared execution capacity together through
+        grows the candidate residency independently through
         :class:`ExpertResidency`.
         """
 

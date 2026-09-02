@@ -14,12 +14,11 @@ Two objects implement it:
 - :class:`ExpertResidency` is the resident identity set. It is one module
   shared by all layer-local banks (like the router and the potentiation
   controller), so expert ``e`` is resident in every layer or in none. Per-token
-  routing is restricted to residents. During a controller-managed request the
-  resident count is also the requested per-token top-``k`` (bounded by
-  ``max_active_experts``): accepted expansion therefore adds coherent expert
-  ids *and* executes the added capacity. Rollback restores both the exact id
-  set and the earlier top-``k``. Outside a request the full pool is resident,
-  which is what training uses.
+  routing is restricted to residents, but resident capacity and per-token
+  top-``k`` are independent: accepted expansion adds coherent candidate ids
+  without forcing every resident to execute. Rollback restores the exact id
+  set and top-``k`` state. Outside a request the full pool is resident, which
+  is what training uses.
 - :func:`choose_inference_residency` is the request-level controller applied
   at prefill. It starts from the minimum resident set, compares the prompt's
   effective surprise with the model's average surprise (C08: ``if effective
@@ -170,9 +169,8 @@ class ExpertResidency(nn.Module):
         """Start a request from ``ids`` and remember the complete prior state.
 
         Nested calls keep the outermost prior set so that :meth:`end_request`
-        always returns to the state before the first request. The controller
-        supplies ``active_experts`` when resident capacity must also become
-        executed capacity.
+        always returns to the state before the first request. ``active_experts``
+        optionally sets the independent per-token top-``k`` for the request.
         """
 
         if active_experts is not None:
@@ -412,9 +410,8 @@ def choose_inference_residency(
         initial_ids: Explicit starting residents. Defaults to the most-utilized
             experts recorded by the potentiation telemetry (or the lowest ids
             when nothing has been observed), ``max(min_resident_experts, k)``
-            of them where ``k`` is the per-token top-``k`` in effect. The
-            starting set becomes the starting executed capacity, capped by
-            ``max_active_experts``.
+            of them where ``k`` is the per-token top-``k`` in effect. Residency
+            expansion does not change ``k``.
         increment: Expert ids added per expansion step (defaults to
             ``residency_increment``).
         min_gain: Smallest signal improvement, in nats per token, that keeps an
@@ -437,7 +434,6 @@ def choose_inference_residency(
     previous_per_token = model.active_experts or config.active_experts
     cap = min(
         max(config.resident_cap, previous_per_token),
-        residency.max_active_experts,
         residency.offload_capacity or residency.num_experts,
     )
     average = model.average_surprise
@@ -465,8 +461,7 @@ def choose_inference_residency(
                     f"{start_count} starting residents exceed the dynamic controller "
                     f"cap of {cap}"
                 )
-            start_active = start_count
-            residency.begin_request(start, active_experts=start_active)
+            residency.begin_request(start, active_experts=previous_per_token)
             output, nll, entropy, signal = _evaluate(model, prompt_ids)
             trace = [(residency.size, signal)]
             expansions: list[tuple[int, ...]] = []
@@ -478,9 +473,6 @@ def choose_inference_residency(
                     break
                 before = residency.snapshot_state()
                 residency.expand(added)
-                residency.set_active_experts(
-                    min(residency.size, residency.max_active_experts)
-                )
                 candidate_output, candidate_nll, candidate_entropy, candidate_signal = _evaluate(
                     model, prompt_ids
                 )

@@ -148,15 +148,18 @@ def test_strict_native_request_fails_instead_of_silently_emulating() -> None:
         fake_quantize_expert_weight(torch.ones(1, 16), config)
 
 
-def test_request_start_residency_cannot_exceed_dynamic_execution_cap() -> None:
-    with pytest.raises(ValueError, match="maximum active experts"):
-        MicroExpertsConfig(
-            d_model=16,
-            num_experts=20,
-            min_resident_experts=10,
-            max_resident_experts=20,
-            max_active_experts=6,
-        )
+def test_request_residency_can_exceed_per_token_execution_cap() -> None:
+    config = MicroExpertsConfig(
+        d_model=16,
+        num_experts=20,
+        min_resident_experts=10,
+        max_resident_experts=20,
+        max_active_experts=6,
+    )
+
+    assert config.min_resident_experts == 10
+    assert config.resident_cap == 20
+    assert config.max_active_experts == 6
 
 
 @pytest.mark.parametrize(

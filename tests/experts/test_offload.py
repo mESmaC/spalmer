@@ -127,11 +127,13 @@ def test_residency_commits_stage_and_evict_the_same_global_ids_in_every_layer() 
     model.residency.expand((3,))
     expanded = model.expert_offload_telemetry()
     assert expanded is not None
+    assert model.active_experts == 2
     assert expanded.cached_expert_ids_by_layer == ((1, 3, 5),) * layer_count
     assert expanded.transferred_expert_rows == 4 * layer_count
     model.residency.restore_state(snapshot)
     rolled_back = model.expert_offload_telemetry()
     assert rolled_back is not None
+    assert model.active_experts == 2
     assert rolled_back.cached_expert_ids_by_layer == ((1, 5),) * layer_count
     assert rolled_back.transferred_expert_rows == 4 * layer_count
     assert rolled_back.evicted_expert_rows == 2 * layer_count

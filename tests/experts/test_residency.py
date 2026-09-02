@@ -73,9 +73,9 @@ def test_controller_starts_at_minimum_and_adds_explicit_ids_up_to_the_cap() -> N
     decision = choose_inference_residency(model, prompt, min_gain=-1.0)
     assert [count for count, _ in decision.trace] == [2, 4, 6]
     assert decision.resident_count == 6
-    assert decision.active_experts == 6
-    assert model.active_experts == 6
-    assert model.parameter_accounting().active_experts_per_token == 6
+    assert decision.active_experts == 2
+    assert model.active_experts == 2
+    assert model.parameter_accounting().active_experts_per_token == 2
     assert model.resident_expert_ids == decision.resident_ids
     # Each expansion added explicit new ids while preserving the earlier set.
     seen = set(decision.trace and default_ids(model))
@@ -86,8 +86,29 @@ def test_controller_starts_at_minimum_and_adds_explicit_ids_up_to_the_cap() -> N
     assert decision.effective_nll is not None and decision.effective_nll > 0
     assert decision.output.logits.shape[1] == prompt.shape[1]
     for metrics in decision.output.layer_metrics:
-        assert metrics["expert_ids"].shape[-1] == 6
-        assert metrics["active_experts_per_token"] == 6
+        assert metrics["expert_ids"].shape[-1] == 2
+        assert metrics["active_experts_per_token"] == 2
+    model.end_residency_request()
+
+
+def test_controller_evaluates_every_resident_expansion_at_the_same_topk(monkeypatch) -> None:
+    from spalmer.experts import residency as residency_module
+
+    model, vocab, _ = _build(max_resident_experts=6)
+    prompt = torch.tensor([Encoder(vocab).encode("alpha beta gamma")])
+    evaluated: list[tuple[int, int]] = []
+    real_evaluate = residency_module._evaluate
+
+    def record_capacity(model_, prompt_ids):
+        evaluated.append((model_.residency.size, model_.active_experts))
+        return real_evaluate(model_, prompt_ids)
+
+    monkeypatch.setattr(residency_module, "_evaluate", record_capacity)
+    decision = residency_module.choose_inference_residency(model, prompt, min_gain=-1.0)
+
+    assert evaluated == [(2, 2), (4, 2), (6, 2)]
+    assert decision.resident_count == 6
+    assert decision.active_experts == 2
     model.end_residency_request()
 
 
@@ -144,9 +165,17 @@ def test_explicit_initial_ids_are_honored() -> None:
     model.end_residency_request()
 
 
-def test_explicit_initial_ids_cannot_bypass_the_execution_cap() -> None:
-    model, vocab, _ = _build(max_resident_experts=8)
+def test_explicit_initial_ids_obey_resident_cap_independently_of_execution_cap() -> None:
+    model, vocab, _ = _build(max_resident_experts=6, max_active_experts=2)
     prompt = torch.tensor([Encoder(vocab).encode("alpha beta gamma")])
+
+    decision = choose_inference_residency(
+        model, prompt, initial_ids=tuple(range(6)), min_gain=10.0
+    )
+    assert decision.resident_count == 6
+    assert decision.active_experts == 2
+    model.end_residency_request()
+
     with pytest.raises(ValueError, match="controller cap of 6"):
         choose_inference_residency(model, prompt, initial_ids=tuple(range(7)))
     assert not model.residency.request_open
