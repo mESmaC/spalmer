@@ -5,8 +5,9 @@ from __future__ import annotations
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from spalmer.attention import KDAConfig, KDATokenMixer
+from spalmer.attention import KDAConfig, KDATokenMixer, MLAConfig, MLATokenMixer
 from spalmer.config import SPALMERConfig
+from spalmer.experts import MicroExpertChannelMixer, MicroExpertsConfig, SurpriseRouter
 from spalmer.modeling import SPALMERBackbone, SPALMERBlock, SPALMERCausalLM
 
 
@@ -65,5 +66,46 @@ def build_kda_bootstrap_model(
     return SPALMERCausalLM(config, SPALMERBackbone(config, blocks))
 
 
-__all__ = ["DenseSwiGLU", "build_kda_bootstrap_model"]
+def build_spalmer_model(
+    config: SPALMERConfig,
+    kda_config: KDAConfig,
+    mla_config: MLAConfig,
+    experts_config: MicroExpertsConfig,
+) -> SPALMERCausalLM:
+    """Assemble the first ledger-faithful KDA/MLA and micro-expert model."""
 
+    component_widths = {
+        "KDA": kda_config.hidden_size,
+        "MLA": mla_config.hidden_size,
+        "micro-experts": experts_config.d_model,
+    }
+    mismatched = {
+        name: width for name, width in component_widths.items() if width != config.d_model
+    }
+    if mismatched:
+        detail = ", ".join(f"{name}={width}" for name, width in mismatched.items())
+        raise ValueError(f"component widths must equal d_model={config.d_model}; got {detail}")
+
+    shared_router = SurpriseRouter(experts_config)
+    blocks: list[SPALMERBlock] = []
+    for layer_index in range(config.n_layers):
+        mixer_name = config.token_mixer_for_layer(layer_index)
+        if mixer_name == "kda":
+            token_mixer = KDATokenMixer(kda_config)
+        elif mixer_name == "mla":
+            token_mixer = MLATokenMixer(mla_config)
+        else:  # SPALMERConfig validates this, but keep the assembly boundary closed.
+            raise ValueError(f"unsupported token mixer: {mixer_name}")
+        channel_mixer = MicroExpertChannelMixer(experts_config, router=shared_router)
+        blocks.append(
+            SPALMERBlock(
+                config.d_model,
+                token_mixer,
+                channel_mixer,
+                norm_eps=config.norm_eps,
+            )
+        )
+    return SPALMERCausalLM(config, SPALMERBackbone(config, blocks))
+
+
+__all__ = ["DenseSwiGLU", "build_kda_bootstrap_model", "build_spalmer_model"]

@@ -1,7 +1,7 @@
 """SPALMER research model components."""
 
 from spalmer.config import PLEConfig, SPALMERConfig
-from spalmer.factory import DenseSwiGLU, build_kda_bootstrap_model
+from spalmer.factory import DenseSwiGLU, build_kda_bootstrap_model, build_spalmer_model
 from spalmer.modeling import (
     BackboneOutput,
     BlockOutput,
@@ -24,6 +24,7 @@ __all__ = [
     "SPALMERCausalLM",
     "SPALMERConfig",
     "build_kda_bootstrap_model",
+    "build_spalmer_model",
 ]
 
 __version__ = "0.1.0"
