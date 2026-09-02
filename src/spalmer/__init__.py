@@ -1,5 +1,6 @@
 """SPALMER research model components."""
 
+from spalmer.checkpoint import load_checkpoint, save_checkpoint
 from spalmer.config import PLEConfig, SPALMERConfig
 from spalmer.factory import DenseSwiGLU, build_kda_bootstrap_model, build_spalmer_model
 from spalmer.modeling import (
@@ -25,6 +26,8 @@ __all__ = [
     "SPALMERConfig",
     "build_kda_bootstrap_model",
     "build_spalmer_model",
+    "load_checkpoint",
+    "save_checkpoint",
 ]
 
 __version__ = "0.1.0"
