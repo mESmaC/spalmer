@@ -3,13 +3,12 @@
 All experts live in three stacked parameters (gate, up, down), one per
 projection. Two execution paths produce the same routed update:
 
-- ``grouped`` (default): pairs are sorted by expert, the tokens of every
-  expert that received at least one pair are gathered into one padded
-  ``[groups, capacity, d_model]`` block and executed with three batched
-  matmuls. There is no per-expert Python loop; the host synchronizes twice per
-  call (which groups are non-empty, and the padded capacity). Dropping empty
-  groups keeps the block proportional to the executed pairs even when routing
-  collapses onto a few experts.
+- ``grouped`` (default): pairs are sorted by expert, then experts are placed in
+  power-of-two count buckets. Each bucket executes three batched matmuls over
+  ``[bucket_groups, bucket_capacity, d_model]``. There is no per-expert Python
+  loop, and the sum of padded slots is strictly less than twice the number of
+  real routed pairs. A single heavily used expert therefore cannot force every
+  other expert to allocate its global maximum capacity.
 - ``loop``: the per-expert reference path (one small matmul triple per
   distinct selected expert) used for equivalence checks and tiny CPU runs.
 """
@@ -585,26 +584,50 @@ class MicroExpertBank(nn.Module):
             return update
         group_counts = counts[group_ids]
         group_starts = starts[group_ids]
-        # Host synchronization 2: the padded capacity of the largest group.
-        capacity = int(group_counts.max())
+        # Host synchronization 2: copy at most ``num_experts`` scalar counts.
+        # Bucket construction then stays on the host and creates at most
+        # ceil(log2(max_count)) batched GEMMs, independent of expert count.
+        buckets = _power_of_two_count_buckets(group_counts.detach().cpu().tolist())
 
-        slot = torch.arange(capacity, device=device)
-        valid = slot[None, :] < group_counts[:, None]
-        gather = (group_starts[:, None] + slot[None, :]).clamp_max(num_pairs - 1)
-        pair_rows = order[gather]
-        token_rows = token_index[pair_rows]
-        inputs = hidden_states[token_rows]
-
-        gate_weight, up_weight, down_weight = self._stacked_effective_weights(
+        # Quantize the selected weight stacks exactly once, in global expert
+        # order. Besides avoiding repeated QAT work across buckets, this keeps
+        # stochastic-rounding draws aligned with the former one-block path.
+        all_gate, all_up, all_down = self._stacked_effective_weights(
             group_ids, promoted_mask
         )
-        expert_inputs = self._effective_activation(inputs)
-        hidden = F.silu(torch.bmm(expert_inputs, gate_weight)) * torch.bmm(
-            expert_inputs, up_weight
-        )
-        outputs = torch.bmm(self._effective_activation(hidden), down_weight)
-        weights = (routing_weights[pair_rows] * valid.to(routing_weights.dtype)).unsqueeze(-1)
-        return update.index_add(0, token_rows.reshape(-1), (outputs * weights).reshape(-1, d_model))
+        routed_rows: list[Tensor] = []
+        routed_updates: list[Tensor] = []
+        for capacity, positions in buckets:
+            group_positions = torch.tensor(positions, dtype=torch.long, device=device)
+            bucket_counts = group_counts.index_select(0, group_positions)
+            bucket_starts = group_starts.index_select(0, group_positions)
+            slot = torch.arange(capacity, device=device)
+            valid = slot[None, :] < bucket_counts[:, None]
+            gather = (bucket_starts[:, None] + slot[None, :]).clamp_max(num_pairs - 1)
+            pair_rows = order[gather]
+            token_rows = token_index[pair_rows]
+            inputs = hidden_states[token_rows]
+
+            gate_weight = all_gate.index_select(0, group_positions)
+            up_weight = all_up.index_select(0, group_positions)
+            down_weight = all_down.index_select(0, group_positions)
+            expert_inputs = self._effective_activation(inputs)
+            hidden = F.silu(torch.bmm(expert_inputs, gate_weight)) * torch.bmm(
+                expert_inputs, up_weight
+            )
+            outputs = torch.bmm(self._effective_activation(hidden), down_weight)
+
+            # Remove padding before retaining results for the final reduction.
+            # Every real routing pair appears exactly once across the buckets.
+            real_rows = pair_rows[valid]
+            routed_rows.append(real_rows)
+            routed_updates.append(
+                outputs[valid] * routing_weights.index_select(0, real_rows).unsqueeze(-1)
+            )
+
+        pair_rows = torch.cat(routed_rows)
+        weighted_updates = torch.cat(routed_updates)
+        return update.index_add(0, token_index.index_select(0, pair_rows), weighted_updates)
 
     def _stacked_effective_weights(
         self,
@@ -641,3 +664,32 @@ def _pair_counts(expert_index: Tensor, num_experts: int) -> Tensor:
 
     counts = torch.zeros(num_experts, dtype=torch.long, device=expert_index.device)
     return counts.scatter_add_(0, expert_index, torch.ones_like(expert_index))
+
+
+def _power_of_two_count_buckets(
+    counts: list[int],
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """Group positive counts by next-power-of-two padded capacity.
+
+    For every positive count ``n``, ``next_power_of_two(n) < 2 * n``. Summing
+    that inequality over all groups guarantees aggregate padded routing slots
+    remain strictly below twice the real pair count.
+    """
+
+    grouped: dict[int, list[int]] = {}
+    real_slots = 0
+    for position, raw_count in enumerate(counts):
+        count = int(raw_count)
+        if count < 1:
+            raise ValueError("count buckets require positive group counts")
+        capacity = 1 << (count - 1).bit_length()
+        grouped.setdefault(capacity, []).append(position)
+        real_slots += count
+    buckets = tuple(
+        (capacity, tuple(positions))
+        for capacity, positions in sorted(grouped.items())
+    )
+    padded_slots = sum(capacity * len(positions) for capacity, positions in buckets)
+    if padded_slots >= 2 * real_slots:
+        raise RuntimeError("power-of-two routing buckets violated their padding bound")
+    return buckets

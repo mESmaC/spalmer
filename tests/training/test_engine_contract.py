@@ -86,6 +86,9 @@ class _AccumulationModel(nn.Module):
                 "utilization": [0.75, 0.25],
                 "nll": [2.0, 4.0],
                 "quantization": [0.1, 0.0],
+                "group_load": 4,
+                "padding_amplification": 1.25,
+                "global_max_counterfactual_amplification": 4.0,
             },
             {
                 "loss": 4.0,
@@ -95,6 +98,9 @@ class _AccumulationModel(nn.Module):
                 "utilization": [0.0, 1.0],
                 "nll": [0.0, 10.0],
                 "quantization": [0.0, 0.3],
+                "group_load": 7,
+                "padding_amplification": 1.75,
+                "global_max_counterfactual_amplification": 12.0,
             },
         )[self.calls]
         self.calls += 1
@@ -123,6 +129,13 @@ class _AccumulationModel(nn.Module):
                     "potentiation_utilization": vector("utilization"),
                     "expert_attributed_nll": vector("nll"),
                     "expert_quantization_error": vector("quantization"),
+                    "expert_group_max_load": scalar("group_load"),
+                    "expert_group_padding_amplification": scalar(
+                        "padding_amplification"
+                    ),
+                    "expert_group_global_max_counterfactual_padding_amplification": scalar(
+                        "global_max_counterfactual_amplification"
+                    ),
                 },
             ),
         )
@@ -167,6 +180,12 @@ def test_gradient_accumulation_aggregates_potentiation_without_retaining_outputs
     assert metrics.surprise_calibration_loss == pytest.approx(8.0)
     assert metrics.predictive_entropy == pytest.approx(10.0)
     assert metrics.promoted_experts == (1,)
+    assert metrics.max_expert_group_load == 7
+    assert metrics.max_expert_group_padding_amplification == pytest.approx(1.75)
+    assert (
+        metrics.max_expert_group_global_max_counterfactual_padding_amplification
+        == pytest.approx(12.0)
+    )
     assert model.aggregated_metrics is not None
     layer = model.aggregated_metrics[0]
     torch.testing.assert_close(layer["potentiation_utilization"], torch.tensor([0.5, 0.5]))

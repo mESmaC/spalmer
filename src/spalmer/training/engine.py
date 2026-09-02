@@ -112,6 +112,9 @@ class TrainStepMetrics:
     elapsed_seconds: float
     promoted_experts: tuple[int, ...]
     average_surprise: float
+    max_expert_group_load: int | None = None
+    max_expert_group_padding_amplification: float | None = None
+    max_expert_group_global_max_counterfactual_padding_amplification: float | None = None
 
 
 @dataclass(slots=True)
@@ -272,6 +275,84 @@ class _PotentiationAccumulator:
         return tuple(aggregated)
 
 
+class _ExecutionTelemetryAccumulator:
+    """Keep only optimizer-step maxima from per-layer execution telemetry."""
+
+    def __init__(self) -> None:
+        self._max_group_load: Tensor | None = None
+        self._max_padding_amplification: Tensor | None = None
+        self._max_global_max_counterfactual_amplification: Tensor | None = None
+
+    def add(self, layer_metrics: Sequence[Mapping[str, Any]]) -> None:
+        for layer_index, metrics in enumerate(layer_metrics):
+            group_load = metrics.get("expert_group_max_load")
+            amplification = metrics.get("expert_group_padding_amplification")
+            counterfactual_amplification = metrics.get(
+                "expert_group_global_max_counterfactual_padding_amplification"
+            )
+            present = (
+                isinstance(group_load, Tensor),
+                isinstance(amplification, Tensor),
+                isinstance(counterfactual_amplification, Tensor),
+            )
+            if any(present) and not all(present):
+                raise RuntimeError(
+                    f"layer {layer_index} has incomplete expert execution telemetry"
+                )
+            if not all(present):
+                continue
+            assert isinstance(group_load, Tensor)
+            assert isinstance(amplification, Tensor)
+            assert isinstance(counterfactual_amplification, Tensor)
+            if (
+                group_load.numel() != 1
+                or amplification.numel() != 1
+                or counterfactual_amplification.numel() != 1
+            ):
+                raise RuntimeError("expert execution telemetry values must be scalars")
+            detached_load = group_load.detach().to(dtype=torch.long)
+            detached_amplification = amplification.detach().float()
+            detached_counterfactual = counterfactual_amplification.detach().float()
+            if self._max_group_load is None:
+                self._max_group_load = detached_load.clone()
+                self._max_padding_amplification = detached_amplification.clone()
+                self._max_global_max_counterfactual_amplification = (
+                    detached_counterfactual.clone()
+                )
+                continue
+            assert self._max_padding_amplification is not None
+            assert self._max_global_max_counterfactual_amplification is not None
+            if (
+                detached_load.device != self._max_group_load.device
+                or detached_amplification.device != self._max_padding_amplification.device
+                or detached_counterfactual.device
+                != self._max_global_max_counterfactual_amplification.device
+            ):
+                raise RuntimeError(
+                    "expert execution telemetry changed device between microbatches"
+                )
+            self._max_group_load = torch.maximum(self._max_group_load, detached_load)
+            self._max_padding_amplification = torch.maximum(
+                self._max_padding_amplification,
+                detached_amplification,
+            )
+            self._max_global_max_counterfactual_amplification = torch.maximum(
+                self._max_global_max_counterfactual_amplification,
+                detached_counterfactual,
+            )
+
+    def finish(self) -> tuple[int | None, float | None, float | None]:
+        if self._max_group_load is None:
+            return None, None, None
+        assert self._max_padding_amplification is not None
+        assert self._max_global_max_counterfactual_amplification is not None
+        return (
+            int(self._max_group_load),
+            float(self._max_padding_amplification),
+            float(self._max_global_max_counterfactual_amplification),
+        )
+
+
 CheckpointCallback = Callable[["ExperimentTrainer", TrainStepMetrics], None]
 ValidationCallback = Callable[[SPALMERCausalLM, int, int], Mapping[str, float]]
 TelemetryCallback = Callable[[TrainStepMetrics], None]
@@ -348,6 +429,7 @@ class ExperimentTrainer:
         calibration_losses: list[float] = []
         predictive_entropies: list[float] = []
         potentiation = _PotentiationAccumulator()
+        execution_telemetry = _ExecutionTelemetryAccumulator()
         targets = 0
         for _ in range(self.config.gradient_accumulation_steps):
             host_batch = self.batches.next_batch(
@@ -378,6 +460,7 @@ class ExperimentTrainer:
                     batch.resolved_labels[:, 1:] != -100,
                 )
             potentiation.add(output.layer_metrics, target_tokens=batch_targets)
+            execution_telemetry.add(output.layer_metrics)
             # Do not keep logits, router scores, recurrent states, or their
             # already-backwarded graphs alive across accumulation microbatches.
             del output, objective, scaled, batch, host_batch
@@ -392,6 +475,11 @@ class ExperimentTrainer:
         self.optimizer.step()
 
         promoted = self.model.update_potentiation(potentiation.finish())
+        (
+            max_group_load,
+            max_padding_amplification,
+            max_global_max_counterfactual_amplification,
+        ) = execution_telemetry.finish()
         self.progress.completed_steps += 1
         self.progress.tokens_seen += targets
         metrics = TrainStepMetrics(
@@ -414,6 +502,11 @@ class ExperimentTrainer:
             elapsed_seconds=time.time() - self.progress.started_at,
             promoted_experts=promoted,
             average_surprise=self.model.average_surprise,
+            max_expert_group_load=max_group_load,
+            max_expert_group_padding_amplification=max_padding_amplification,
+            max_expert_group_global_max_counterfactual_padding_amplification=(
+                max_global_max_counterfactual_amplification
+            ),
         )
         self._dispatch_callbacks(metrics)
         return metrics

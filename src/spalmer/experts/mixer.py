@@ -153,7 +153,8 @@ class MicroExpertChannelMixer(nn.Module):
             ``auxiliary_loss`` is the resident-normalized load-balancing loss,
             and ``metrics`` carries ``expert_ids``, ``routing_weights``,
             ``router_scores`` (predicted surprise), ``expert_utilization``,
-            ``expert_quantization_error``, ``promoted_experts``,
+            grouped-execution load/padding scalars, ``expert_quantization_error``,
+            ``promoted_experts``,
             ``resident_experts``, and ``num_active_experts``.
         """
 
@@ -202,6 +203,11 @@ class MicroExpertChannelMixer(nn.Module):
         utilization = expert_utilization(expert_ids, self.config.num_experts)
         quantization_error = self.experts.quantization_error(expert_ids, resident_ids)
         auxiliary_loss = load_balance_loss(scores, expert_ids, None if full_pool else resident_mask)
+        execution_metrics = _expert_execution_metrics(
+            expert_ids,
+            num_experts=self.config.num_experts,
+            execution=self.config.expert_execution,
+        )
         metrics: dict[str, Any] = {
             "expert_ids": expert_ids,
             "routing_weights": routing_weights,
@@ -213,6 +219,7 @@ class MicroExpertChannelMixer(nn.Module):
             "active_experts_per_token": num_active,
             # Distinct experts executed this pass, kept on device (no sync).
             "num_active_experts": (utilization > 0).sum(),
+            **execution_metrics,
         }
         return ChannelMixerOutput(
             update=update,
@@ -220,3 +227,59 @@ class MicroExpertChannelMixer(nn.Module):
             auxiliary_loss=auxiliary_loss,
             metrics=metrics,
         )
+
+
+def _expert_execution_metrics(
+    expert_ids: Tensor,
+    *,
+    num_experts: int,
+    execution: str,
+) -> dict[str, Any]:
+    """Return scalar evidence for actual and legacy grouped padding overhead."""
+
+    pair_count = expert_ids.numel()
+    if pair_count < 1:
+        raise ValueError("expert_ids must contain at least one routed pair")
+    if num_experts < 1:
+        raise ValueError("num_experts must be positive")
+    counts = torch.bincount(expert_ids.reshape(-1), minlength=num_experts)
+    active_mask = counts > 0
+    active_groups = active_mask.sum(dtype=torch.long)
+    max_group_load = counts.max()
+    real_pairs = counts.sum()
+    global_max_counterfactual_pairs = max_group_load * active_groups
+    if execution == "grouped":
+        # The executor buckets each exact group count to its own next power of
+        # two. Integer bit propagation mirrors ``int.bit_length`` without a
+        # host sync and guarantees less than 2x actual padding.
+        rounded_counts = counts.clamp_min(1) - 1
+        for shift in (1, 2, 4, 8, 16, 32):
+            rounded_counts = torch.bitwise_or(
+                rounded_counts,
+                torch.bitwise_right_shift(rounded_counts, shift),
+            )
+        padded_pairs = torch.where(
+            active_mask,
+            rounded_counts + 1,
+            torch.zeros_like(rounded_counts),
+        ).sum()
+    elif execution == "loop":
+        padded_pairs = real_pairs
+    else:
+        raise ValueError(f"unsupported expert execution mode: {execution!r}")
+    return {
+        "expert_execution": execution,
+        "expert_group_count": active_groups.detach(),
+        "expert_group_max_load": max_group_load.detach(),
+        "expert_group_real_pairs": real_pairs.detach(),
+        "expert_group_padded_pairs": padded_pairs.detach(),
+        "expert_group_padding_amplification": (
+            padded_pairs.float() / real_pairs.float()
+        ).detach(),
+        "expert_group_global_max_counterfactual_padded_pairs": (
+            global_max_counterfactual_pairs.detach()
+        ),
+        "expert_group_global_max_counterfactual_padding_amplification": (
+            global_max_counterfactual_pairs.float() / real_pairs.float()
+        ).detach(),
+    }
