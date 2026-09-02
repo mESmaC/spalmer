@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -37,6 +38,11 @@ class MicroExpertsConfig:
             non-negative; ``identity`` exists only to reproduce legacy
             checkpoints trained with raw router logits.
         router_bias: Learnable bias on the router projection.
+        residency_increment: Experts added per expansion step of the C13
+            inference residency controller.
+        residency_min_gain: Smallest drop in effective NLL (nats per token)
+            that an expansion step must buy to be retained; otherwise the
+            controller rolls back to the previous active count.
         initializer_range: Standard deviation of the normal initializations.
     """
 
@@ -56,6 +62,8 @@ class MicroExpertsConfig:
     potentiation_hysteresis: float = 0.05
     router_score_transform: Literal["softplus", "identity"] = "softplus"
     router_bias: bool = False
+    residency_increment: int = 2
+    residency_min_gain: float = 0.02
     initializer_range: float = 0.02
 
     def __post_init__(self) -> None:
@@ -79,11 +87,12 @@ class MicroExpertsConfig:
         if self.potentiation_hysteresis < 0:
             raise ValueError("potentiation_hysteresis must be non-negative")
         if self.router_score_transform not in {"softplus", "identity"}:
-            raise ValueError(
-                "router_score_transform must be 'softplus' or 'identity'"
-            )
+            raise ValueError("router_score_transform must be 'softplus' or 'identity'")
         if self.initializer_range <= 0:
             raise ValueError("initializer_range must be positive")
+        _require_positive("residency_increment", self.residency_increment)
+        if not math.isfinite(self.residency_min_gain):
+            raise ValueError("residency_min_gain must be finite")
         if self.min_active_experts > self.max_active_experts:
             raise ValueError(
                 f"min_active_experts ({self.min_active_experts}) cannot exceed "

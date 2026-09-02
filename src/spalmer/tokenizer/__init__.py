@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 from .encoder import Encoder, build_tier_tables, longest_match_in
+from .evaluation import VocabEvaluation, evaluate_vocab
+from .proxy import ProxyCharModel
 from .tiers import TIER_LABELS, TIER_ORDER, Tier
 from .trainer import Sample, TrainerConfig, lexer_surfaces, split_identifier, train
 from .vocab import (
@@ -23,6 +25,7 @@ __all__ = [
     "FORMAT_NAME",
     "FORMAT_VERSION",
     "Encoder",
+    "ProxyCharModel",
     "Sample",
     "TIER_LABELS",
     "TIER_ORDER",
@@ -30,10 +33,12 @@ __all__ = [
     "TokenEntry",
     "TrainerConfig",
     "Vocab",
+    "VocabEvaluation",
     "VersionRecord",
     "append_byte_backstop",
     "build_tier_tables",
     "byte_surface",
+    "evaluate_vocab",
     "lexer_surfaces",
     "longest_match_in",
     "split_identifier",

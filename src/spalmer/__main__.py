@@ -73,6 +73,9 @@ def _training_parser() -> argparse.ArgumentParser:
     parser.add_argument("--potentiation-warmup-steps", type=int, default=4)
     parser.add_argument("--potentiation-hold-steps", type=int, default=8)
     parser.add_argument("--surprise-loss-weight", type=float, default=0.05)
+    parser.add_argument("--surprise-ema-decay", type=float, default=0.99)
+    parser.add_argument("--residency-increment", type=int, default=2)
+    parser.add_argument("--residency-min-gain", type=float, default=0.02)
     parser.add_argument("--ple-expansion", type=int, default=2)
     parser.add_argument("--new-tokens", type=int, default=32)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -89,6 +92,19 @@ def _generate_parser() -> argparse.ArgumentParser:
     parser.add_argument("--new-tokens", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int)
+    parser.add_argument(
+        "--kind",
+        choices=("mixed", "prose", "code"),
+        help="override the checkpoint corpus kind used to route prompt regions",
+    )
+    parser.add_argument(
+        "--dynamic-residency",
+        action="store_true",
+        help=(
+            "let the C13 residency controller expand the active expert count from the "
+            "configured minimum while the prompt's surprise stays above average"
+        ),
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser
 
@@ -120,7 +136,7 @@ def _run(args: argparse.Namespace) -> None:
         name=corpus_name,
     )
     encoder = Encoder(vocab)
-    token_ids = torch.tensor(encoder.encode(text), dtype=torch.long)
+    token_ids = torch.tensor(encoder.encode(text, kind=args.kind), dtype=torch.long)
     head_dim = args.d_model // args.heads
 
     config = SPALMERConfig(
@@ -131,6 +147,7 @@ def _run(args: argparse.Namespace) -> None:
         tokenizer_fingerprint=vocab.fingerprint,
         ple_expansion_factor=args.ple_expansion,
         token_mixer_pattern=_HYBRID_CYCLE,
+        surprise_ema_decay=args.surprise_ema_decay,
     )
     kda_config = KDAConfig(
         hidden_size=args.d_model,
@@ -157,6 +174,8 @@ def _run(args: argparse.Namespace) -> None:
         potentiation_budget=args.potentiation_budget,
         potentiation_warmup_steps=args.potentiation_warmup_steps,
         potentiation_hold_steps=args.potentiation_hold_steps,
+        residency_increment=args.residency_increment,
+        residency_min_gain=args.residency_min_gain,
     )
     model = build_spalmer_model(config, kda_config, mla_config, experts_config)
     device = torch.device(args.device)
@@ -193,6 +212,7 @@ def _run(args: argparse.Namespace) -> None:
             "final_surprise_calibration_loss": result.final_surprise_calibration_loss,
             "final_predictive_entropy": result.final_predictive_entropy,
             "promoted_experts": list(result.promoted_experts),
+            "average_surprise": result.average_surprise,
             "source": source,
             "corpus_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             "kind": args.kind,
@@ -200,12 +220,15 @@ def _run(args: argparse.Namespace) -> None:
             "batch_size": args.batch_size,
             "sequence_length": args.sequence_length,
             "learning_rate": args.learning_rate,
+            "surprise_ema_decay": args.surprise_ema_decay,
+            "residency_increment": args.residency_increment,
+            "residency_min_gain": args.residency_min_gain,
             "seed": 0,
         },
     )
 
     prompt = args.prompt or text[: min(80, len(text))]
-    prompt_ids = torch.tensor(encoder.encode(prompt), dtype=torch.long)
+    prompt_ids = torch.tensor(encoder.encode(prompt, kind=args.kind), dtype=torch.long)
     generated_ids = generate_tokens(model, prompt_ids, max_new_tokens=args.new_tokens)
     payload = b"".join(vocab.get(int(token)).payload() for token in generated_ids[0])
     generated = payload.decode("utf-8", errors="replace")
@@ -213,20 +236,22 @@ def _run(args: argparse.Namespace) -> None:
     print(
         f"saved={destination} parameters={parameters:,} vocab={len(vocab):,} "
         f"tokens_seen={result.tokens_seen:,} seconds={result.elapsed_seconds:.2f} "
-        f"promoted={list(result.promoted_experts)}"
+        f"promoted={list(result.promoted_experts)} "
+        f"average_surprise={result.average_surprise:.4f}"
     )
-    print(generated)
+    print(_terminal_safe_text(generated))
 
 
 def _run_generate(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
-    model, vocab, _ = load_checkpoint(args.checkpoint, map_location="cpu")
+    model, vocab, metadata = load_checkpoint(args.checkpoint, map_location="cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     model.to(device=device, dtype=dtype)
     model.eval()
 
     encoder = Encoder(vocab)
-    prompt_ids = torch.tensor(encoder.encode(args.prompt), dtype=torch.long)
+    prompt_kind = args.kind or metadata.get("kind", "mixed")
+    prompt_ids = torch.tensor(encoder.encode(args.prompt, kind=prompt_kind), dtype=torch.long)
     if prompt_ids.numel() == 0:
         raise ValueError("prompt must encode to at least one token")
     generated_ids = generate_tokens(
@@ -235,9 +260,17 @@ def _run_generate(args: argparse.Namespace) -> None:
         max_new_tokens=args.new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
+        dynamic_residency=args.dynamic_residency,
     )
     payload = b"".join(vocab.get(int(token)).payload() for token in generated_ids[0])
-    print(payload.decode("utf-8", errors="replace"))
+    print(_terminal_safe_text(payload.decode("utf-8", errors="replace")))
+
+
+def _terminal_safe_text(text: str, *, encoding: str | None = None) -> str:
+    """Keep arbitrary byte-token generations printable on legacy Windows consoles."""
+
+    target = encoding or getattr(sys.stdout, "encoding", None) or "utf-8"
+    return text.encode(target, errors="backslashreplace").decode(target)
 
 
 if __name__ == "__main__":

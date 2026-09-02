@@ -65,10 +65,44 @@ class MicroExpertChannelMixer(nn.Module):
         # boundary. The weak reference prevents registering the same state under
         # every layer-local bank.
         object.__setattr__(self, "_potentiation_controller_ref", ref(potentiation_controller))
+        self._active_experts_override: int | None = None
 
     @property
     def active_experts(self) -> int:
+        """Experts executed per token: the residency override, else the config value."""
+
+        if self._active_experts_override is not None:
+            return self._active_experts_override
         return self.config.active_experts
+
+    @property
+    def active_experts_override(self) -> int | None:
+        """Residency override currently applied, or ``None`` for the configured count."""
+
+        return self._active_experts_override
+
+    @property
+    def max_active_experts(self) -> int:
+        """Soft residency cap (ledger C13), bounded by the bank size."""
+
+        return min(self.config.max_active_experts, self.config.num_experts)
+
+    def set_active_experts(self, count: int | None) -> None:
+        """Change inference residency; ``None`` restores the configured count.
+
+        This is the C13 dynamic-rounding knob: the bank keeps every expert, and
+        only the number executed per token moves within
+        ``[min_active_experts, max_active_experts]``.
+        """
+
+        if count is not None and not (
+            self.config.min_active_experts <= count <= self.max_active_experts
+        ):
+            raise ValueError(
+                f"active expert count must be in [{self.config.min_active_experts}, "
+                f"{self.max_active_experts}]; got {count}"
+            )
+        self._active_experts_override = count
 
     @property
     def potentiation_controller(self) -> ExpertPotentiationController:
@@ -77,9 +111,7 @@ class MicroExpertChannelMixer(nn.Module):
             raise RuntimeError("the shared potentiation controller no longer exists")
         return controller
 
-    def forward(
-        self, hidden_states: Tensor, *, state: Any = None
-    ) -> ChannelMixerOutput:
+    def forward(self, hidden_states: Tensor, *, state: Any = None) -> ChannelMixerOutput:
         """Route, execute the selected experts, and combine their updates.
 
         Args:
@@ -102,19 +134,17 @@ class MicroExpertChannelMixer(nn.Module):
             )
         if hidden_states.shape[-1] != self.config.d_model:
             raise ValueError(
-                f"expected trailing dimension {self.config.d_model}; "
-                f"got {hidden_states.shape[-1]}"
+                f"expected trailing dimension {self.config.d_model}; got {hidden_states.shape[-1]}"
             )
         batch, seq_len, d_model = hidden_states.shape
-        num_active = self.config.active_experts
+        num_active = self.active_experts
 
         scores = self.router(hidden_states)
         expert_ids, routing_weights = select_least_surprised_experts(scores, num_active)
 
         flat_hidden = hidden_states.reshape(batch * seq_len, d_model)
-        token_index = (
-            torch.arange(batch * seq_len, device=hidden_states.device)
-            .repeat_interleave(num_active)
+        token_index = torch.arange(batch * seq_len, device=hidden_states.device).repeat_interleave(
+            num_active
         )
         expert_index = expert_ids.reshape(-1)
         flat_weights = routing_weights.reshape(-1)

@@ -15,6 +15,11 @@ class ExpertPotentiationController(nn.Module):
     fake-low-bit execution to its floating shadow parameter. It establishes the
     expert-wide control semantics; packed FP4 plus FP8 residual storage remains a
     later numerical backend.
+
+    Signal roles stay separate (ledger C10). The promotion score is precision
+    pressure only: how often an expert is selected times its quantization
+    reconstruction error. Attributed NLL is tracked as telemetry for the
+    capacity question (C08/C13), but it never decides who is promoted.
     """
 
     def __init__(self, config: MicroExpertsConfig) -> None:
@@ -30,7 +35,9 @@ class ExpertPotentiationController(nn.Module):
 
     @property
     def scores(self) -> Tensor:
-        return self.utilization_ema * self.attributed_nll_ema * self.quantization_error_ema
+        """Precision pressure: selection frequency times reconstruction error."""
+
+        return self.utilization_ema * self.quantization_error_ema
 
     def _apply(self, fn):
         super()._apply(fn)

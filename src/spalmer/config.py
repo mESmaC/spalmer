@@ -93,6 +93,9 @@ class SPALMERConfig:
     norm_eps: float = 1e-6
     initializer_range: float = 0.02
     token_mixer_pattern: tuple[str, ...] = ("kda", "kda", "kda", "mla")
+    # Averaging window of the shared "average surprise" signal (ledger C08/C13):
+    # an exponential moving average of realized next-token NLL seen in training.
+    surprise_ema_decay: float = 0.99
 
     def __post_init__(self) -> None:
         _require_positive("vocab_size", self.vocab_size)
@@ -105,6 +108,8 @@ class SPALMERConfig:
             raise ValueError("norm_eps must be positive")
         if self.initializer_range <= 0:
             raise ValueError("initializer_range must be positive")
+        if not 0 <= self.surprise_ema_decay < 1:
+            raise ValueError("surprise_ema_decay must be in [0, 1)")
         if not self.token_mixer_pattern:
             raise ValueError("token_mixer_pattern cannot be empty")
         unsupported = set(self.token_mixer_pattern) - {"kda", "mla"}

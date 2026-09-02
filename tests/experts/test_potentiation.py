@@ -97,8 +97,7 @@ def test_promoted_expert_bypasses_low_bit_substrate_and_demotion_restores_it() -
         )
 
     manual_low = (
-        F.silu(hidden @ quantized(bank.gate_proj))
-        * (hidden @ quantized(bank.up_proj))
+        F.silu(hidden @ quantized(bank.gate_proj)) * (hidden @ quantized(bank.up_proj))
     ) @ quantized(bank.down_proj)
     manual_high = (
         F.silu(hidden @ bank.gate_proj[0]) * (hidden @ bank.up_proj[0])
@@ -125,12 +124,17 @@ def test_controller_keeps_separate_signals_and_persists_exact_promoted_set() -> 
         quantization_error=torch.tensor([0.5, 0.5, 0.2, 100.0]),
     )
 
-    # Products are [0.6, 0.6, 0.18, 0.0]; both tied positive leaders fit.
+    # Precision pressure is utilization * quantization error: [0.3, 0.15, 0.02, 0.0].
+    # Attributed NLL is recorded but plays no part in the promotion decision.
     assert set(promoted) == {0, 1}
     assert controller.promoted_mask.sum() == 2
     torch.testing.assert_close(
         controller.scores,
-        torch.tensor([0.6, 0.6, 0.18, 0.0]),
+        torch.tensor([0.3, 0.15, 0.02, 0.0]),
+    )
+    torch.testing.assert_close(
+        controller.attributed_nll_ema,
+        torch.tensor([2.0, 4.0, 9.0, 100.0]),
     )
 
     restored = ExpertPotentiationController(config)
@@ -142,6 +146,19 @@ def test_controller_keeps_separate_signals_and_persists_exact_promoted_set() -> 
         restored.quantization_error_ema,
         controller.quantization_error_ema,
     )
+
+
+def test_attributed_nll_does_not_decide_promotion() -> None:
+    controller = ExpertPotentiationController(_config(potentiation_budget=1))
+    (promoted,) = controller.observe(
+        utilization=torch.tensor([0.5, 0.5, 0.0, 0.0]),
+        attributed_nll=torch.tensor([9.0, 1.0, 0.0, 0.0]),
+        quantization_error=torch.tensor([0.1, 0.4, 0.0, 0.0]),
+    )
+
+    # Expert 0 is the most surprised, but expert 1 is the one that is
+    # precision-limited, so expert 1 is promoted (ledger C10 signal roles).
+    assert promoted == 1
 
 
 def test_controller_does_not_promote_without_observed_precision_pressure() -> None:
@@ -223,6 +240,15 @@ def test_checkpoint_restores_one_authoritative_controller_and_effective_logits(
             mla_config=mla_config,
             experts_config=replace(experts_config, expert_quant_bits=5),
         )
+    with pytest.raises(ValueError, match="KDA config does not match"):
+        save_checkpoint(
+            tmp_path / "mismatched-kda.pt",
+            model,
+            vocab,
+            kda_config=replace(kda_config, backend="auto"),
+            mla_config=mla_config,
+            experts_config=experts_config,
+        )
 
     restored, _, _ = load_checkpoint(path)
     restored.eval()
@@ -255,6 +281,9 @@ def test_checkpoint_restores_one_authoritative_controller_and_effective_logits(
 
     legacy_payload = torch.load(path, weights_only=False)
     legacy_payload["format_version"] = 1
+    legacy_payload["model_config"].pop("surprise_ema_decay")
+    legacy_payload["model_state"].pop("surprise_ema")
+    legacy_payload["model_state"].pop("surprise_observations")
     for name in list(legacy_payload["model_state"]):
         if name.startswith("potentiation_controller."):
             legacy_payload["model_state"].pop(name)
@@ -268,6 +297,8 @@ def test_checkpoint_restores_one_authoritative_controller_and_effective_logits(
         "potentiation_hold_steps",
         "potentiation_hysteresis",
         "router_score_transform",
+        "residency_increment",
+        "residency_min_gain",
     ):
         legacy_payload["experts_config"].pop(name, None)
     legacy_path = tmp_path / "legacy-v1.pt"
@@ -278,3 +309,10 @@ def test_checkpoint_restores_one_authoritative_controller_and_effective_logits(
     assert legacy_controller.config.router_score_transform == "identity"
     assert not legacy_controller.config.expert_fake_quantization
     assert legacy_controller.config.potentiation_budget == 0
+
+    damaged_legacy_payload = torch.load(legacy_path, weights_only=False)
+    damaged_legacy_payload["experts_config"].pop("active_experts")
+    damaged_legacy_path = tmp_path / "damaged-legacy-v1.pt"
+    torch.save(damaged_legacy_payload, damaged_legacy_path)
+    with pytest.raises(ValueError, match="active_experts"):
+        load_checkpoint(damaged_legacy_path)

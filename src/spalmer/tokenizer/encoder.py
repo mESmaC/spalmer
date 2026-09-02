@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 
+from .code_regions import InputKind, route_regions, tiers_for_role
 from .tiers import TIER_ORDER, Tier
 from .vocab import Vocab
 
@@ -83,15 +84,27 @@ class Encoder:
         if set(self._byte_ids) != set(range(256)):
             raise ValueError("vocabulary must contain the complete 256-byte backstop")
 
-    def encode(self, text: str) -> list[int]:
-        return [token_id for token_id, _ in self.encode_with_tiers(text)]
+    def encode(self, text: str, *, kind: InputKind = "mixed") -> list[int]:
+        return [token_id for token_id, _ in self.encode_with_tiers(text, kind=kind)]
 
-    def encode_with_tiers(self, text: str) -> list[tuple[int, Tier]]:
+    def encode_with_tiers(self, text: str, *, kind: InputKind = "mixed") -> list[tuple[int, Tier]]:
         out: list[tuple[int, Tier]] = []
+        for region in route_regions(text, kind):
+            region_text = text[region.start : region.end]
+            tiers = tiers_for_role(self._text_tiers, region.role)
+            self._encode_region(region_text, tiers, out)
+        return out
+
+    def _encode_region(
+        self,
+        text: str,
+        tiers: tuple[Tier, ...],
+        out: list[tuple[int, Tier]],
+    ) -> None:
         pos = 0
         length = len(text)
         while pos < length:
-            match = longest_match_in(self._tables, self._max_lens, text, pos, self._text_tiers)
+            match = longest_match_in(self._tables, self._max_lens, text, pos, tiers)
             if match is not None:
                 token_id, tier, surface = match
                 out.append((token_id, tier))
@@ -100,7 +113,6 @@ class Encoder:
                 for value in text[pos].encode("utf-8"):
                     out.append((self._byte_ids[value], Tier.BYTE))
                 pos += 1
-        return out
 
     def decode(self, token_ids: Iterable[int]) -> str:
         payload = b"".join(self._payloads[token_id] for token_id in token_ids)

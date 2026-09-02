@@ -264,6 +264,69 @@ class SPALMERCausalLM(nn.Module):
         self.potentiation_controller = potentiation_controller
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         nn.init.normal_(self.lm_head.weight, mean=0.0, std=config.initializer_range)
+        # Shared "average surprise" telemetry (ledger C08/C13): the EMA of
+        # realized next-token NLL, consumed by the inference residency controller.
+        self.register_buffer("surprise_ema", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("surprise_observations", torch.zeros((), dtype=torch.long))
+
+    def _apply(self, fn):
+        super()._apply(fn)
+        # Module-wide low-precision casts are for weights, not for a slowly
+        # moving average that a bf16 update step would silently round away.
+        self._buffers["surprise_ema"] = self._buffers["surprise_ema"].float()
+        return self
+
+    @property
+    def average_surprise(self) -> float:
+        """Average realized surprise in nats per token (``0.0`` before any observation)."""
+
+        return float(self.surprise_ema)
+
+    @torch.no_grad()
+    def observe_surprise(self, token_nll: Tensor, valid: Tensor | None = None) -> float:
+        """Fold realized next-token NLL into the shared average-surprise signal."""
+
+        values = token_nll.detach().float()
+        if valid is not None:
+            values = values[valid]
+        if values.numel() == 0:
+            return self.average_surprise
+        batch_mean = values.mean().to(self.surprise_ema)
+        if int(self.surprise_observations) == 0:
+            self.surprise_ema.copy_(batch_mean)
+        else:
+            decay = self.config.surprise_ema_decay
+            self.surprise_ema.mul_(decay).add_(batch_mean, alpha=1.0 - decay)
+        self.surprise_observations.add_(1)
+        return self.average_surprise
+
+    @property
+    def active_experts(self) -> int | None:
+        """Experts executed per token by the routed channel mixers, if any."""
+
+        for block in self.backbone.blocks:
+            count = getattr(block.channel_mixer, "active_experts", None)
+            if isinstance(count, int):
+                return count
+        return None
+
+    @property
+    def active_experts_override(self) -> int | None:
+        """Residency override applied to the routed mixers, or ``None``."""
+
+        for block in self.backbone.blocks:
+            mixer = block.channel_mixer
+            if hasattr(mixer, "active_experts_override"):
+                return mixer.active_experts_override
+        return None
+
+    def set_active_experts(self, count: int | None) -> None:
+        """Apply one inference residency decision to every routed channel mixer."""
+
+        for block in self.backbone.blocks:
+            setter = getattr(block.channel_mixer, "set_active_experts", None)
+            if callable(setter):
+                setter(count)
 
     def forward(
         self,
@@ -315,9 +378,9 @@ class SPALMERCausalLM(nn.Module):
 
         with torch.no_grad():
             final_log_probabilities = F.log_softmax(logits[:, -1].detach().float(), dim=-1)
-            predictive_entropy = -(
-                final_log_probabilities.exp() * final_log_probabilities
-            ).sum(dim=-1)
+            predictive_entropy = -(final_log_probabilities.exp() * final_log_probabilities).sum(
+                dim=-1
+            )
         return CausalLMOutput(
             logits=logits,
             token_mixer_states=backbone_output.token_mixer_states,
@@ -349,35 +412,27 @@ class SPALMERCausalLM(nn.Module):
             for metric in layer_metrics
         ]
         complete = [
-            values
-            for values in telemetry
-            if all(isinstance(value, Tensor) for value in values)
+            values for values in telemetry if all(isinstance(value, Tensor) for value in values)
         ]
         if not complete:
             return self.promoted_expert_ids()
-        utilization_by_layer = torch.stack(
-            [values[0].float() for values in complete]
-        )
-        attributed_nll_by_layer = torch.stack(
-            [values[1].float() for values in complete]
-        )
-        quantization_error_by_layer = torch.stack(
-            [values[2].float() for values in complete]
-        )
+        utilization_by_layer = torch.stack([values[0].float() for values in complete])
+        attributed_nll_by_layer = torch.stack([values[1].float() for values in complete])
+        quantization_error_by_layer = torch.stack([values[2].float() for values in complete])
         utilization = utilization_by_layer.mean(dim=0)
         responsibility = utilization_by_layer.sum(dim=0)
-        attributed_nll = (
-            attributed_nll_by_layer * utilization_by_layer
-        ).sum(dim=0) / responsibility.clamp_min(1e-8)
+        attributed_nll = (attributed_nll_by_layer * utilization_by_layer).sum(
+            dim=0
+        ) / responsibility.clamp_min(1e-8)
         attributed_nll = torch.where(
             responsibility > 0,
             attributed_nll,
             torch.zeros_like(attributed_nll),
         )
         measured = quantization_error_by_layer > 0
-        quantization_error = quantization_error_by_layer.sum(dim=0) / measured.sum(
-            dim=0
-        ).clamp_min(1)
+        quantization_error = quantization_error_by_layer.sum(dim=0) / measured.sum(dim=0).clamp_min(
+            1
+        )
         observe = getattr(controller, "observe", None)
         if not callable(observe):
             raise TypeError("potentiation_controller must implement observe(...)")
@@ -433,19 +488,14 @@ def _attach_surprise_telemetry(
         scores = metrics.get("router_scores")
         expert_ids = metrics.get("expert_ids")
         routing_weights = metrics.get("routing_weights")
-        if not all(
-            isinstance(value, Tensor)
-            for value in (scores, expert_ids, routing_weights)
-        ):
+        if not all(isinstance(value, Tensor) for value in (scores, expert_ids, routing_weights)):
             enriched.append(metrics)
             continue
 
         selected_surprise = scores.gather(-1, expert_ids)[:, :-1]
         # This v0 target calibrates the selected mixture's scalar estimate. The
         # downstream LM NLL is not a counterfactual measurement for each expert.
-        predicted_mixture_surprise = (
-            selected_surprise * routing_weights[:, :-1]
-        ).sum(dim=-1)
+        predicted_mixture_surprise = (selected_surprise * routing_weights[:, :-1]).sum(dim=-1)
         calibration = F.smooth_l1_loss(
             predicted_mixture_surprise,
             token_nll.detach(),

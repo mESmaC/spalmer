@@ -22,6 +22,7 @@ class TrainResult:
     final_surprise_calibration_loss: float | None
     final_predictive_entropy: float
     promoted_experts: tuple[int, ...]
+    average_surprise: float = 0.0
 
 
 def train_token_stream(
@@ -81,22 +82,19 @@ def train_token_stream(
         if output.auxiliary_loss is not None:
             objective = objective + auxiliary_loss_weight * output.auxiliary_loss
         if output.surprise_calibration_loss is not None:
-            objective = (
-                objective
-                + surprise_calibration_weight * output.surprise_calibration_loss
-            )
+            objective = objective + surprise_calibration_weight * output.surprise_calibration_loss
         objective.backward()
         if gradient_clip is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
         optimizer.step()
         promoted_experts = model.update_potentiation(output.layer_metrics)
+        if output.token_nll is not None:
+            model.observe_surprise(output.token_nll, batch[:, 1:] != -100)
 
         value = float(objective.detach())
         final_model_loss = float(output.loss.detach())
         final_auxiliary_loss = (
-            None
-            if output.auxiliary_loss is None
-            else float(output.auxiliary_loss.detach())
+            None if output.auxiliary_loss is None else float(output.auxiliary_loss.detach())
         )
         final_surprise_calibration_loss = (
             None
@@ -119,6 +117,7 @@ def train_token_stream(
         final_surprise_calibration_loss=final_surprise_calibration_loss,
         final_predictive_entropy=final_predictive_entropy,
         promoted_experts=promoted_experts,
+        average_surprise=model.average_surprise,
     )
 
 
@@ -131,8 +130,15 @@ def generate_tokens(
     temperature: float = 0.0,
     top_k: int | None = None,
     seed: int = 0,
+    dynamic_residency: bool = False,
 ) -> Tensor:
-    """Generate with one prefill followed by explicit recurrent decode steps."""
+    """Generate with one prefill followed by explicit recurrent decode steps.
+
+    With ``dynamic_residency`` the prefill runs the C13 residency controller:
+    the active expert count starts at the configured minimum and expands while
+    the prompt's effective surprise stays above the model's average surprise,
+    and decoding then continues with the count that was retained.
+    """
 
     if prompt_ids.ndim == 1:
         prompt_ids = prompt_ids.unsqueeze(0)
@@ -148,9 +154,15 @@ def generate_tokens(
     if max_new_tokens == 0:
         return generated
     was_training = model.training
+    previous_residency = model.active_experts_override if dynamic_residency else None
     model.eval()
     try:
-        output = model(generated)
+        if dynamic_residency:
+            from spalmer.experts.residency import choose_inference_residency
+
+            output = choose_inference_residency(model, generated).output
+        else:
+            output = model(generated)
         token_states = output.token_mixer_states
         channel_states = output.channel_mixer_states
         generator = torch.Generator(device=device).manual_seed(seed)
@@ -174,6 +186,8 @@ def generate_tokens(
             token_states = output.token_mixer_states
             channel_states = output.channel_mixer_states
     finally:
+        if dynamic_residency:
+            model.set_active_experts(previous_residency)
         model.train(was_training)
     return generated
 

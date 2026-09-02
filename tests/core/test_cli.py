@@ -21,23 +21,22 @@ def test_legacy_training_invocations_keep_their_existing_dispatch(monkeypatch) -
     assert calls[1].smoke is True
 
 
-def test_generate_command_loads_saved_vocab_and_uses_cached_runtime(
-    monkeypatch, capsys
-) -> None:
+def test_generate_command_loads_saved_vocab_and_uses_cached_runtime(monkeypatch, capsys) -> None:
     vocab = _FakeVocab()
     model = _FakeModel()
 
     def fake_load_checkpoint(path, *, map_location):
         assert path == Path("trained.pt")
         assert map_location == "cpu"
-        return model, vocab, {"tokens_seen": 10}
+        return model, vocab, {"tokens_seen": 10, "kind": "code"}
 
     class FakeEncoder:
         def __init__(self, loaded_vocab) -> None:
             assert loaded_vocab is vocab
 
-        def encode(self, text: str) -> list[int]:
+        def encode(self, text: str, *, kind: str) -> list[int]:
             assert text == "prompt"
+            assert kind == "code"
             return [1, 2]
 
     def fake_generate_tokens(loaded_model, prompt_ids, **kwargs):
@@ -47,6 +46,7 @@ def test_generate_command_loads_saved_vocab_and_uses_cached_runtime(
             "max_new_tokens": 3,
             "temperature": 0.7,
             "top_k": 5,
+            "dynamic_residency": True,
         }
         return torch.tensor([[1, 2, 3]])
 
@@ -68,6 +68,7 @@ def test_generate_command_loads_saved_vocab_and_uses_cached_runtime(
             "0.7",
             "--top-k",
             "5",
+            "--dynamic-residency",
         ]
     )
 
@@ -79,6 +80,10 @@ def test_generate_command_loads_saved_vocab_and_uses_cached_runtime(
 def test_training_rejects_incomplete_kda_mla_cycle() -> None:
     with pytest.raises(ValueError, match="positive multiple of 4"):
         cli.main(["--smoke", "--layers", "5"])
+
+
+def test_terminal_output_escapes_unencodable_generation_bytes() -> None:
+    assert cli._terminal_safe_text("A\ufffdB", encoding="cp1252") == r"A\ufffdB"
 
 
 class _FakeModel:

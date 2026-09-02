@@ -16,8 +16,23 @@ from spalmer.modeling import SPALMERCausalLM
 from spalmer.tokenizer import Vocab
 
 FORMAT_NAME = "spalmer.prototype.checkpoint"
-FORMAT_VERSION = 2
-_SUPPORTED_FORMAT_VERSIONS = {1, FORMAT_VERSION}
+FORMAT_VERSION = 3
+_SUPPORTED_FORMAT_VERSIONS = {1, 2, FORMAT_VERSION}
+# Version 3 added the shared average-surprise buffers on the language model and
+# the C13 residency fields of the expert configuration.
+_VERSION_3_EXPERT_FIELDS = {"residency_increment", "residency_min_gain"}
+_VERSION_3_MODEL_BUFFERS = {"surprise_ema", "surprise_observations"}
+_VERSION_3_MODEL_CONFIG_FIELDS = {"surprise_ema_decay"}
+_VERSION_1_EXPERT_FIELDS = {
+    "d_model",
+    "num_experts",
+    "expert_inter_dim",
+    "active_experts",
+    "min_active_experts",
+    "max_active_experts",
+    "router_bias",
+    "initializer_range",
+}
 
 
 def save_checkpoint(
@@ -36,6 +51,7 @@ def save_checkpoint(
         version=vocab.version,
         fingerprint=vocab.fingerprint,
     )
+    _validate_model_attention_configs(model, kda_config, mla_config)
     _validate_model_experts_config(model, experts_config)
     _validate_potentiation_state(model, experts_config)
     destination = Path(path)
@@ -71,12 +87,22 @@ def load_checkpoint(
     if checkpoint_version not in _SUPPORTED_FORMAT_VERSIONS:
         raise ValueError(f"unsupported checkpoint version: {payload.get('format_version')}")
 
-    config = SPALMERConfig(**payload["model_config"])
-    kda_config = KDAConfig(**payload["kda_config"])
-    mla_config = MLAConfig(**payload["mla_config"])
+    raw_model_config = dict(payload["model_config"])
+    required_model = {field.name for field in fields(SPALMERConfig)}
+    if checkpoint_version < 3:
+        required_model -= _VERSION_3_MODEL_CONFIG_FIELDS
+    _require_config_schema("model", raw_model_config, required_model)
+    config = SPALMERConfig(**raw_model_config)
+    raw_kda_config = dict(payload["kda_config"])
+    raw_mla_config = dict(payload["mla_config"])
+    _require_config_schema("KDA", raw_kda_config, {field.name for field in fields(KDAConfig)})
+    _require_config_schema("MLA", raw_mla_config, {field.name for field in fields(MLAConfig)})
+    kda_config = KDAConfig(**raw_kda_config)
+    mla_config = MLAConfig(**raw_mla_config)
     raw_experts_config = dict(payload["experts_config"])
     legacy_experts = checkpoint_version == 1
     if legacy_experts:
+        _require_config_schema("expert", raw_experts_config, _VERSION_1_EXPERT_FIELDS)
         # Version-1 prototypes predate the low-bit expert substrate. Preserve
         # their dense execution semantics instead of silently quantizing them.
         raw_experts_config["expert_fake_quantization"] = False
@@ -84,12 +110,9 @@ def load_checkpoint(
         raw_experts_config["router_score_transform"] = "identity"
     else:
         required = {field.name for field in fields(MicroExpertsConfig)}
-        missing_config = required - raw_experts_config.keys()
-        if missing_config:
-            raise ValueError(
-                "current checkpoint is missing expert configuration fields: "
-                f"{sorted(missing_config)}"
-            )
+        if checkpoint_version == 2:
+            required -= _VERSION_3_EXPERT_FIELDS
+        _require_config_schema("expert", raw_experts_config, required)
     experts_config = MicroExpertsConfig(**raw_experts_config)
     vocab = Vocab.from_dict(payload["vocab"])
     config.assert_tokenizer_compatible(
@@ -102,20 +125,36 @@ def load_checkpoint(
         )
 
     model = build_spalmer_model(config, kda_config, mla_config, experts_config)
-    if legacy_experts:
+    if checkpoint_version == FORMAT_VERSION:
+        model.load_state_dict(payload["model_state"], strict=True)
+    else:
+        # Older bundles predate some buffers; everything else must still match.
+        allowed_missing = set(_VERSION_3_MODEL_BUFFERS)
+        if legacy_experts:
+            allowed_missing |= {
+                f"potentiation_controller.{name}"
+                for name in model.potentiation_controller.state_dict()
+            }
         incompatible = model.load_state_dict(payload["model_state"], strict=False)
-        expected_missing = {
-            f"potentiation_controller.{name}"
-            for name in model.potentiation_controller.state_dict()
-        }
-        if set(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
+        missing = set(incompatible.missing_keys)
+        invalid_missing = not missing <= allowed_missing
+        # A real version-2 checkpoint predates both average-surprise buffers.
+        # Requiring the pair prevents a damaged hybrid bundle from silently
+        # initializing half of the signal from defaults.
+        if checkpoint_version == 2:
+            invalid_missing = missing != _VERSION_3_MODEL_BUFFERS
+        elif checkpoint_version == 1:
+            invalid_missing = missing != allowed_missing
+        if invalid_missing or incompatible.unexpected_keys:
             raise RuntimeError(
                 "legacy checkpoint state does not match its construction config; "
                 f"missing={sorted(incompatible.missing_keys)}, "
                 f"unexpected={sorted(incompatible.unexpected_keys)}"
             )
-    else:
-        model.load_state_dict(payload["model_state"], strict=True)
+        metadata = payload.get("metadata") or {}
+        if "average_surprise" in metadata:
+            model.surprise_ema.fill_(float(metadata["average_surprise"]))
+            model.surprise_observations.fill_(1)
     _validate_potentiation_state(model, experts_config)
     return model, vocab, dict(payload.get("metadata") or {})
 
@@ -136,6 +175,30 @@ def _validate_model_experts_config(
             raise ValueError(f"experts_config does not match router at layer {layer_index}")
 
 
+def _validate_model_attention_configs(
+    model: SPALMERCausalLM,
+    kda_config: KDAConfig,
+    mla_config: MLAConfig,
+) -> None:
+    for layer_index, block in enumerate(model.backbone.blocks):
+        mixer_name = model.config.token_mixer_for_layer(layer_index)
+        expected = kda_config if mixer_name == "kda" else mla_config
+        if getattr(block.token_mixer, "config", None) != expected:
+            raise ValueError(
+                f"{mixer_name.upper()} config does not match token mixer at layer {layer_index}"
+            )
+
+
+def _require_config_schema(name: str, raw_config: dict[str, Any], required: set[str]) -> None:
+    missing = required - raw_config.keys()
+    unexpected = raw_config.keys() - required
+    if missing or unexpected:
+        raise ValueError(
+            f"checkpoint has invalid {name} configuration fields: "
+            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+        )
+
+
 def _validate_potentiation_state(
     model: SPALMERCausalLM,
     experts_config: MicroExpertsConfig,
@@ -147,8 +210,7 @@ def _validate_potentiation_state(
     promoted = int(mask.count_nonzero())
     if promoted > experts_config.potentiation_budget:
         raise ValueError(
-            f"promoted expert count {promoted} exceeds budget "
-            f"{experts_config.potentiation_budget}"
+            f"promoted expert count {promoted} exceeds budget {experts_config.potentiation_budget}"
         )
     if not experts_config.expert_fake_quantization and promoted:
         raise ValueError("dense legacy expert execution cannot carry promoted experts")
