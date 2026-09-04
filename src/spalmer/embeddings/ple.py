@@ -167,9 +167,12 @@ class PLELayerEmbedding(nn.Module):
             self.config.expansion_factor,
             self.config.d_model,
         )
-        lane_weights = self.lane_logits.softmax(dim=0)
+        lane_weights = self.lane_logits.softmax(dim=0).to(dtype=quantized.dtype)
         view_shape = (1,) * (quantized.ndim - 2) + (self.config.expansion_factor, 1)
-        compressed = (quantized * lane_weights.view(view_shape)).sum(dim=-2)
+        compressed = (quantized * lane_weights.view(view_shape)).sum(
+            dim=-2,
+            dtype=quantized.dtype,
+        )
         return compressed * self.gate.to(dtype=compressed.dtype)
 
     def prepare_qr_indices(self, input_ids: Tensor) -> QRIndices:
@@ -194,9 +197,12 @@ class PLELayerEmbedding(nn.Module):
         expanded = self.remainder_embedding(remainder_ids) * self.quotient_embedding(
             quotient_ids
         )
-        lane_weights = self.lane_logits.softmax(dim=0)
+        lane_weights = self.lane_logits.softmax(dim=0).to(dtype=expanded.dtype)
         view_shape = (1,) * (expanded.ndim - 2) + (self.config.expansion_factor, 1)
-        compressed = (expanded * lane_weights.view(view_shape)).sum(dim=-2)
+        compressed = (expanded * lane_weights.view(view_shape)).sum(
+            dim=-2,
+            dtype=expanded.dtype,
+        )
         return compressed * self.gate.to(dtype=compressed.dtype)
 
     def inject(

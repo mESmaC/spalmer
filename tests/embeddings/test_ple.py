@@ -185,6 +185,27 @@ def test_qr_composition_matches_product_softmax_and_gate() -> None:
     torch.testing.assert_close(layer(torch.tensor([[0, 8, 16]])), expected)
 
 
+@pytest.mark.parametrize("backend", ["fake_qat", "qr"])
+def test_lane_controls_do_not_promote_embedding_dtype(backend: str) -> None:
+    config = PLEConfig(
+        vocab_size=17,
+        d_model=4,
+        n_layers=2,
+        expansion_factor=2,
+        backend=backend,
+    )
+    layer = PLELayerEmbedding(config, layer_index=1).to(dtype=torch.bfloat16)
+    # CUDA softmax may retain these tiny stability-sensitive controls in FP32.
+    layer.lane_logits = torch.nn.Parameter(layer.lane_logits.float())
+
+    output = layer(torch.tensor([[1, 2, 3]]))
+
+    assert output.dtype == torch.bfloat16
+    output.float().square().mean().backward()
+    assert layer.lane_logits.grad is not None
+    assert layer.lane_logits.grad.dtype == torch.float32
+
+
 def test_qr_refresh_uses_two_flat_embedding_gathers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

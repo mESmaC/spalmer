@@ -695,11 +695,11 @@ class MicroExpertBank(nn.Module):
             slot_mask = expert_index == expert
             rows = token_index[slot_mask]
             outputs = self.expert_forward(hidden_states[rows], int(expert), promoted_mask)
-            # Stable router softmaxes may remain FP32 under mixed precision.
-            # Cast only the combination weights so expert updates and their
-            # reduction stay in the activation dtype without promoting the
-            # full routed tensor to FP32.
-            weighted = routing_weights[slot_mask].to(outputs.dtype).unsqueeze(-1) * outputs
+            weighted = _weighted_expert_updates(
+                outputs,
+                routing_weights[slot_mask],
+                target_dtype=update.dtype,
+            )
             update = update.index_add(0, rows, weighted)
         return update
 
@@ -769,8 +769,11 @@ class MicroExpertBank(nn.Module):
             real_rows = pair_rows[valid]
             routed_rows.append(real_rows)
             routed_updates.append(
-                outputs[valid]
-                * routing_weights.index_select(0, real_rows).to(outputs.dtype).unsqueeze(-1)
+                _weighted_expert_updates(
+                    outputs[valid],
+                    routing_weights.index_select(0, real_rows),
+                    target_dtype=update.dtype,
+                )
             )
 
         pair_rows = torch.cat(routed_rows)
@@ -802,7 +805,11 @@ class MicroExpertBank(nn.Module):
                 slot_mask = expert_index == expert
                 rows = token_index[slot_mask]
                 outputs = self.expert_forward(hidden_states[rows], expert, promoted_mask)
-                weighted = routing_weights[slot_mask].to(outputs.dtype).unsqueeze(-1) * outputs
+                weighted = _weighted_expert_updates(
+                    outputs,
+                    routing_weights[slot_mask],
+                    target_dtype=update.dtype,
+                )
                 update = update.index_add(0, rows, weighted)
         self._publish_paged_quantization(selected_ids, errors)
         return update
@@ -876,8 +883,11 @@ class MicroExpertBank(nn.Module):
                 real_rows = pair_rows[valid]
                 routed_rows.append(real_rows)
                 routed_updates.append(
-                    outputs[valid]
-                    * routing_weights.index_select(0, real_rows).to(outputs.dtype).unsqueeze(-1)
+                    _weighted_expert_updates(
+                        outputs[valid],
+                        routing_weights.index_select(0, real_rows),
+                        target_dtype=update.dtype,
+                    )
                 )
 
         pair_rows = torch.cat(routed_rows)
@@ -903,7 +913,6 @@ class MicroExpertBank(nn.Module):
     ) -> None:
         self._last_paged_quantization_ids = selected_ids
         self._last_paged_quantization_error = errors
-
     def _stacked_effective_weights(
         self,
         group_ids: Tensor | None,
@@ -932,6 +941,17 @@ class MicroExpertBank(nn.Module):
             )
         gate, up, down = (self._effective_weight(stack, promoted) for stack in stacks)
         return gate, up, down
+
+
+def _weighted_expert_updates(
+    outputs: Tensor,
+    routing_weights: Tensor,
+    *,
+    target_dtype: torch.dtype,
+) -> Tensor:
+    """Combine routes in the residual stream's dtype under mixed precision."""
+
+    return outputs.to(dtype=target_dtype) * routing_weights.to(dtype=target_dtype).unsqueeze(-1)
 
 
 def _pair_counts(expert_index: Tensor, num_experts: int) -> Tensor:
