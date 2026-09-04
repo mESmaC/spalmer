@@ -81,6 +81,12 @@ def build_spalmer_model(
     - ``atxy_config`` (ledger C03/C04) attaches the ATXY address embedding and
       exact-value injection; ``None`` keeps the ATXY-free model. Even when
       attached, ATXY only acts on forward calls that pass an ``ATXYRequest``.
+    - ``config.recurrence`` splits the same physical blocks into a prelude, an
+      iterated latent core, and a coda, and makes the backbone build its
+      ``LatentRecurrence`` module. The block list itself is unchanged: the
+      counts are physical, so ``token_mixer_pattern``, the PLE tables, and every
+      checkpoint validator keep their per-block meaning. ``None`` builds the
+      plain stack, bit-for-bit as before.
     """
 
     component_widths = {

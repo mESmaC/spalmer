@@ -10,6 +10,7 @@ from spalmer.experiment import (
     ExplicitVocabularyPolicy,
     MemoryAssumptions,
     ModelScaleConfig,
+    RecurrenceScaleConfig,
     ScaleSearchSpace,
     count_parameters,
     estimate_memory,
@@ -224,3 +225,127 @@ def test_explicit_vocabulary_policy_has_no_implicit_fallback() -> None:
     policy = ExplicitVocabularyPolicy(((10_000_000, 1_024),))
     with pytest.raises(KeyError, match="50,000,000"):
         policy.vocab_size_for(50_000_000)
+
+
+def _breakdown_shape(**overrides: object) -> ModelScaleConfig:
+    values: dict[str, object] = {
+        "vocab_size": 1_024,
+        "d_model": 128,
+        "n_layers": 8,
+        "num_heads": 4,
+        "num_experts": 32,
+        "expert_width": 64,
+        "ple_expansion": 2,
+    }
+    values.update(overrides)
+    return ModelScaleConfig(**values)  # type: ignore[arg-type]
+
+
+def test_recurrence_adds_adapter_and_keeps_fingerprints() -> None:
+    flat = _breakdown_shape()
+    flat_counts = count_parameters(flat)
+    assert flat_counts.total == 9_908_080
+    assert flat_counts.recurrence == 0
+    assert "recurrence" not in flat_counts.to_dict()
+    assert "recurrence" not in flat.to_dict()
+    assert flat_counts.components["recurrence"] == 0
+    assert flat.effective_depth() == 8
+    assert flat.core_layers == 0
+
+    recurrent = _breakdown_shape(
+        recurrence=RecurrenceScaleConfig(prelude_layers=1, coda_layers=1, default_steps=4)
+    )
+    counts = count_parameters(recurrent)
+
+    adapter = 2 * 128 * 128 + 2 * 128
+    assert counts.recurrence == adapter
+    assert counts.total == 9_908_080 + adapter
+    assert counts.to_dict()["recurrence"] == adapter
+    assert sum(counts.components.values()) == counts.total
+    assert recurrent.core_layers == 6
+    assert recurrent.effective_depth() == 1 + 4 * 6 + 1
+    assert recurrent.effective_depth(2) == 1 + 2 * 6 + 1
+    assert recurrent.to_dict()["recurrence"] == {
+        "prelude_layers": 1,
+        "coda_layers": 1,
+        "default_steps": 4,
+        "latent_init_std": 1.0,
+    }
+
+
+def test_recurrent_scale_plan_publishes_a_recurrence_block() -> None:
+    flat = plan_configuration(2_000_000, 512)
+    assert "recurrence" not in flat.to_dict()
+    assert flat.effective_depth == flat.config.n_layers
+    assert flat.block_passes_per_token == flat.config.n_layers
+
+    plan = plan_configuration(
+        2_000_000,
+        512,
+        recurrence=RecurrenceScaleConfig(prelude_layers=1, coda_layers=1, default_steps=3),
+    )
+    block = plan.to_dict()["recurrence"]
+
+    assert block["prelude_layers"] == 1
+    assert block["coda_layers"] == 1
+    assert block["core_layers"] == plan.config.n_layers - 2
+    assert block["default_steps"] == 3
+    assert block["effective_depth"] == plan.effective_depth
+    assert sum(block["core_mixers"].values()) == block["core_layers"]
+    assert plan.fingerprint != flat.fingerprint
+
+
+def test_recurrent_shapes_reject_impossible_cores() -> None:
+    with pytest.raises(ValueError, match="at least one core layer"):
+        _breakdown_shape(
+            n_layers=4,
+            recurrence=RecurrenceScaleConfig(prelude_layers=2, coda_layers=2),
+        )
+    with pytest.raises(ValueError, match="outside the recurrent core"):
+        _breakdown_shape(
+            atxy=ATXYScaleConfig(
+                value_dim=16,
+                a_cardinality=2,
+                t_cardinality=2,
+                x_cardinality=2,
+                y_cardinality=2,
+                injection_layer=3,
+            ),
+            recurrence=RecurrenceScaleConfig(prelude_layers=1, coda_layers=1),
+        )
+    with pytest.raises(ValueError, match="latent_init_std"):
+        RecurrenceScaleConfig(latent_init_std=-1.0)
+    with pytest.raises(ValueError, match="prelude_layers must be positive"):
+        RecurrenceScaleConfig(prelude_layers=0)
+
+
+def test_planner_skips_grid_points_that_cannot_hold_a_core() -> None:
+    space = ScaleSearchSpace(d_models=(64,), n_layers=(4, 8), num_heads=(4,))
+    plan = plan_configuration(
+        50_000_000,
+        1_024,
+        search_space=space,
+        recurrence=RecurrenceScaleConfig(prelude_layers=3, coda_layers=2),
+    )
+
+    assert plan.config.n_layers == 8
+
+    with pytest.raises(ValueError, match="no valid"):
+        plan_configuration(
+            50_000_000,
+            1_024,
+            search_space=ScaleSearchSpace(d_models=(64,), n_layers=(4,), num_heads=(4,)),
+            recurrence=RecurrenceScaleConfig(prelude_layers=3, coda_layers=2),
+        )
+
+
+def test_plan_ladder_threads_recurrence_to_every_rung() -> None:
+    policy = ExplicitVocabularyPolicy(((2_000_000, 512), (4_000_000, 1_024)))
+    plans = plan_ladder(
+        (2_000_000, 4_000_000),
+        policy,
+        recurrence=RecurrenceScaleConfig(prelude_layers=1, coda_layers=1, default_steps=2),
+    )
+
+    assert all(plan.config.recurrence is not None for plan in plans)
+    assert all("recurrence" in plan.to_dict() for plan in plans)

@@ -33,6 +33,7 @@ from spalmer.experiment import (
     validate_rng_state_compatibility,
     validate_run_state_compatibility,
 )
+from spalmer.training.config import TrainingConfig
 from spalmer.training.engine import ExperimentTrainer, TrainerProgress
 
 _CHECKPOINT_BINDING_ATTRIBUTE = "_spalmer_checkpoint_binding"
@@ -307,10 +308,31 @@ def _validate_authoritative_metadata(
         saved = state.metadata.get(name)
         if saved is None and allow_legacy:
             continue
+        if name == "training_config":
+            saved = _normalized_training_config(saved, current)
         if saved != current:
             mismatches[f"metadata.{name}"] = (saved, current)
     if mismatches:
         raise RunStateCompatibilityError(mismatches)
+
+
+def _normalized_training_config(saved: Any, current: Mapping[str, Any]) -> Any:
+    """Fill defaults into a run state written before a field was introduced.
+
+    Only keys the saved mapping never carried are supplied; any value the run
+    state does record still has to match, so a real configuration change still
+    raises :class:`RunStateCompatibilityError`.
+    """
+
+    if not isinstance(saved, Mapping):
+        return saved
+    missing = set(current) - set(saved)
+    if not missing:
+        return saved
+    try:
+        return TrainingConfig(**dict(saved)).to_dict()
+    except (TypeError, ValueError):
+        return saved
 
 
 def _resolve_loaded_checkpoint_binding(

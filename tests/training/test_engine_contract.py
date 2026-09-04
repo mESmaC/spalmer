@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import weakref
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -192,3 +193,143 @@ def test_gradient_accumulation_aggregates_potentiation_without_retaining_outputs
     torch.testing.assert_close(layer["expert_attributed_nll"], torch.tensor([2.0, 8.0]))
     torch.testing.assert_close(layer["expert_quantization_error"], torch.tensor([0.1, 0.3]))
     assert all(not value.requires_grad for value in layer.values())
+
+
+class _RecurrenceBatchSource:
+    def next_batch(self, *, batch_size: int, sequence_length: int) -> CausalBatch:
+        del batch_size, sequence_length
+        return CausalBatch(torch.tensor([[1, 2, 3]]))
+
+    def state_dict(self) -> dict[str, int]:
+        return {}
+
+    def load_state_dict(self, state: object) -> None:
+        del state
+
+
+class _RecurrentFakeModel(nn.Module):
+    """A flat double that only advertises a recurrent core through ``config``."""
+
+    def __init__(self, *, recurrent: bool = True) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(1.0))
+        self.backbone = nn.Module()
+        self.backbone.blocks = nn.ModuleList()
+        self.average_surprise = 0.0
+        self.forward_kwargs: list[dict[str, object]] = []
+        self.config = SimpleNamespace(
+            recurrence=(
+                SimpleNamespace(prelude_layers=1, core_layers=2, coda_layers=1, default_steps=8)
+                if recurrent
+                else None
+            ),
+            n_layers=4,
+            effective_depth=lambda steps=None: 1 + 2 * (8 if steps is None else steps) + 1,
+        )
+
+    def forward(self, input_ids: torch.Tensor, **kwargs: object) -> CausalLMOutput:
+        self.forward_kwargs.append(dict(kwargs))
+        anchor = self.weight * 0.0
+        steps = int(kwargs.get("recurrence_steps") or 1)
+        return CausalLMOutput(
+            logits=anchor + torch.zeros((*input_ids.shape, 8)),
+            token_mixer_states=(),
+            channel_mixer_states=(),
+            loss=anchor + 1.0,
+            predictive_entropy=anchor + 2.0,
+            layer_metrics=(
+                {
+                    "potentiation_utilization": anchor + torch.tensor([0.5, 0.5]),
+                    "expert_attributed_nll": anchor + torch.tensor([1.0, 1.0]),
+                    "expert_quantization_error": anchor + torch.tensor([0.0, 0.0]),
+                },
+            ),
+            recurrence_steps=steps,
+            latent_deltas=torch.tensor([0.9, 0.4, 0.25][:steps] or [0.25]),
+            latent_position_correlation=torch.tensor(0.5),
+        )
+
+    def update_potentiation(self, layer_metrics):
+        del layer_metrics
+        return ()
+
+
+def _recurrent_training_config(**overrides: object) -> TrainingConfig:
+    values: dict[str, object] = {
+        "max_steps": 1,
+        "micro_batch_size": 1,
+        "sequence_length": 2,
+        "gradient_accumulation_steps": 2,
+        "gradient_clip": None,
+        "device": "cpu",
+        "require_cuda": False,
+        "compute_dtype": "float32",
+        "parameter_dtype": "float32",
+        "mean_recurrence": 5.0,
+        "mean_backprop_depth": 2,
+        "recurrence_sampling": "fixed",
+    }
+    values.update(overrides)
+    return TrainingConfig(**values)  # type: ignore[arg-type]
+
+
+def _trainer(model: nn.Module, config: TrainingConfig) -> ExperimentTrainer:
+    return ExperimentTrainer(
+        model,
+        _RecurrenceBatchSource(),
+        config,
+        optimizer=OptimizerBundle(
+            dense=torch.optim.SGD(model.parameters(), lr=1e-3),
+            sparse=None,
+        ),
+    )
+
+
+def test_trainer_samples_recurrence_once_per_optimizer_step() -> None:
+    model = _RecurrentFakeModel()
+    trainer = _trainer(model, _recurrent_training_config())
+
+    metrics = next(trainer.run())
+
+    assert len(model.forward_kwargs) == 2
+    depths = {
+        (call["recurrence_steps"], call["backprop_steps"]) for call in model.forward_kwargs
+    }
+    assert depths == {(5, 2)}
+    assert metrics.recurrence_steps == 5
+    assert metrics.backprop_steps == 2
+    assert metrics.effective_depth == 1 + 2 * 5 + 1
+    assert metrics.latent_delta_final == pytest.approx(0.25)
+    assert metrics.latent_position_correlation == pytest.approx(0.5)
+
+
+def test_trainer_omits_recurrence_kwargs_for_flat_models() -> None:
+    model = _RecurrentFakeModel(recurrent=False)
+    trainer = _trainer(
+        model,
+        _recurrent_training_config(mean_recurrence=None, recurrence_sampling="poisson_lognormal"),
+    )
+
+    metrics = next(trainer.run())
+
+    assert model.forward_kwargs
+    assert all(
+        "recurrence_steps" not in call and "backprop_steps" not in call
+        for call in model.forward_kwargs
+    )
+    assert metrics.recurrence_steps is None
+    assert metrics.backprop_steps is None
+    assert metrics.effective_depth is None
+
+
+def test_trainer_fails_closed_on_recurrence_mismatch() -> None:
+    with pytest.raises(ValueError, match="requires TrainingConfig.mean_recurrence"):
+        _trainer(
+            _RecurrentFakeModel(),
+            _recurrent_training_config(
+                mean_recurrence=None,
+                recurrence_sampling="poisson_lognormal",
+            ),
+        )
+    with pytest.raises(ValueError, match="model has no recurrent core"):
+        _trainer(_RecurrentFakeModel(recurrent=False), _recurrent_training_config())

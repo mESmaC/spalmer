@@ -12,7 +12,7 @@ from typing import Any
 import torch
 
 from spalmer.attention import KDAConfig, MLAConfig
-from spalmer.config import SPALMERConfig
+from spalmer.config import RecurrenceConfig, SPALMERConfig
 from spalmer.directional import DirectionalConfig
 from spalmer.experiment.state import (
     CheckpointBinding,
@@ -33,8 +33,8 @@ from spalmer.tokenizer import (
 )
 
 FORMAT_NAME = "spalmer.prototype.checkpoint"
-FORMAT_VERSION = 5
-_SUPPORTED_FORMAT_VERSIONS = {1, 2, 3, 4, FORMAT_VERSION}
+FORMAT_VERSION = 6
+_SUPPORTED_FORMAT_VERSIONS = {1, 2, 3, 4, 5, FORMAT_VERSION}
 CHECKPOINT_BINDING_METADATA_KEY = "_spalmer_checkpoint_binding"
 _CHECKPOINT_BINDING_ATTRIBUTE = "_spalmer_checkpoint_binding"
 _MODEL_PARAMETER_DTYPES = {
@@ -46,6 +46,8 @@ _MODEL_PARAMETER_DTYPES = {
 _VERSION_3_EXPERT_FIELDS = {"residency_increment", "residency_min_gain"}
 _VERSION_3_MODEL_BUFFERS = {"surprise_ema", "surprise_observations"}
 _VERSION_3_MODEL_CONFIG_FIELDS = {"surprise_ema_decay"}
+# Version 6 added the optional depth-recurrent core to the model config.
+_VERSION_6_MODEL_CONFIG_FIELDS = {"recurrence"}
 _VERSION_5_EXPERT_FIELDS = {
     "expert_weight_format",
     "expert_activation_format",
@@ -92,6 +94,7 @@ def save_checkpoint(
     _validate_model_experts_config(model, experts_config)
     _validate_optional_component_configs(model, directional_config, atxy_config)
     _validate_potentiation_state(model, experts_config)
+    _validate_model_recurrence(model)
     model_parameter_dtype = _model_parameter_dtype(model.named_parameters())
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -491,7 +494,26 @@ def load_checkpoint(
     required_model = {field.name for field in fields(SPALMERConfig)}
     if checkpoint_version < 3:
         required_model -= _VERSION_3_MODEL_CONFIG_FIELDS
+    if checkpoint_version < 6:
+        # Pre-recurrence bundles construct a plain physical stack. A null
+        # recurrence field carries no information, so it is dropped rather than
+        # rejected; a populated one would contradict the declared version.
+        required_model -= _VERSION_6_MODEL_CONFIG_FIELDS
+        if raw_model_config.get("recurrence") is None:
+            raw_model_config.pop("recurrence", None)
+        else:
+            raise ValueError(
+                f"checkpoint version {checkpoint_version} predates the recurrent core "
+                "but carries a recurrence configuration"
+            )
     _require_config_schema("model", raw_model_config, required_model)
+    raw_recurrence = raw_model_config.get("recurrence")
+    if isinstance(raw_recurrence, Mapping):
+        _require_config_schema(
+            "recurrence",
+            dict(raw_recurrence),
+            {field.name for field in fields(RecurrenceConfig)},
+        )
     config = SPALMERConfig(**raw_model_config)
     raw_kda_config = dict(payload["kda_config"])
     raw_mla_config = dict(payload["mla_config"])
@@ -575,6 +597,7 @@ def load_checkpoint(
     _validate_model_experts_config(model, experts_config)
     _validate_potentiation_state(model, experts_config)
     _validate_optional_component_configs(model, directional_config, atxy_config)
+    _validate_model_recurrence(model)
     object.__setattr__(model, _CHECKPOINT_BINDING_ATTRIBUTE, binding)
     metadata = dict(payload.get("metadata") or {})
     metadata.pop(CHECKPOINT_BINDING_METADATA_KEY, None)
@@ -601,7 +624,9 @@ def _migrate_experts_config(
     """Upgrade historical expert configs without changing their numerics."""
 
     current_fields = {field.name for field in fields(MicroExpertsConfig)}
-    if checkpoint_version == FORMAT_VERSION:
+    # The v5 and v6 expert schemas are identical; an equality gate here would
+    # reject every v5 bundle the moment FORMAT_VERSION moves past it.
+    if checkpoint_version >= 5:
         _require_config_schema("expert", raw_config, current_fields)
         return raw_config
     if checkpoint_version == 1:
@@ -733,6 +758,19 @@ def _validate_model_experts_config(
                 f"expert bank at layer {layer_index} has master dtypes "
                 f"{sorted(map(str, observed_dtypes))}; expected {expected_dtype}"
             )
+
+
+def _validate_model_recurrence(model: SPALMERCausalLM) -> None:
+    """The latent recurrence module must exist exactly when the config says so."""
+
+    configured = model.config.recurrence is not None
+    attached = getattr(model.backbone, "recurrence", None) is not None
+    if configured != attached:
+        raise ValueError(
+            "model recurrence configuration disagrees with the backbone: "
+            f"config.recurrence={'set' if configured else 'None'}, "
+            f"backbone.recurrence={'present' if attached else 'absent'}"
+        )
 
 
 def _validate_model_attention_configs(

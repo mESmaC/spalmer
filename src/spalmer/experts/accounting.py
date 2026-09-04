@@ -27,6 +27,7 @@ _COMPONENT_ORDER = (
     "expert_pool",
     "directional",
     "atxy",
+    "recurrence",
     "vocab_head",
     "other",
 )
@@ -51,6 +52,11 @@ class ParameterAccounting:
     # useful when a newly constructed reference model has not yet been cast to
     # its configured persistent dtype.
     parameter_bytes: dict[str, int] = field(default_factory=dict)
+    # Block passes one token makes: ``n_layers`` for a flat stack, and
+    # ``prelude + steps * core + coda`` for a depth-recurrent model at its
+    # checkpointed default depth.
+    effective_depth: int | None = None
+    per_token_block_passes: int | None = None
 
     @property
     def total(self) -> int:
@@ -94,7 +100,12 @@ class ParameterAccounting:
 
     @property
     def per_token_active_parameters(self) -> int:
-        """Parameters one token touches: shared base, vocab, router, top-``k`` experts."""
+        """Parameters one token touches: shared base, vocab, router, top-``k`` experts.
+
+        This counts DISTINCT parameters, so a depth-recurrent core contributes
+        its core weights once no matter how many iterations run. Compute is
+        ``per_token_block_passes`` times the per-pass cost, not this number.
+        """
 
         return (
             self.total
@@ -135,6 +146,16 @@ class ParameterAccounting:
             + (self.resident_experts * per_expert_bytes)
         )
 
+    @property
+    def is_recurrent(self) -> bool:
+        """Whether one token makes more block passes than there are blocks."""
+
+        return (
+            self.per_token_block_passes is not None
+            and self.effective_depth is not None
+            and self.components.get("recurrence", 0) > 0
+        )
+
     def summary(self) -> str:
         lines = [f"total={self.total:,}"]
         for name in _COMPONENT_ORDER:
@@ -150,6 +171,11 @@ class ParameterAccounting:
             f"per_token_active={self.per_token_active_parameters:,} "
             f"(top-{self.active_experts_per_token})"
         )
+        if self.is_recurrent:
+            lines.append(
+                f"effective_depth={self.effective_depth} "
+                f"(block passes per token {self.per_token_block_passes})"
+            )
         return "\n".join(lines)
 
 
@@ -162,6 +188,10 @@ def classify_parameter(name: str) -> str:
         return "embeddings"
     if name.startswith("backbone.atxy") or ".atxy." in name:
         return "atxy"
+    # Must precede the directional and norm rules: the recurrence module owns
+    # two RMSNorm weights whose names would otherwise land in "norms".
+    if ".recurrence." in name:
+        return "recurrence"
     if ".directional_mixer." in name:
         return "directional"
     if ".channel_mixer.experts." in name:
@@ -241,6 +271,9 @@ def account_parameters(
         bits["expert_pool"] = int(expert_config.expert_master_bits)
         execution_bits["expert_pool"] = int(expert_config.expert_forward_weight_bits)
     bits.update(nominal_bits or {})
+    effective_depth = None
+    if config is not None and callable(getattr(config, "effective_depth", None)):
+        effective_depth = int(config.effective_depth())
     return ParameterAccounting(
         components=components,
         num_experts=num_experts,
@@ -250,6 +283,8 @@ def account_parameters(
         nominal_bits=bits,
         execution_bits=execution_bits,
         parameter_bytes=parameter_bytes,
+        effective_depth=effective_depth,
+        per_token_block_passes=effective_depth,
     )
 
 

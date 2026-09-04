@@ -20,6 +20,7 @@ from spalmer.training.optim import (
     classify_parameters,
     gradients_are_finite,
 )
+from spalmer.training.recurrence import RecurrenceSampler
 from spalmer.training.resume import (
     build_artifact_hashes,
     canonical_sha256,
@@ -31,6 +32,7 @@ __all__ = [
     "BF16MasterAdamW",
     "OptimizerBundle",
     "ParameterGroups",
+    "RecurrenceSampler",
     "RuntimeDevice",
     "MMapBatchSource",
     "ModelEvaluationReport",

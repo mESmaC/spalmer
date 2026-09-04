@@ -9,6 +9,7 @@ from spalmer.attention import KDAConfig, MLAConfig
 from spalmer.checkpoint import load_checkpoint, save_checkpoint
 from spalmer.config import SPALMERConfig
 from spalmer.experts import MicroExpertsConfig, choose_inference_residency
+from spalmer.experts import residency as residency_module
 from spalmer.factory import build_spalmer_model
 from spalmer.runtime import generate_tokens, train_token_stream
 from spalmer.tokenizer import Encoder, Sample, train
@@ -267,3 +268,31 @@ def test_generation_restores_the_previous_residency_after_dynamic_prefill() -> N
     assert model.active_experts_override is None
     assert model.active_experts == 2
     assert model.resident_expert_ids == tuple(range(8))
+
+
+def test_choose_inference_residency_threads_recurrence_steps(monkeypatch) -> None:
+    model, _, _ = _build()
+    prompt = torch.tensor([[1, 2, 3, 4]])
+    observed: list[dict[str, object]] = []
+    original = residency_module._evaluate
+
+    def spy(spied_model, prompt_ids, **kwargs):
+        observed.append(dict(kwargs))
+        return original(spied_model, prompt_ids)
+
+    monkeypatch.setattr(residency_module, "_evaluate", spy)
+
+    choose_inference_residency(model, prompt, recurrence_steps=5)
+    model.end_residency_request()
+
+    assert observed
+    assert all(call == {"recurrence_steps": 5} for call in observed)
+
+    observed.clear()
+    choose_inference_residency(model, prompt)
+    model.end_residency_request()
+
+    # A non-recurrent request never grows the evaluation signature, so legacy
+    # `_evaluate` doubles keep working.
+    assert observed
+    assert all(call == {} for call in observed)

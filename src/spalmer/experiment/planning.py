@@ -86,6 +86,43 @@ class ATXYScaleConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RecurrenceScaleConfig:
+    """Countable configuration for the optional depth-recurrent latent core.
+
+    The core is the block span between ``prelude_layers`` leading blocks and
+    ``coda_layers`` trailing ones; it is executed ``default_steps`` times at
+    inference unless a caller asks for another depth.
+    """
+
+    prelude_layers: int = 1
+    coda_layers: int = 1
+    default_steps: int = 8
+    latent_init_std: float = 1.0
+
+    def __post_init__(self) -> None:
+        for name in ("prelude_layers", "coda_layers", "default_steps"):
+            _require_positive(name, int(getattr(self, name)))
+        if not math.isfinite(self.latent_init_std) or self.latent_init_std < 0:
+            raise ValueError("latent_init_std must be a finite, non-negative value")
+
+    def core_layers(self, n_layers: int) -> int:
+        core = n_layers - self.prelude_layers - self.coda_layers
+        if core <= 0:
+            raise ValueError("recurrence needs at least one core layer")
+        return core
+
+    def parameter_count(self, d_model: int) -> int:
+        """Adapter projection over ``cat[s, e]`` plus the two learned RMSNorms."""
+
+        return 2 * d_model * d_model + 2 * d_model
+
+    def effective_depth(self, n_layers: int, steps: int | None = None) -> int:
+        resolved = self.default_steps if steps is None else steps
+        _require_positive("steps", int(resolved))
+        return self.prelude_layers + resolved * self.core_layers(n_layers) + self.coda_layers
+
+
+@dataclass(frozen=True, slots=True)
 class ModelScaleConfig:
     """One countable SPALMER shape.
 
@@ -115,6 +152,7 @@ class ModelScaleConfig:
     expert_master_dtype: Literal["bfloat16"] = "bfloat16"
     directional: DirectionalScaleConfig | None = None
     atxy: ATXYScaleConfig | None = None
+    recurrence: RecurrenceScaleConfig | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -162,6 +200,30 @@ class ModelScaleConfig:
             self.directional.parameters_per_layer(self.d_model)
         if self.atxy is not None and self.atxy.injection_layer >= self.n_layers:
             raise ValueError("ATXY injection_layer must be below n_layers")
+        if self.recurrence is not None:
+            if self.n_layers <= self.recurrence.prelude_layers + self.recurrence.coda_layers:
+                raise ValueError("recurrence needs at least one core layer")
+            if self.atxy is not None and (
+                self.recurrence.prelude_layers
+                <= self.atxy.injection_layer
+                < self.n_layers - self.recurrence.coda_layers
+            ):
+                raise ValueError("ATXY injection_layer must lie outside the recurrent core")
+
+    @property
+    def core_layers(self) -> int:
+        """Physical blocks inside the recurrent core (0 when not recurrent)."""
+
+        if self.recurrence is None:
+            return 0
+        return self.recurrence.core_layers(self.n_layers)
+
+    def effective_depth(self, steps: int | None = None) -> int:
+        """Block passes per token: ``n_layers`` unless a core is iterated."""
+
+        if self.recurrence is None:
+            return self.n_layers
+        return self.recurrence.effective_depth(self.n_layers, steps)
 
     @property
     def head_dim(self) -> int:
@@ -188,7 +250,12 @@ class ModelScaleConfig:
         return self.n_layers // 4
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        values = asdict(self)
+        if self.recurrence is None:
+            # Non-recurrent shapes keep the exact dict every stored plan
+            # fingerprint was computed from.
+            values.pop("recurrence")
+        return values
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +273,7 @@ class ParameterBreakdown:
     directional: int
     atxy: int
     lm_head: int
+    recurrence: int = 0
 
     @property
     def total(self) -> int:
@@ -221,6 +289,7 @@ class ParameterBreakdown:
                 self.expert_banks,
                 self.directional,
                 self.atxy,
+                self.recurrence,
                 self.lm_head,
             )
         )
@@ -258,6 +327,7 @@ class ParameterBreakdown:
             "expert_pool": self.expert_pool,
             "directional": self.directional,
             "atxy": self.atxy,
+            "recurrence": self.recurrence,
             "vocab_head": self.lm_head,
             "other": 0,
         }
@@ -274,6 +344,10 @@ class ParameterBreakdown:
 
     def to_dict(self) -> dict[str, int]:
         values = asdict(self)
+        if not self.recurrence:
+            # Keep every non-recurrent breakdown byte-identical to the dicts
+            # existing plan fingerprints were hashed from.
+            values.pop("recurrence")
         values.update(
             total=self.total,
             low_bit_candidates=self.low_bit_candidates,
@@ -342,6 +416,7 @@ def count_parameters(config: ModelScaleConfig) -> ParameterBreakdown:
         else config.n_layers * config.directional.parameters_per_layer(d)
     )
     atxy = 0 if config.atxy is None else config.atxy.parameter_count(d)
+    recurrence = 0 if config.recurrence is None else config.recurrence.parameter_count(d)
     lm_head = d * config.vocab_size
     return ParameterBreakdown(
         ple_lookup=ple_lookup,
@@ -354,6 +429,7 @@ def count_parameters(config: ModelScaleConfig) -> ParameterBreakdown:
         expert_banks=expert_banks,
         directional=directional,
         atxy=atxy,
+        recurrence=recurrence,
         lm_head=lm_head,
     )
 
@@ -600,6 +676,18 @@ class ScalePlan:
         return self.parameter_error / self.target_parameters
 
     @property
+    def effective_depth(self) -> int:
+        """Physical block passes per token at the plan's default depth."""
+
+        return self.config.effective_depth()
+
+    @property
+    def block_passes_per_token(self) -> int:
+        """Alias of :attr:`effective_depth`; one pass per physical block."""
+
+        return self.effective_depth
+
+    @property
     def fingerprint(self) -> str:
         return _canonical_digest(
             {
@@ -611,7 +699,7 @@ class ScalePlan:
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "target_parameters": self.target_parameters,
             "parameter_error": self.parameter_error,
             "relative_error": self.relative_error,
@@ -620,6 +708,29 @@ class ScalePlan:
             "memory": self.memory.to_dict(),
             "fingerprint": self.fingerprint,
         }
+        recurrence = self.config.recurrence
+        if recurrence is not None:
+            payload["recurrence"] = {
+                "prelude_layers": recurrence.prelude_layers,
+                "core_layers": self.config.core_layers,
+                "coda_layers": recurrence.coda_layers,
+                "default_steps": recurrence.default_steps,
+                "effective_depth": self.effective_depth,
+                "core_mixers": _core_mixer_counts(self.config),
+            }
+        return payload
+
+
+def _core_mixer_counts(config: ModelScaleConfig) -> dict[str, int]:
+    """Count the 3:1 KDA/MLA cycle inside the recurrent core, by physical index."""
+
+    recurrence = config.recurrence
+    if recurrence is None:
+        return {"kda": 0, "mla": 0}
+    start = recurrence.prelude_layers
+    stop = config.n_layers - recurrence.coda_layers
+    mla = sum(1 for index in range(start, stop) if index % 4 == 3)
+    return {"kda": (stop - start) - mla, "mla": mla}
 
 
 def plan_configuration(
@@ -631,6 +742,7 @@ def plan_configuration(
     expert_weight_format: Literal["mxfp4", "nvfp4"] = "mxfp4",
     directional: DirectionalScaleConfig | None = None,
     atxy: ATXYScaleConfig | None = None,
+    recurrence: RecurrenceScaleConfig | None = None,
 ) -> ScalePlan:
     """Choose the enumerated shape nearest an explicit total parameter target."""
 
@@ -645,6 +757,15 @@ def plan_configuration(
                 continue
             if atxy is not None and atxy.injection_layer >= n_layers:
                 continue
+            if recurrence is not None:
+                if n_layers <= recurrence.prelude_layers + recurrence.coda_layers:
+                    continue
+                if atxy is not None and (
+                    recurrence.prelude_layers
+                    <= atxy.injection_layer
+                    < n_layers - recurrence.coda_layers
+                ):
+                    continue
             for num_heads in sorted(set(search_space.num_heads)):
                 if d_model % num_heads:
                     continue
@@ -668,6 +789,7 @@ def plan_configuration(
                                 expert_weight_format=expert_weight_format,
                                 directional=directional,
                                 atxy=atxy,
+                                recurrence=recurrence,
                             )
                             breakdown = count_parameters(config)
                             # Target distance dominates; stable tie-breakers prefer
@@ -703,6 +825,7 @@ def plan_ladder(
     expert_weight_format: Literal["mxfp4", "nvfp4"] = "mxfp4",
     directional: DirectionalScaleConfig | None = None,
     atxy: ATXYScaleConfig | None = None,
+    recurrence: RecurrenceScaleConfig | None = None,
 ) -> tuple[ScalePlan, ...]:
     """Plan several scales, resolving vocabulary size independently per rung."""
 
@@ -720,6 +843,7 @@ def plan_ladder(
                 expert_weight_format=expert_weight_format,
                 directional=directional,
                 atxy=atxy,
+                recurrence=recurrence,
             )
         )
     return tuple(plans)
@@ -734,6 +858,7 @@ __all__ = [
     "MemoryEstimate",
     "ModelScaleConfig",
     "ParameterBreakdown",
+    "RecurrenceScaleConfig",
     "ScalePlan",
     "ScaleSearchSpace",
     "VocabularySizePolicy",

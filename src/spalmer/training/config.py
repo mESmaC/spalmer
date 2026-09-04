@@ -46,6 +46,11 @@ class TrainingConfig:
     validation_interval_steps: int = 100
     checkpoint_interval_steps: int = 100
     telemetry_interval_steps: int = 10
+    mean_recurrence: float | None = None
+    mean_backprop_depth: int = 4
+    recurrence_sigma: float = 0.5
+    recurrence_sampling: Literal["poisson_lognormal", "uniform", "fixed"] = "poisson_lognormal"
+    max_recurrence: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -98,6 +103,35 @@ class TrainingConfig:
             )
         if self.fused_adamw not in {"auto", "on", "off"}:
             raise ValueError(f"unsupported fused_adamw policy: {self.fused_adamw!r}")
+        self._validate_recurrence()
+
+    def _validate_recurrence(self) -> None:
+        """Fail closed on depth-recurrence controls that cannot describe a run."""
+
+        if self.mean_recurrence is not None and self.mean_recurrence < 1:
+            raise ValueError("mean_recurrence must be at least 1")
+        if self.mean_backprop_depth < 1:
+            raise ValueError("mean_backprop_depth must be positive")
+        if self.recurrence_sigma < 0:
+            raise ValueError("recurrence_sigma cannot be negative")
+        if self.recurrence_sampling not in {"poisson_lognormal", "uniform", "fixed"}:
+            raise ValueError(
+                f"unsupported recurrence_sampling: {self.recurrence_sampling!r}"
+            )
+        if self.max_recurrence is not None and self.max_recurrence < 1:
+            raise ValueError("max_recurrence must be positive or None")
+        if (
+            self.recurrence_sampling == "fixed"
+            and self.mean_recurrence is not None
+            and self.mean_recurrence != int(self.mean_recurrence)
+        ):
+            raise ValueError("fixed recurrence sampling requires an integer mean_recurrence")
+        if (
+            self.max_recurrence is not None
+            and self.mean_recurrence is not None
+            and self.max_recurrence < self.mean_recurrence
+        ):
+            raise ValueError("max_recurrence cannot be smaller than mean_recurrence")
 
     @property
     def tokens_per_optimizer_step(self) -> int:

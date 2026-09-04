@@ -10,7 +10,13 @@ import pytest
 import torch
 from torch import Tensor, nn
 
-from spalmer import SPALMERBackbone, SPALMERBlock, SPALMERCausalLM, SPALMERConfig
+from spalmer import (
+    RecurrenceConfig,
+    SPALMERBackbone,
+    SPALMERBlock,
+    SPALMERCausalLM,
+    SPALMERConfig,
+)
 from spalmer.attention import KDAConfig, MLAConfig
 from spalmer.experts import MicroExpertsConfig
 from spalmer.factory import build_spalmer_model
@@ -301,6 +307,69 @@ def test_value_injection_happens_only_at_the_configured_boundary(
     for layer in range(3):
         torch.testing.assert_close(hit_seen[layer], miss_seen[layer])
     assert not torch.allclose(hit_seen[3][0, 2], miss_seen[3][0, 2])
+
+
+def _recurrent_model(
+    atxy: ATXYInjection | None,
+    recurrence: RecurrenceConfig,
+) -> SPALMERCausalLM:
+    config = SPALMERConfig(
+        vocab_size=31,
+        d_model=12,
+        n_layers=4,
+        tokenizer_version=1,
+        tokenizer_fingerprint="test-atxy-v0",
+        ple_expansion_factor=2,
+        recurrence=recurrence,
+    )
+    blocks = [
+        SPALMERBlock(
+            config.d_model,
+            _StubTokenMixer(config.d_model),
+            _RecordingChannelMixer(config.d_model),
+            norm_eps=config.norm_eps,
+        )
+        for _ in range(config.n_layers)
+    ]
+    return SPALMERCausalLM(config, SPALMERBackbone(config, blocks, atxy=atxy)).eval()
+
+
+def test_atxy_injection_inside_core_is_rejected() -> None:
+    torch.manual_seed(6)
+    # The exact-value boundary must not be re-applied once per iteration.
+    for injection_layer in (1, 2):
+        with pytest.raises(ValueError, match="inside the recurrent core"):
+            _recurrent_model(
+                ATXYInjection(make_config(injection_layer=injection_layer)),
+                RecurrenceConfig(1, 2, 1),
+            )
+
+
+def test_atxy_outside_core_fires_once_per_forward() -> None:
+    torch.manual_seed(7)
+    atxy = ATXYInjection(make_config(injection_layer=3))
+    calls = 0
+    real_inject = atxy.inject_values
+
+    def counting_inject(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_inject(*args, **kwargs)
+
+    atxy.inject_values = counting_inject
+    model = _recurrent_model(atxy, RecurrenceConfig(1, 2, 1, default_steps=3))
+    store = ATXYStore(store_id="model-store", version=1, value_dim=5)
+
+    output = model(torch.tensor([[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]]), atxy=_request(store))
+
+    assert output.recurrence_steps == 3
+    # The coda boundary fires exactly once, not once per core iteration.
+    assert calls == 1
+    # A prelude boundary is equally valid and equally single-shot.
+    torch.manual_seed(7)
+    prelude_atxy = ATXYInjection(make_config(injection_layer=0))
+    prelude_model = _recurrent_model(prelude_atxy, RecurrenceConfig(1, 2, 1, default_steps=3))
+    assert prelude_model(torch.tensor([[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]])).recurrence_steps == 3
 
 
 def test_factory_gate_and_decode_step_with_atxy() -> None:

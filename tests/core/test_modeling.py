@@ -89,6 +89,28 @@ def test_causal_lm_composes_blocks_and_computes_next_token_loss() -> None:
     assert model.lm_head.weight.grad is not None
 
 
+def test_non_recurrent_config_keeps_flat_contract() -> None:
+    model = _tiny_model().eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+
+    output = model(input_ids, labels=input_ids)
+
+    # One state, one metrics entry and one physical block each, exactly as
+    # before the optional recurrent core existed.
+    assert output.token_mixer_states == (1, 1, 1, 1)
+    assert output.channel_mixer_states == (None, None, None, None)
+    assert len(output.layer_metrics) == model.config.n_layers
+    assert model.config.recurrence is None
+    assert model.backbone.recurrence is None
+    assert not model.is_recurrent
+    assert model.recurrence_default_steps is None
+    assert output.recurrence_steps is None
+    assert output.latent_states is None
+    assert output.latent_deltas is None
+    assert output.latent_position_correlation is None
+    assert model.config.effective_depth() == model.config.n_layers
+
+
 def test_token_mixer_states_round_trip_through_the_backbone() -> None:
     model = _tiny_model().eval()
     input_ids = torch.tensor([[1, 2, 3]])

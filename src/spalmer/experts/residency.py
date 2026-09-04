@@ -393,6 +393,7 @@ def choose_inference_residency(
     initial_ids: Sequence[int] | None = None,
     increment: int | None = None,
     min_gain: float | None = None,
+    recurrence_steps: int | None = None,
 ) -> ResidencyDecision:
     """Pick which experts this request keeps resident and leave the model set to it.
 
@@ -417,6 +418,9 @@ def choose_inference_residency(
         min_gain: Smallest signal improvement, in nats per token, that keeps an
             expansion (defaults to ``residency_min_gain``). A negative value
             retains every expansion up to the cap.
+        recurrence_steps: Latent-core depth used for every prompt evaluation of
+            a recurrent model. ``None`` leaves the model's own default in force
+            and keeps the evaluation call signature unchanged.
     """
 
     offload = getattr(model, "_expert_offload_manager", None)
@@ -467,8 +471,13 @@ def choose_inference_residency(
                     f"{start_count} starting residents exceed the dynamic controller "
                     f"cap of {cap}"
                 )
+            # Only recurrent requests carry the depth keyword, so existing
+            # `_evaluate` doubles keep their original signature.
+            depth_kwargs: dict[str, int] = (
+                {} if recurrence_steps is None else {"recurrence_steps": recurrence_steps}
+            )
             residency.begin_request(start, active_experts=previous_per_token)
-            output, nll, entropy, signal = _evaluate(model, prompt_ids)
+            output, nll, entropy, signal = _evaluate(model, prompt_ids, **depth_kwargs)
             trace = [(residency.size, signal)]
             expansions: list[tuple[int, ...]] = []
             while residency.size < cap and signal >= average:
@@ -480,7 +489,7 @@ def choose_inference_residency(
                 before = residency.snapshot_state()
                 residency.expand(added)
                 candidate_output, candidate_nll, candidate_entropy, candidate_signal = _evaluate(
-                    model, prompt_ids
+                    model, prompt_ids, **depth_kwargs
                 )
                 trace.append((residency.size, candidate_signal))
                 if signal - candidate_signal < gain:
@@ -523,12 +532,18 @@ def default_resident_ids(model: SPALMERCausalLM, count: int) -> tuple[int, ...]:
 
 
 def _evaluate(
-    model: SPALMERCausalLM, prompt_ids: Tensor
+    model: SPALMERCausalLM,
+    prompt_ids: Tensor,
+    *,
+    recurrence_steps: int | None = None,
 ) -> tuple[CausalLMOutput, float | None, float, float]:
+    kwargs: dict[str, int] = (
+        {} if recurrence_steps is None else {"recurrence_steps": recurrence_steps}
+    )
     if prompt_ids.shape[1] >= 2:
-        output = model(prompt_ids, labels=prompt_ids)
+        output = model(prompt_ids, labels=prompt_ids, **kwargs)
     else:
-        output = model(prompt_ids)
+        output = model(prompt_ids, **kwargs)
     nll = None if output.token_nll is None else float(output.token_nll.float().mean())
     if output.predictive_entropy is None:
         raise RuntimeError("model did not return predictive entropy telemetry")

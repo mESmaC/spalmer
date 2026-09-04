@@ -24,6 +24,7 @@ from spalmer.training.optim import (
     build_optimizers,
     gradients_are_finite,
 )
+from spalmer.training.recurrence import RecurrenceSampler
 
 
 @dataclass(slots=True)
@@ -115,6 +116,11 @@ class TrainStepMetrics:
     max_expert_group_load: int | None = None
     max_expert_group_padding_amplification: float | None = None
     max_expert_group_global_max_counterfactual_padding_amplification: float | None = None
+    recurrence_steps: int | None = None
+    backprop_steps: int | None = None
+    effective_depth: int | None = None
+    latent_delta_final: float | None = None
+    latent_position_correlation: float | None = None
 
 
 @dataclass(slots=True)
@@ -394,6 +400,8 @@ class ExperimentTrainer:
             dtype=_parameter_dtype(config),
         )
         _validate_expert_master_dtype(self.model, config)
+        self.recurrence = RecurrenceSampler.from_training_config(config)
+        _validate_recurrence_contract(self.model, self.recurrence)
         self.batches = batches
         self.optimizer = optimizer or build_optimizers(self.model, config)
         _validate_optimizer_precision_contract(self.optimizer, config)
@@ -420,6 +428,14 @@ class ExperimentTrainer:
 
     def _optimizer_step(self) -> TrainStepMetrics:
         step_index = self.progress.completed_steps
+        # One draw per optimizer step: every microbatch runs the same depth, so
+        # `_PotentiationAccumulator` still sees a constant `layer_metrics` length.
+        recurrence = None if self.recurrence is None else self.recurrence.sample(step_index)
+        recurrence_kwargs: dict[str, int] = (
+            {}
+            if recurrence is None
+            else {"recurrence_steps": recurrence[0], "backprop_steps": recurrence[1]}
+        )
         rate = self.config.learning_rate * self.config.learning_rate_multiplier(step_index)
         self.optimizer.set_learning_rate(rate)
         self.optimizer.zero_grad(set_to_none=True)
@@ -428,6 +444,8 @@ class ExperimentTrainer:
         auxiliary_losses: list[float] = []
         calibration_losses: list[float] = []
         predictive_entropies: list[float] = []
+        latent_deltas: list[float] = []
+        latent_correlations: list[float] = []
         potentiation = _PotentiationAccumulator()
         execution_telemetry = _ExecutionTelemetryAccumulator()
         targets = 0
@@ -445,6 +463,7 @@ class ExperimentTrainer:
                     labels=batch.resolved_labels,
                     attention_mask=batch.attention_mask,
                     state_reset_mask=batch.state_reset_mask,
+                    **recurrence_kwargs,
                 )
                 objective = _objective(output, self.config)
                 scaled = objective / self.config.gradient_accumulation_steps
@@ -461,6 +480,7 @@ class ExperimentTrainer:
                 )
             potentiation.add(output.layer_metrics, target_tokens=batch_targets)
             execution_telemetry.add(output.layer_metrics)
+            _append_latent_telemetry(latent_deltas, latent_correlations, output)
             # Do not keep logits, router scores, recurrent states, or their
             # already-backwarded graphs alive across accumulation microbatches.
             del output, objective, scaled, batch, host_batch
@@ -506,6 +526,16 @@ class ExperimentTrainer:
             max_expert_group_padding_amplification=max_padding_amplification,
             max_expert_group_global_max_counterfactual_padding_amplification=(
                 max_global_max_counterfactual_amplification
+            ),
+            recurrence_steps=None if recurrence is None else recurrence[0],
+            backprop_steps=None if recurrence is None else recurrence[1],
+            effective_depth=(
+                None if recurrence is None else _effective_depth(self.model, recurrence[0])
+            ),
+            latent_delta_final=_mean_scalars(latent_deltas, "latent_delta_final"),
+            latent_position_correlation=_mean_scalars(
+                latent_correlations,
+                "latent_position_correlation",
             ),
         )
         self._dispatch_callbacks(metrics)
@@ -606,6 +636,44 @@ def _move_optional(value: Tensor | None, device: torch.device) -> Tensor | None:
 def _append_optional_scalar(destination: list[float], value: Any) -> None:
     if isinstance(value, Tensor):
         destination.append(float(value.detach().float().mean()))
+
+
+def _model_recurrence(model: Any) -> Any:
+    """The model's recurrence config, tolerating test doubles without one."""
+
+    return getattr(getattr(model, "config", None), "recurrence", None)
+
+
+def _validate_recurrence_contract(model: Any, sampler: RecurrenceSampler | None) -> None:
+    """Reject a depth policy that does not match the model's physical core."""
+
+    is_recurrent = _model_recurrence(model) is not None
+    if is_recurrent and sampler is None:
+        raise ValueError("recurrent model requires TrainingConfig.mean_recurrence")
+    if not is_recurrent and sampler is not None:
+        raise ValueError("mean_recurrence was set but the model has no recurrent core")
+
+
+def _effective_depth(model: Any, steps: int) -> int | None:
+    config = getattr(model, "config", None)
+    resolver = getattr(config, "effective_depth", None)
+    if not callable(resolver):
+        return None
+    return int(resolver(steps))
+
+
+def _append_latent_telemetry(
+    deltas: list[float],
+    correlations: list[float],
+    output: Any,
+) -> None:
+    latent_deltas = getattr(output, "latent_deltas", None)
+    if isinstance(latent_deltas, Tensor) and latent_deltas.numel():
+        deltas.append(float(latent_deltas.detach().float().reshape(-1)[-1]))
+    _append_optional_scalar(
+        correlations,
+        getattr(output, "latent_position_correlation", None),
+    )
 
 
 def _mean_scalars(values: list[float], name: str, *, required: bool = False) -> float | None:

@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import pytest
 
+from spalmer.config import RecurrenceConfig
 from spalmer.experiment import (
     ATXYScaleConfig,
     DirectionalScaleConfig,
+    RecurrenceScaleConfig,
     ScaleSearchSpace,
     plan_configuration,
 )
-from spalmer.experts.accounting import ParameterAccounting
+from spalmer.experts.accounting import (
+    ParameterAccounting,
+    account_parameters,
+    classify_parameter,
+)
 from spalmer.presets import (
     TOTAL_PARAMETER_TARGETS,
     assert_accounting_matches_plan,
@@ -189,3 +195,63 @@ def test_named_scale_target_table_contains_only_total_budget_labels() -> None:
         "50M": 50_000_000,
         "100M": 100_000_000,
     }
+
+
+def _recurrent_plan(*, prelude: int = 1, coda: int = 1, default_steps: int = 3):
+    return plan_configuration(
+        1_000_000,
+        300,
+        search_space=_one_shape_search(),
+        recurrence=RecurrenceScaleConfig(
+            prelude_layers=prelude,
+            coda_layers=coda,
+            default_steps=default_steps,
+            latent_init_std=0.5,
+        ),
+    )
+
+
+def test_build_configs_passes_recurrence_and_protects_it() -> None:
+    plan = _recurrent_plan()
+    bundle = build_configs(plan, tokenizer_version=1, tokenizer_fingerprint="presets")
+
+    assert bundle.model.recurrence == RecurrenceConfig(
+        prelude_layers=1,
+        core_layers=2,
+        coda_layers=1,
+        default_steps=3,
+        latent_init_std=0.5,
+    )
+    assert bundle.model.recurrence.total_layers == plan.config.n_layers
+    assert bundle.model.effective_depth() == plan.effective_depth
+
+    flat = build_configs(_tiny_plan(), tokenizer_version=1, tokenizer_fingerprint="presets")
+    assert flat.model.recurrence is None
+
+    with pytest.raises(ValueError, match="ScalePlan fields"):
+        build_configs(
+            plan,
+            tokenizer_version=1,
+            tokenizer_fingerprint="presets",
+            model_overrides={"recurrence": None},
+        )
+
+
+def test_recurrent_accounting_matches_the_plan_component_by_component() -> None:
+    plan = _recurrent_plan()
+    model = build_configs(
+        plan,
+        tokenizer_version=1,
+        tokenizer_fingerprint="presets",
+        attention_backend="reference",
+        experts_overrides={"expert_qat_backend": "reference"},
+    ).build()
+    accounting = account_parameters(model)
+
+    assert accounting.components["recurrence"] == plan.parameters.recurrence
+    assert_accounting_matches_plan(plan, accounting)
+    recurrence_names = sorted(
+        name for name, _ in model.named_parameters() if ".recurrence." in name
+    )
+    assert recurrence_names
+    assert {classify_parameter(name) for name in recurrence_names} == {"recurrence"}

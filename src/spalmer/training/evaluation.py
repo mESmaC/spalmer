@@ -47,11 +47,22 @@ def evaluate_model_batches(
     compute_dtype: torch.dtype = torch.bfloat16,
     mixture_weights: Mapping[EvaluationStratum | str, float] | None = None,
     max_batches: int | None = None,
+    recurrence_steps: int | None = None,
 ) -> ModelEvaluationReport:
-    """Evaluate finite held-out batches without updating model/controller state."""
+    """Evaluate finite held-out batches without updating model/controller state.
+
+    ``recurrence_steps`` selects the latent-core depth for recurrent models;
+    ``None`` leaves the model's own default in force and keeps the call
+    signature identical to a non-recurrent evaluation.
+    """
 
     if max_batches is not None and max_batches <= 0:
         raise ValueError("max_batches must be positive or None")
+    if recurrence_steps is not None and recurrence_steps < 1:
+        raise ValueError("recurrence_steps must be positive or None")
+    recurrence_kwargs: dict[str, int] = (
+        {} if recurrence_steps is None else {"recurrence_steps": recurrence_steps}
+    )
     del tokenizer  # Retained for API compatibility; exact byte counts come from batches.
     target_device = torch.device(device)
     model_device = next(model.parameters()).device
@@ -78,6 +89,7 @@ def evaluate_model_batches(
                     labels=batch.resolved_labels,
                     attention_mask=batch.attention_mask,
                     state_reset_mask=batch.state_reset_mask,
+                    **recurrence_kwargs,
                 )
             _accumulate_causal(causal, output, batch)
             router = _accumulate_router(router, output, batch)

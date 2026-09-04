@@ -10,12 +10,15 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from spalmer.attention import KDAConfig, KDATokenMixer
+from spalmer import RecurrenceConfig, RecurrentMixerStates, SPALMERConfig
+from spalmer.attention import KDAConfig, KDATokenMixer, MLAConfig
 from spalmer.attention.recurrence import (
     compute_forget_gate,
     init_dt_bias,
     kda_recurrent_reference,
 )
+from spalmer.experts import MicroExpertsConfig
+from spalmer.factory import build_spalmer_model
 
 
 def test_full_prefill_equals_recurrent_decode(small_config: KDAConfig):
@@ -181,3 +184,81 @@ def test_output_is_alive(small_config: KDAConfig):
     out, _ = mixer(x)
     assert out.std().item() > 1e-3
     assert torch.isfinite(out).all()
+
+
+def _recurrent_model():
+    """A tiny real-mixer model whose core iterates one KDA and one MLA block."""
+
+    model_config = SPALMERConfig(
+        vocab_size=32,
+        d_model=16,
+        n_layers=4,
+        tokenizer_version=1,
+        tokenizer_fingerprint="recurrent-core-v1",
+        ple_expansion_factor=1,
+        # Physical indices 1 (core) and 3 (coda) are MLA, so the iterated core
+        # carries both a KDA recurrent state and a growing MLA latent cache.
+        token_mixer_pattern=("kda", "mla", "kda", "mla"),
+        # Deterministic latent start: prefill and decode must agree exactly.
+        recurrence=RecurrenceConfig(1, 2, 1, default_steps=3, latent_init_std=0.0),
+    )
+    kda = KDAConfig(hidden_size=16, num_heads=2, head_k_dim=8, backend="reference")
+    mla = MLAConfig(hidden_size=16, num_heads=2, head_k_dim=8, q_latent_dim=8, kv_latent_dim=8)
+    experts = MicroExpertsConfig(d_model=16, num_experts=4, expert_inter_dim=8, active_experts=2)
+    torch.manual_seed(0)
+    return build_spalmer_model(model_config, kda, mla, experts).eval()
+
+
+def test_recurrent_core_prefill_matches_decode():
+    model = _recurrent_model()
+    prompt = torch.randint(0, model.config.vocab_size, (1, 9))
+    steps = 3
+
+    with torch.no_grad():
+        full = model(prompt, recurrence_steps=steps)
+        warm = model(prompt[:, :-1], recurrence_steps=steps)
+        stepped = model(
+            prompt[:, -1:],
+            execution_mode="decode",
+            recurrence_steps=steps,
+            token_mixer_states=warm.token_mixer_states,
+            channel_mixer_states=warm.channel_mixer_states,
+        )
+
+    assert full.recurrence_steps == stepped.recurrence_steps == steps
+    torch.testing.assert_close(
+        stepped.logits[:, -1], full.logits[:, -1], rtol=1e-4, atol=1e-4
+    )
+    torch.testing.assert_close(
+        stepped.latent_states[:, -1], full.latent_states[:, -1], rtol=1e-4, atol=1e-4
+    )
+    # Each core block keeps one state per iteration through both paths.
+    for slot in list(warm.token_mixer_states[1:3]) + list(stepped.token_mixer_states[1:3]):
+        assert isinstance(slot, RecurrentMixerStates)
+        assert len(slot) == steps
+    # Distinct per-iteration KDA memories: one shared cache would collapse them.
+    core_kda = stepped.token_mixer_states[2]
+    assert not torch.allclose(
+        core_kda[0].recurrent_state, core_kda[steps - 1].recurrent_state
+    )
+
+
+def test_recurrent_core_token_by_token_decode_matches_a_full_prefill():
+    model = _recurrent_model()
+    prompt = torch.randint(0, model.config.vocab_size, (1, 6))
+    steps = 2
+
+    with torch.no_grad():
+        full = model(prompt, recurrence_steps=steps)
+        output = model(prompt[:, :1], recurrence_steps=steps)
+        for position in range(1, prompt.shape[1]):
+            output = model(
+                prompt[:, position : position + 1],
+                execution_mode="decode",
+                recurrence_steps=steps,
+                token_mixer_states=output.token_mixer_states,
+                channel_mixer_states=output.channel_mixer_states,
+            )
+            torch.testing.assert_close(
+                output.logits[:, -1], full.logits[:, position], rtol=1e-4, atol=1e-4
+            )

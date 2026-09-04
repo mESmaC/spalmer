@@ -21,6 +21,7 @@ from spalmer.directional import DirectionalConfig
 from spalmer.experiment.planning import (
     ATXYScaleConfig,
     DirectionalScaleConfig,
+    RecurrenceScaleConfig,
     ScalePlan,
     ScaleSearchSpace,
     count_parameters,
@@ -49,6 +50,7 @@ def plan_named_scale(
     expert_weight_format: Literal["mxfp4", "nvfp4"] = "mxfp4",
     directional: DirectionalScaleConfig | None = None,
     atxy: ATXYScaleConfig | None = None,
+    recurrence: RecurrenceScaleConfig | None = None,
 ) -> ScalePlan:
     """Plan a conventional experiment rung as an inclusive total budget."""
 
@@ -62,6 +64,7 @@ def plan_named_scale(
         "expert_weight_format": expert_weight_format,
         "directional": directional,
         "atxy": atxy,
+        "recurrence": recurrence,
     }
     if search_space is not None:
         kwargs["search_space"] = search_space
@@ -110,6 +113,7 @@ _MODEL_SHAPE_FIELDS = {
     "ple_expansion_factor",
     "ple_quant_bits",
     "token_mixer_pattern",
+    "recurrence",
 }
 _EXPERT_SHAPE_FIELDS = {
     "d_model",
@@ -173,6 +177,18 @@ def build_configs(
         "ple_quant_bits": 4,
         "token_mixer_pattern": ("kda", "kda", "kda", "mla"),
     }
+    if config.recurrence is not None:
+        # Imported lazily so a non-recurrent build never depends on the
+        # recurrence config type being present.
+        from spalmer.config import RecurrenceConfig
+
+        model_fields["recurrence"] = RecurrenceConfig(
+            prelude_layers=config.recurrence.prelude_layers,
+            core_layers=config.recurrence.core_layers(config.n_layers),
+            coda_layers=config.recurrence.coda_layers,
+            default_steps=config.recurrence.default_steps,
+            latent_init_std=config.recurrence.latent_init_std,
+        )
     model_fields.update(model_extra)
     model = SPALMERConfig(**model_fields)
     kda = KDAConfig(

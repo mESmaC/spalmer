@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import Tensor
 
 from spalmer.modeling import SPALMERCausalLM
 from spalmer.training.optim import BF16MasterAdamW
+from spalmer.training.recurrence import RecurrenceSampler
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from spalmer.modeling import AdaptiveExit
 
 
 @dataclass(slots=True)
@@ -24,6 +29,37 @@ class TrainResult:
     final_predictive_entropy: float
     promoted_experts: tuple[int, ...]
     average_surprise: float = 0.0
+    mean_recurrence_steps: float | None = None
+
+
+@dataclass(slots=True)
+class RecurrenceTrace:
+    """A caller-owned receipt of the depth actually run by ``generate_tokens``."""
+
+    max_steps: int = 0
+    prefill_steps: int = 0
+    decode_steps: list[int] = field(default_factory=list)
+    early_exits: int = 0
+
+    @property
+    def mean_decode_steps(self) -> float:
+        if not self.decode_steps:
+            return 0.0
+        return sum(self.decode_steps) / len(self.decode_steps)
+
+    @property
+    def min_decode_steps(self) -> int:
+        return min(self.decode_steps, default=0)
+
+    @property
+    def max_decode_steps(self) -> int:
+        return max(self.decode_steps, default=0)
+
+
+def _recurrence_config(model: Any) -> Any:
+    """The model's recurrence config, tolerating doubles that have none."""
+
+    return getattr(getattr(model, "config", None), "recurrence", None)
 
 
 def train_token_stream(
@@ -39,9 +75,15 @@ def train_token_stream(
     gradient_clip: float | None = 1.0,
     seed: int = 0,
     log: Callable[[int, float], None] | None = None,
+    recurrence: RecurrenceSampler | None = None,
 ) -> TrainResult:
     """Train directly from one one-dimensional token stream."""
 
+    is_recurrent = _recurrence_config(model) is not None
+    if is_recurrent and recurrence is None:
+        raise ValueError("recurrent model requires a RecurrenceSampler")
+    if not is_recurrent and recurrence is not None:
+        raise ValueError("a RecurrenceSampler was given but the model has no recurrent core")
     if token_ids.ndim != 1:
         raise ValueError("token_ids must be one-dimensional")
     if len(token_ids) <= sequence_length:
@@ -71,6 +113,7 @@ def train_token_stream(
     final_auxiliary_loss: float | None = None
     final_surprise_calibration_loss: float | None = None
     final_predictive_entropy = float("nan")
+    sampled_steps: list[int] = []
     started = time.perf_counter()
     model.train()
 
@@ -87,7 +130,15 @@ def train_token_stream(
         batch = stream[starts[:, None] + offsets[None, :]]
 
         optimizer.zero_grad(set_to_none=True)
-        output = model(batch, labels=batch)
+        recurrence_kwargs: dict[str, int] = {}
+        if recurrence is not None:
+            drawn_steps, drawn_backprop = recurrence.sample(step - 1)
+            sampled_steps.append(drawn_steps)
+            recurrence_kwargs = {
+                "recurrence_steps": drawn_steps,
+                "backprop_steps": drawn_backprop,
+            }
+        output = model(batch, labels=batch, **recurrence_kwargs)
         if output.loss is None:
             raise RuntimeError("model did not return its next-token loss")
         objective = output.loss
@@ -130,6 +181,9 @@ def train_token_stream(
         final_predictive_entropy=final_predictive_entropy,
         promoted_experts=promoted_experts,
         average_surprise=model.average_surprise,
+        mean_recurrence_steps=(
+            None if not sampled_steps else sum(sampled_steps) / len(sampled_steps)
+        ),
     )
 
 
@@ -180,6 +234,11 @@ def generate_tokens(
     top_k: int | None = None,
     seed: int = 0,
     dynamic_residency: bool = False,
+    recurrence_steps: int | None = None,
+    adaptive_exit: AdaptiveExit | None = None,
+    warm_start: bool = False,
+    latent_seed: int | None = None,
+    trace: RecurrenceTrace | None = None,
 ) -> Tensor:
     """Generate with one prefill followed by explicit recurrent decode steps.
 
@@ -188,8 +247,21 @@ def generate_tokens(
     stays above the model's average surprise. The configured per-token top-k
     remains fixed, and decoding continues with the resident ids that were
     retained.
+
+    For a model with a recurrent latent core, ``recurrence_steps`` selects the
+    fixed depth (``None`` uses the checkpoint's ``default_steps``),
+    ``adaptive_exit`` optionally stops decode iterations early, and
+    ``warm_start`` seeds each decode step from the previous token's final
+    latent. ``trace`` is filled in place with the depth actually run.
     """
 
+    recurrence_config = _recurrence_config(model)
+    if recurrence_config is None and (
+        recurrence_steps is not None or adaptive_exit is not None or warm_start
+    ):
+        raise ValueError("model has no recurrent core")
+    if recurrence_steps is not None and recurrence_steps < 1:
+        raise ValueError("recurrence_steps must be positive or None")
     if prompt_ids.ndim == 1:
         prompt_ids = prompt_ids.unsqueeze(0)
     if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1 or prompt_ids.shape[1] == 0:
@@ -205,15 +277,31 @@ def generate_tokens(
     generated = prompt_ids.to(device=device, dtype=torch.long)
     if max_new_tokens == 0:
         return generated
+    steps: int | None = None
+    prefill_kwargs: dict[str, Any] = {}
+    decode_kwargs: dict[str, Any] = {}
+    if recurrence_config is not None:
+        steps = int(recurrence_steps or recurrence_config.default_steps)
+        latent_generator = torch.Generator(device=device).manual_seed(
+            seed if latent_seed is None else latent_seed
+        )
+        prefill_kwargs = {"recurrence_steps": steps, "latent_generator": latent_generator}
+        decode_kwargs = dict(prefill_kwargs)
+        if adaptive_exit is not None:
+            decode_kwargs["adaptive_exit"] = adaptive_exit
+        if trace is not None:
+            trace.max_steps = steps
+            trace.prefill_steps = steps
     was_training = model.training
     model.eval()
     try:
         if dynamic_residency:
             from spalmer.experts.residency import choose_inference_residency
 
-            output = choose_inference_residency(model, generated).output
+            residency_kwargs = {} if steps is None else {"recurrence_steps": steps}
+            output = choose_inference_residency(model, generated, **residency_kwargs).output
         else:
-            output = model(generated)
+            output = model(generated, **prefill_kwargs)
         token_states = output.token_mixer_states
         channel_states = output.channel_mixer_states
         generator = torch.Generator(device=device).manual_seed(seed)
@@ -228,14 +316,25 @@ def generate_tokens(
             generated = torch.cat((generated, next_token), dim=1)
             if token_index + 1 == max_new_tokens:
                 break
+            step_kwargs = dict(decode_kwargs)
+            if warm_start:
+                latent_states = getattr(output, "latent_states", None)
+                if latent_states is not None:
+                    step_kwargs["latent_init"] = latent_states[:, -1:, :]
             output = model(
                 next_token,
                 token_mixer_states=token_states,
                 channel_mixer_states=channel_states,
                 execution_mode="decode",
+                **step_kwargs,
             )
             token_states = output.token_mixer_states
             channel_states = output.channel_mixer_states
+            if trace is not None and steps is not None:
+                ran = getattr(output, "recurrence_steps", None)
+                ran = steps if ran is None else int(ran)
+                trace.decode_steps.append(ran)
+                trace.early_exits += int(ran < steps)
     finally:
         if dynamic_residency:
             model.end_residency_request()
@@ -263,4 +362,4 @@ def _select_token(
     return torch.multinomial(probabilities, num_samples=1, generator=generator)
 
 
-__all__ = ["TrainResult", "generate_tokens", "train_token_stream"]
+__all__ = ["RecurrenceTrace", "TrainResult", "generate_tokens", "train_token_stream"]

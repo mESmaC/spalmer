@@ -16,16 +16,17 @@ from spalmer.attention import KDAConfig, MLAConfig
 from spalmer.checkpoint import load_checkpoint, save_checkpoint
 from spalmer.config import SPALMERConfig
 from spalmer.data import JsonlAdapterConfig, prepare_approved_jsonl
-from spalmer.experiment import ExplicitVocabularyPolicy, plan_ladder
+from spalmer.experiment import ExplicitVocabularyPolicy, RecurrenceScaleConfig, plan_ladder
 from spalmer.experts import MicroExpertsConfig
 from spalmer.factory import build_spalmer_model
-from spalmer.runtime import generate_tokens, train_token_stream
+from spalmer.runtime import RecurrenceTrace, generate_tokens, train_token_stream
 from spalmer.tokenizer import Encoder, Sample, TokenizerBackend, TrainerConfig, Vocab, train
 from spalmer.tokenizer.backends import (
     HFTokenizerAdapter,
     RPDTokenizerAdapter,
     SpecialTokenIds,
 )
+from spalmer.training.recurrence import RecurrenceSampler
 
 _SMOKE_TEXT = (
     "SPALMER routes each token through small experts predicted to be least surprised. "
@@ -86,6 +87,19 @@ def _plan_parser() -> argparse.ArgumentParser:
         choices=("mxfp4", "nvfp4"),
         default="mxfp4",
         help="routed-expert QAT forward-weight format recorded in each plan",
+    )
+    parser.add_argument(
+        "--recurrence",
+        metavar=("PRELUDE", "CODA"),
+        nargs=2,
+        type=int,
+        help="plan a depth-recurrent core with this many prelude and coda blocks",
+    )
+    parser.add_argument(
+        "--recurrence-steps",
+        type=int,
+        default=8,
+        help="default inference depth recorded on a recurrent plan",
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     return parser
@@ -167,6 +181,27 @@ def _training_parser() -> argparse.ArgumentParser:
     parser.add_argument("--residency-increment", type=int, default=2)
     parser.add_argument("--residency-min-gain", type=float, default=0.02)
     parser.add_argument("--ple-expansion", type=int, default=2)
+    parser.add_argument(
+        "--recurrent-layers",
+        metavar=("PRELUDE", "CORE", "CODA"),
+        nargs=3,
+        type=int,
+        help="split --layers into a prelude, an iterated latent core, and a coda",
+    )
+    parser.add_argument(
+        "--mean-recurrence",
+        type=float,
+        help="expected sampled core iterations per optimizer step (required with "
+        "--recurrent-layers)",
+    )
+    parser.add_argument("--backprop-depth", type=int, default=4)
+    parser.add_argument("--recurrence-sigma", type=float, default=0.5)
+    parser.add_argument(
+        "--default-steps",
+        type=int,
+        help="inference depth recorded in the checkpoint (default: round(mean recurrence))",
+    )
+    parser.add_argument("--max-recurrence", type=int)
     parser.add_argument("--new-tokens", type=int, default=32)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser
@@ -209,6 +244,21 @@ def _generate_parser() -> argparse.ArgumentParser:
         type=int,
         help="maximum expert identities staged per layer (default: checkpoint resident cap)",
     )
+    parser.add_argument(
+        "--recurrence-steps",
+        type=int,
+        help="latent-core depth per token (default: the checkpoint's default_steps)",
+    )
+    parser.add_argument(
+        "--adaptive-exit",
+        choices=("none", "latent_diff", "kl"),
+        default="none",
+        help="stop decode iterations early once the chosen criterion settles",
+    )
+    parser.add_argument("--exit-threshold", type=float)
+    parser.add_argument("--min-steps", type=int, default=2)
+    parser.add_argument("--warm-start", action="store_true")
+    parser.add_argument("--exit-state-policy", choices=("fill", "skip"), default="fill")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser
 
@@ -224,29 +274,40 @@ def _run_plan(args: argparse.Namespace) -> None:
         right <= left for left, right in zip(args.vocab_sizes, args.vocab_sizes[1:])
     ):
         raise SystemExit("vocabulary size must increase at every larger model target")
+    recurrence = None
+    if args.recurrence is not None:
+        prelude, coda = args.recurrence
+        recurrence = RecurrenceScaleConfig(
+            prelude_layers=prelude,
+            coda_layers=coda,
+            default_steps=args.recurrence_steps,
+        )
     policy = ExplicitVocabularyPolicy(tuple(zip(args.targets, args.vocab_sizes, strict=True)))
     plans = plan_ladder(
         tuple(args.targets),
         policy,
         expert_weight_format=args.expert_weight_format,
+        recurrence=recurrence,
     )
     if args.json:
         print(json.dumps([plan.to_dict() for plan in plans], indent=2))
         return
     header = (
         f"{'target':>12} {'planned':>12} {'error':>9} {'vocab':>8} "
-        f"{'d':>5} {'L':>3} {'h':>3} {'E':>4} {'expert':>7} {'PLE':>4} "
-        f"{'BF16 GiB':>9} {'cached W4':>11}"
+        f"{'d':>5} {'L':>3} {'core':>5} {'eff':>5} {'h':>3} {'E':>4} "
+        f"{'expert':>7} {'PLE':>4} {'BF16 GiB':>9} {'cached W4':>11}"
     )
     print(header)
     print("-" * len(header))
     for plan in plans:
         shape = plan.config
         memory = plan.memory
+        core = "-" if shape.recurrence is None else f"{shape.core_layers:d}"
         print(
             f"{plan.target_parameters:12,d} {plan.parameters.total:12,d} "
             f"{plan.relative_error:+8.2%} {shape.vocab_size:8,d} {shape.d_model:5d} "
-            f"{shape.n_layers:3d} {shape.num_heads:3d} {shape.num_experts:4d} "
+            f"{shape.n_layers:3d} {core:>5} {plan.effective_depth:5d} "
+            f"{shape.num_heads:3d} {shape.num_experts:4d} "
             f"{shape.expert_width:7d} {shape.ple_expansion:4d} "
             f"{memory.gib(memory.reference_training_bytes):9.3f} "
             f"{memory.gib(memory.packed_training_bytes):11.3f}"
@@ -337,6 +398,7 @@ def _run(args: argparse.Namespace) -> None:
         raise ValueError("the SPALMER prototype requires at least two experts")
     if args.layers <= 0 or args.layers % len(_HYBRID_CYCLE):
         raise ValueError("layers must be a positive multiple of 4 for the 3:1 KDA/MLA cycle")
+    recurrence_config, sampler = _resolve_training_recurrence(args)
 
     if args.smoke:
         text = _SMOKE_TEXT
@@ -361,16 +423,19 @@ def _run(args: argparse.Namespace) -> None:
     head_dim = args.d_model // args.heads
     device = torch.device(args.device)
 
-    config = SPALMERConfig(
-        vocab_size=len(vocab),
-        d_model=args.d_model,
-        n_layers=args.layers,
-        tokenizer_version=vocab.version,
-        tokenizer_fingerprint=vocab.fingerprint,
-        ple_expansion_factor=args.ple_expansion,
-        token_mixer_pattern=_HYBRID_CYCLE,
-        surprise_ema_decay=args.surprise_ema_decay,
-    )
+    model_fields: dict[str, object] = {
+        "vocab_size": len(vocab),
+        "d_model": args.d_model,
+        "n_layers": args.layers,
+        "tokenizer_version": vocab.version,
+        "tokenizer_fingerprint": vocab.fingerprint,
+        "ple_expansion_factor": args.ple_expansion,
+        "token_mixer_pattern": _HYBRID_CYCLE,
+        "surprise_ema_decay": args.surprise_ema_decay,
+    }
+    if recurrence_config is not None:
+        model_fields["recurrence"] = recurrence_config
+    config = SPALMERConfig(**model_fields)
     kda_config = KDAConfig(
         hidden_size=args.d_model,
         num_heads=args.heads,
@@ -431,6 +496,7 @@ def _run(args: argparse.Namespace) -> None:
         learning_rate=args.learning_rate,
         surprise_calibration_weight=args.surprise_loss_weight,
         log=report,
+        recurrence=sampler,
     )
     destination = save_checkpoint(
         args.output,
@@ -459,6 +525,7 @@ def _run(args: argparse.Namespace) -> None:
             "residency_increment": args.residency_increment,
             "residency_min_gain": args.residency_min_gain,
             "seed": 0,
+            "recurrence": _recurrence_metadata(recurrence_config, sampler, result),
         },
     )
 
@@ -468,13 +535,74 @@ def _run(args: argparse.Namespace) -> None:
     payload = b"".join(vocab.get(int(token)).payload() for token in generated_ids[0])
     generated = payload.decode("utf-8", errors="replace")
     parameters = sum(parameter.numel() for parameter in model.parameters())
-    print(
+    summary = (
         f"saved={destination} parameters={parameters:,} vocab={len(vocab):,} "
         f"tokens_seen={result.tokens_seen:,} seconds={result.elapsed_seconds:.2f} "
         f"promoted={list(result.promoted_experts)} "
         f"average_surprise={result.average_surprise:.4f}"
     )
+    if recurrence_config is not None and sampler is not None:
+        summary += (
+            f" effective_depth={config.effective_depth()} "
+            f"mean_r={result.mean_recurrence_steps:.2f}"
+        )
+    print(summary)
     print(_terminal_safe_text(generated))
+
+
+def _resolve_training_recurrence(args: argparse.Namespace) -> tuple[object | None, object | None]:
+    """Turn ``--recurrent-layers`` and its companions into config + sampler."""
+
+    if args.recurrent_layers is None:
+        for name in ("mean_recurrence", "default_steps", "max_recurrence"):
+            if getattr(args, name) is not None:
+                raise ValueError(
+                    f"--{name.replace('_', '-')} requires --recurrent-layers"
+                )
+        return None, None
+    prelude, core, coda = args.recurrent_layers
+    if prelude + core + coda != args.layers:
+        raise ValueError(
+            f"--recurrent-layers must sum to --layers ({prelude + core + coda} != {args.layers})"
+        )
+    if args.mean_recurrence is None:
+        raise ValueError("--mean-recurrence is required with --recurrent-layers")
+    from spalmer.config import RecurrenceConfig
+
+    default_steps = args.default_steps or max(1, round(args.mean_recurrence))
+    config = RecurrenceConfig(
+        prelude_layers=prelude,
+        core_layers=core,
+        coda_layers=coda,
+        default_steps=default_steps,
+    )
+    sampler = RecurrenceSampler(
+        mean_recurrence=float(args.mean_recurrence),
+        mean_backprop_depth=int(args.backprop_depth),
+        sigma=float(args.recurrence_sigma),
+        max_recurrence=args.max_recurrence,
+    )
+    return config, sampler
+
+
+def _recurrence_metadata(
+    config: object | None,
+    sampler: object | None,
+    result: object,
+) -> dict[str, object] | None:
+    if config is None or sampler is None:
+        return None
+    return {
+        "prelude_layers": config.prelude_layers,
+        "core_layers": config.core_layers,
+        "coda_layers": config.coda_layers,
+        "default_steps": config.default_steps,
+        "latent_init_std": config.latent_init_std,
+        "mean_recurrence": sampler.mean_recurrence,
+        "mean_backprop_depth": sampler.mean_backprop_depth,
+        "recurrence_sigma": sampler.sigma,
+        "mean_recurrence_steps": result.mean_recurrence_steps,
+    }
 
 
 def _run_generate(args: argparse.Namespace) -> None:
@@ -509,6 +637,7 @@ def _run_generate(args: argparse.Namespace) -> None:
     prompt_ids = torch.tensor(encoded_prompt, dtype=torch.long)
     if prompt_ids.numel() == 0:
         raise ValueError("prompt must encode to at least one token")
+    recurrence_kwargs, trace = _generate_recurrence_kwargs(args, model)
     generated_ids = generate_tokens(
         model,
         prompt_ids,
@@ -516,6 +645,7 @@ def _run_generate(args: argparse.Namespace) -> None:
         temperature=args.temperature,
         top_k=args.top_k,
         dynamic_residency=args.dynamic_residency,
+        **recurrence_kwargs,
     )
     decoded_ids = generated_ids[0].detach().cpu().tolist()
     if isinstance(tokenizer, Vocab):
@@ -530,6 +660,55 @@ def _run_generate(args: argparse.Namespace) -> None:
     else:
         generated = tokenizer.decode(decoded_ids, skip_special_tokens=False)
     print(_terminal_safe_text(generated))
+    if trace is not None:
+        print(
+            f"recurrence: steps={trace.max_steps} prefill={trace.prefill_steps} "
+            f"decode mean={trace.mean_decode_steps:.2f} min={trace.min_decode_steps} "
+            f"max={trace.max_decode_steps} early_exits={trace.early_exits}"
+        )
+
+
+_RECURRENCE_GENERATE_FLAGS = (
+    ("recurrence_steps", "--recurrence-steps"),
+    ("exit_threshold", "--exit-threshold"),
+)
+
+
+def _generate_recurrence_kwargs(
+    args: argparse.Namespace,
+    model: object,
+) -> tuple[dict[str, object], RecurrenceTrace | None]:
+    """Build the recurrence keywords, refusing them on a flat checkpoint."""
+
+    requested = [
+        flag for name, flag in _RECURRENCE_GENERATE_FLAGS if getattr(args, name) is not None
+    ]
+    if args.adaptive_exit != "none":
+        requested.append("--adaptive-exit")
+    if args.warm_start:
+        requested.append("--warm-start")
+    if getattr(getattr(model, "config", None), "recurrence", None) is None:
+        if requested:
+            raise SystemExit(
+                "checkpoint has no recurrent core; drop " + ", ".join(sorted(requested))
+            )
+        return {}, None
+    kwargs: dict[str, object] = {
+        "recurrence_steps": args.recurrence_steps,
+        "warm_start": args.warm_start,
+    }
+    if args.adaptive_exit != "none":
+        from spalmer.modeling import AdaptiveExit
+
+        kwargs["adaptive_exit"] = AdaptiveExit(
+            criterion=args.adaptive_exit,
+            threshold=args.exit_threshold,
+            min_steps=args.min_steps,
+            state_policy=args.exit_state_policy,
+        )
+    trace = RecurrenceTrace()
+    kwargs["trace"] = trace
+    return kwargs, trace
 
 
 def _terminal_safe_text(text: str, *, encoding: str | None = None) -> str:

@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from spalmer.attention import KDAConfig, MLAConfig
-from spalmer.config import SPALMERConfig
+from spalmer.config import RecurrenceConfig, SPALMERConfig
 from spalmer.experts import (
     MicroExpertBank,
     MicroExpertChannelMixer,
@@ -406,3 +406,80 @@ def test_enable_rejects_open_request_without_mutation_and_restores_on_failure(
 
 def _banks(model) -> tuple[MicroExpertBank, ...]:
     return tuple(block.channel_mixer.experts for block in model.backbone.blocks)
+
+
+def _recurrent_tiny_model():
+    model_config = SPALMERConfig(
+        vocab_size=16,
+        d_model=8,
+        n_layers=3,
+        tokenizer_version=1,
+        tokenizer_fingerprint="paged-offload-recurrent",
+        ple_expansion_factor=1,
+        recurrence=RecurrenceConfig(1, 1, 1, default_steps=3),
+    )
+    kda = KDAConfig(hidden_size=8, num_heads=2, head_k_dim=4, backend="reference")
+    mla = MLAConfig(
+        hidden_size=8,
+        num_heads=2,
+        head_k_dim=4,
+        q_latent_dim=4,
+        kv_latent_dim=4,
+    )
+    return build_spalmer_model(model_config, kda, mla, _experts()).eval()
+
+
+def test_paged_core_bank_counters_scale_with_iterations() -> None:
+    """Paged expert banks in the recurrent core are re-staged once per iteration."""
+
+    torch.manual_seed(37)
+    model = _recurrent_tiny_model()
+    banks = _banks(model)
+    for bank in banks:
+        _prepare_paged(bank, capacity=2)
+    prompt = torch.randint(0, model.config.vocab_size, (1, 7))
+
+    routing_calls = [0, 0, 0]
+    for index, bank in enumerate(banks):
+        real_execute = bank.execute_routing
+
+        def counting_execute(*args, _index=index, _real=real_execute, **kwargs):
+            routing_calls[_index] += 1
+            return _real(*args, **kwargs)
+
+        bank.execute_routing = counting_execute
+
+    def stages() -> tuple[int, ...]:
+        return tuple(bank.expert_offload_counters[0] for bank in banks)
+
+    def rows() -> tuple[int, ...]:
+        return tuple(bank.expert_offload_counters[1] for bank in banks)
+
+    measured: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}
+    with torch.inference_mode():
+        for steps in (1, 3, 5):
+            routing_calls[:] = [0, 0, 0]
+            before_stages, before_rows = stages(), rows()
+            output = model(prompt, recurrence_steps=steps)
+            measured[steps] = (
+                tuple(a - b for a, b in zip(stages(), before_stages, strict=True)),
+                tuple(a - b for a, b in zip(rows(), before_rows, strict=True)),
+            )
+            assert output.recurrence_steps == steps
+            # The prelude and coda banks route once; the core bank routes once
+            # per iteration, so its paged cache is re-staged r times.
+            assert routing_calls == [1, steps, 1]
+            # Reading the per-expert quantization error stays valid: the mixer
+            # collects it inside the same execute_routing call every iteration.
+            for metrics in output.layer_metrics:
+                error = metrics.get("expert_quantization_error")
+                if error is not None:
+                    assert torch.isfinite(error).all()
+
+    core_stages = [measured[steps][0][1] for steps in (1, 3, 5)]
+    assert core_stages[0] < core_stages[1] < core_stages[2]
+    assert core_stages[2] <= 5 * core_stages[0] * 2
+    # The prelude bank's paging traffic does not depend on the recurrence depth.
+    assert {measured[steps][0][0] for steps in (1, 3, 5)} == {measured[1][0][0]}
+    assert measured[5][1][1] > measured[5][1][0] + measured[5][1][2]
+    assert all(len(bank.cached_expert_ids) <= 2 for bank in banks)
