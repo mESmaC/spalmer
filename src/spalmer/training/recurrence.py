@@ -2,8 +2,8 @@
 
 The sampler is deliberately stateless: ``r`` is a pure function of the run
 seed and the completed step index, so resuming a run needs no extra run-state
-payload and the draws never touch the global Python/torch RNG streams that
-PLE stochastic rounding and expert QAT depend on.
+payload and the draws never perturb the global Python/torch RNG streams used
+by model training.
 """
 
 from __future__ import annotations

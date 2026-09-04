@@ -281,13 +281,33 @@ def _bf16_capability(device: torch.device) -> ExpertPrecisionCapability:
         detail = "PyTorch dense BF16 forward/backward"
     elif device.type == "cuda" and torch.cuda.is_available():
         try:
-            available = bool(torch.cuda.is_bf16_supported())
-        except (AssertionError, RuntimeError):
+            index = torch.cuda.current_device() if device.index is None else int(device.index)
+            if index < 0 or index >= torch.cuda.device_count():
+                raise ValueError(f"CUDA device index {index} is unavailable")
+            # Capability discovery can be reached from an inference-mode
+            # model call.  The probe must create ordinary autograd tensors or
+            # it would falsely reject a working backward kernel.
+            with torch.inference_mode(False), torch.enable_grad(), torch.cuda.device(index):
+                # PyTorch defaults ``including_emulation`` to true. That is
+                # explicitly unsuitable for SPALMER's native-only contract.
+                available = bool(torch.cuda.is_bf16_supported(including_emulation=False))
+                if available:
+                    generator = torch.Generator(device="cpu").manual_seed(1616)
+                    left = torch.randn((8, 16), generator=generator).to(
+                        device=device, dtype=torch.bfloat16
+                    ).requires_grad_(True)
+                    right = torch.randn((16, 8), generator=generator).to(
+                        device=device, dtype=torch.bfloat16
+                    ).requires_grad_(True)
+                    output = left @ right
+                    torch.autograd.grad(output.float().square().mean(), (left, right))
+                    torch.cuda.synchronize(device)
+        except (AssertionError, RuntimeError, ValueError):
             available = False
         detail = (
-            "PyTorch CUDA BF16 forward/backward"
+            "native PyTorch CUDA BF16 forward/backward smoke passed"
             if available
-            else "CUDA device does not report BF16 support"
+            else "CUDA device has no verified native BF16 forward/backward path"
         )
     else:
         available = False

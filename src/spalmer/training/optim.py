@@ -26,9 +26,9 @@ class ParameterGroups:
 def classify_parameters(model: nn.Module) -> ParameterGroups:
     """Partition every trainable parameter exactly once.
 
-    Fake-QAT PLE rows requested with sparse gradients must use SparseAdam;
-    applying AdamW to those gradients fails at the first optimizer step.  Bias,
-    scalar, vector, normalization, and explicitly marked parameters do not decay.
+    Any explicitly sparse embedding rows must use SparseAdam; applying AdamW
+    to sparse gradients fails at the first optimizer step. Bias, scalar,
+    vector, normalization, and explicitly marked parameters do not decay.
     """
 
     sparse_ids: set[int] = set()
