@@ -469,6 +469,8 @@ class MicroExpertBank(nn.Module):
             return "bfloat16", "bfloat16"
         if self.config.expert_promotion_format == "mxfp8":
             return "mxfp8", "mxfp8"
+        if self.config.expert_promotion_format == "float32":
+            return "float32", "float32"
         raise RuntimeError(
             f"no native promotion kernel for {self.config.expert_promotion_format!r}"
         )
@@ -538,7 +540,7 @@ class MicroExpertBank(nn.Module):
         )
         assert error_device is not None
         errors = torch.zeros(self.num_experts, dtype=torch.float32, device=error_device)
-        if self.config.expert_weight_format == "bfloat16":
+        if self.config.expert_weight_format in {"bfloat16", "float32"}:
             return errors
 
         if self.expert_paging_enabled:
@@ -615,6 +617,17 @@ class MicroExpertBank(nn.Module):
         """
 
         self._ensure_native_precision(hidden_states.device)
+        expected_dtype = (
+            torch.float32
+            if self.config.expert_weight_format == "float32"
+            else torch.bfloat16
+        )
+        if hidden_states.dtype != expected_dtype:
+            raise RuntimeError(
+                f"{self.config.expert_weight_format}/{self.config.expert_activation_format} "
+                f"expert execution requires {expected_dtype} hidden states, got "
+                f"{hidden_states.dtype}"
+            )
         if self.expert_paging_enabled:
             return self._execute_paged(
                 hidden_states,
@@ -909,15 +922,15 @@ class MicroExpertBank(nn.Module):
         group_ids: Tensor | None,
         promoted_mask: Tensor | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """BF16 weights for the ordinary grouped executor.
+        """BF16 or FP32 weights for the ordinary grouped executor.
 
         Low-precision providers cannot reach this method unless they explicitly
         advertise a true grouped kernel and receive a dedicated executor.
         """
 
-        if self.config.expert_weight_format != "bfloat16":
+        if self.config.expert_weight_format not in {"bfloat16", "float32"}:
             raise RuntimeError(
-                "the torch.bmm grouped executor is BF16-only; no low-precision "
+                "the torch.bmm grouped executor is BF16/FP32-only; no low-precision "
                 "fallback is permitted"
             )
         # BF16 configs are construction-validated with a zero potentiation
@@ -940,6 +953,16 @@ class MicroExpertBank(nn.Module):
                 self.gate_proj[group_ids],
                 self.up_proj[group_ids],
                 self.down_proj[group_ids],
+            )
+        expected_dtype = (
+            torch.float32
+            if self.config.expert_weight_format == "float32"
+            else torch.bfloat16
+        )
+        if any(weight.dtype != expected_dtype for weight in stacks):
+            raise RuntimeError(
+                f"{self.config.expert_weight_format} grouped execution requires "
+                f"{expected_dtype} weights"
             )
         return stacks
 

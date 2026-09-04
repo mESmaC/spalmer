@@ -21,6 +21,10 @@ def make_mixer(**overrides: object) -> MicroExpertChannelMixer:
         d_model=16,
         num_experts=6,
         expert_inter_dim=8,
+        expert_weight_format="float32",
+        expert_activation_format="float32",
+        expert_master_dtype="float32",
+        expert_promotion_format="float32",
         **overrides,
     )
     torch.manual_seed(0)
@@ -76,7 +80,15 @@ def test_least_surprise_is_preferred():
 
 
 def test_two_hundred_experts_supported():
-    config = MicroExpertsConfig(d_model=16, num_experts=200, expert_inter_dim=8)
+    config = MicroExpertsConfig(
+        d_model=16,
+        num_experts=200,
+        expert_inter_dim=8,
+        expert_weight_format="float32",
+        expert_activation_format="float32",
+        expert_master_dtype="float32",
+        expert_promotion_format="float32",
+    )
     torch.manual_seed(0)
     mixer = MicroExpertChannelMixer(config)
     x = torch.randn(2, 3, 16)
@@ -111,7 +123,15 @@ def test_gradients_reach_router_and_selected_experts():
 
 
 def test_shared_router_serves_multiple_banks():
-    config = MicroExpertsConfig(d_model=16, num_experts=6, expert_inter_dim=8)
+    config = MicroExpertsConfig(
+        d_model=16,
+        num_experts=6,
+        expert_inter_dim=8,
+        expert_weight_format="float32",
+        expert_activation_format="float32",
+        expert_master_dtype="float32",
+        expert_promotion_format="float32",
+    )
     torch.manual_seed(0)
     shared_router = SurpriseRouter(config)
     layer_one = MicroExpertChannelMixer(config, router=shared_router)
@@ -137,9 +157,25 @@ def test_shared_router_serves_multiple_banks():
 
 
 def test_shared_router_rejects_mismatched_bank():
-    config = MicroExpertsConfig(d_model=16, num_experts=6, expert_inter_dim=8)
+    config = MicroExpertsConfig(
+        d_model=16,
+        num_experts=6,
+        expert_inter_dim=8,
+        expert_weight_format="float32",
+        expert_activation_format="float32",
+        expert_master_dtype="float32",
+        expert_promotion_format="float32",
+    )
     router = SurpriseRouter(config)
-    other = MicroExpertsConfig(d_model=16, num_experts=8, expert_inter_dim=8)
+    other = MicroExpertsConfig(
+        d_model=16,
+        num_experts=8,
+        expert_inter_dim=8,
+        expert_weight_format="float32",
+        expert_activation_format="float32",
+        expert_master_dtype="float32",
+        expert_promotion_format="float32",
+    )
     try:
         MicroExpertChannelMixer(other, router=router)
     except ValueError as exc:

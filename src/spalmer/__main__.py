@@ -98,8 +98,18 @@ def _selectable_precision_cli_values(
 def _resolved_expert_activation(weight_format: str, activation_format: str | None) -> str:
     return activation_format or {
         "bfloat16": "bfloat16",
+        "float32": "float32",
         "nvfp4": "nvfp4",
     }.get(weight_format, "mxfp8")
+
+
+def _default_expert_weight_format(weight_formats: tuple[str, ...]) -> str:
+    for candidate in ("bfloat16", "float32"):
+        if candidate in weight_formats:
+            return candidate
+    if weight_formats:
+        return weight_formats[0]
+    return "bfloat16"
 
 
 def _plan_parser(*, device: str | torch.device | None = None) -> argparse.ArgumentParser:
@@ -107,6 +117,7 @@ def _plan_parser(*, device: str | torch.device | None = None) -> argparse.Argume
     weight_formats, activation_formats, pair_text = _selectable_precision_cli_values(
         resolved_device
     )
+    default_weight_format = _default_expert_weight_format(weight_formats)
     parser = argparse.ArgumentParser(
         prog="spalmer plan",
         description="Plan scale-aware model shapes without constructing or training a model",
@@ -130,7 +141,7 @@ def _plan_parser(*, device: str | torch.device | None = None) -> argparse.Argume
     parser.add_argument(
         "--expert-weight-format",
         choices=weight_formats,
-        default="bfloat16",
+        default=default_weight_format,
         help=f"device-verified routed-expert weight format; exact pairs: {pair_text}",
     )
     parser.add_argument(
@@ -204,10 +215,16 @@ def _training_parser(*, device: str | torch.device | None = None) -> argparse.Ar
         resolved_device
     )
     capabilities = detect_precision_capabilities(resolved_device)
-    promotion_formats = (
-        ("mxfp8", "bfloat16")
-        if capabilities.supports("mxfp8", "mxfp8")
-        else ("bfloat16",)
+    default_weight_format = _default_expert_weight_format(weight_formats)
+    promotion_formats = tuple(
+        precision
+        for precision in ("mxfp8", "bfloat16", "float32")
+        if capabilities.supports(precision, precision)
+    )
+    default_promotion_format = (
+        default_weight_format
+        if default_weight_format in {"bfloat16", "float32"}
+        else "bfloat16"
     )
     parser = argparse.ArgumentParser(
         prog="spalmer",
@@ -236,7 +253,7 @@ def _training_parser(*, device: str | torch.device | None = None) -> argparse.Ar
     parser.add_argument(
         "--expert-weight-format",
         choices=weight_formats,
-        default="bfloat16",
+        default=default_weight_format,
         help=f"device-verified routed-expert weight format; exact pairs: {pair_text}",
     )
     parser.add_argument(
@@ -253,7 +270,7 @@ def _training_parser(*, device: str | torch.device | None = None) -> argparse.Ar
     parser.add_argument(
         "--expert-promotion-format",
         choices=promotion_formats,
-        default="bfloat16",
+        default=default_promotion_format,
         help="device-verified whole-expert promotion precision",
     )
     parser.add_argument("--potentiation-budget", type=int, default=0)
@@ -528,6 +545,9 @@ def _run(args: argparse.Namespace) -> None:
         args.expert_weight_format,
         activation_format,
     )
+    expert_master_dtype = (
+        "float32" if args.expert_weight_format == "float32" else "bfloat16"
+    )
 
     if args.smoke:
         text = _SMOKE_TEXT
@@ -589,7 +609,7 @@ def _run(args: argparse.Namespace) -> None:
         expert_execution="grouped" if capability.grouped_available else "loop",
         expert_weight_format=args.expert_weight_format,
         expert_activation_format=activation_format,
-        expert_master_dtype="bfloat16",
+        expert_master_dtype=expert_master_dtype,
         expert_qat_backend=args.expert_qat_backend,
         expert_promotion_format=args.expert_promotion_format,
         potentiation_budget=args.potentiation_budget,
@@ -599,7 +619,7 @@ def _run(args: argparse.Namespace) -> None:
         residency_min_gain=args.residency_min_gain,
     )
     model = build_spalmer_model(config, kda_config, mla_config, experts_config)
-    dtype = torch.bfloat16
+    dtype = torch.float32 if expert_master_dtype == "float32" else torch.bfloat16
     model.to(device=device, dtype=dtype)
     print(
         "expert precision: "

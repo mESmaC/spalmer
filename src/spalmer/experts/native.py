@@ -46,6 +46,48 @@ def _require_cuda_bf16(left: Tensor, right: Tensor, *, operation: str) -> None:
         )
 
 
+def _require_exact_bf16(
+    left: Tensor,
+    right: Tensor,
+    bias: Tensor | None,
+    *,
+    operation: str,
+) -> None:
+    """Validate the actual operands of the advertised BF16/BF16 lane."""
+
+    if left.device != right.device:
+        raise NativeExpertPrecisionError(f"{operation} operands must share one device")
+    if left.device.type not in {"cpu", "cuda"}:
+        raise NativeExpertPrecisionError(
+            f"{operation} is not integrated for device type {left.device.type!r}"
+        )
+    if left.dtype != torch.bfloat16 or right.dtype != torch.bfloat16:
+        raise NativeExpertPrecisionError(
+            f"{operation} requires BF16 activation and weight operands"
+        )
+    if bias is not None and (bias.device != left.device or bias.dtype != torch.bfloat16):
+        raise NativeExpertPrecisionError(
+            f"{operation} bias must be BF16 on {left.device}"
+        )
+
+
+def _require_exact_float32(
+    left: Tensor,
+    right: Tensor,
+    bias: Tensor | None,
+    *,
+    operation: str,
+) -> None:
+    if left.device != right.device or left.device.type != "cpu":
+        raise NativeExpertPrecisionError(f"{operation} requires operands on one CPU device")
+    if left.dtype != torch.float32 or right.dtype != torch.float32:
+        raise NativeExpertPrecisionError(
+            f"{operation} requires FP32 activation and weight operands"
+        )
+    if bias is not None and (bias.device != left.device or bias.dtype != torch.float32):
+        raise NativeExpertPrecisionError(f"{operation} bias must be FP32 on CPU")
+
+
 def _mx_quantize_rows(value: Tensor):
     """Pack matrix rows to E4M3 elements with block-32 E8M0 scales."""
 
@@ -286,6 +328,21 @@ def native_expert_matmul(
         _require_cuda_bf16(input, weight, operation="native MXFP8 expert matmul")
         return _NativeMXFP8Linear.apply(input, weight, bias, True)
     if pair == ("bfloat16", "bfloat16"):
+        _require_exact_bf16(
+            input,
+            weight,
+            bias,
+            operation="native BF16 expert matmul",
+        )
+        output = torch.matmul(input, weight)
+        return output if bias is None else output + bias
+    if pair == ("float32", "float32"):
+        _require_exact_float32(
+            input,
+            weight,
+            bias,
+            operation="native FP32 expert matmul",
+        )
         output = torch.matmul(input, weight)
         return output if bias is None else output + bias
     raise NativeExpertPrecisionError(
@@ -310,6 +367,20 @@ def native_expert_linear(
     if pair == ("mxfp8", "mxfp8"):
         return native_mxfp8_linear(input, weight, bias)
     if pair == ("bfloat16", "bfloat16"):
+        _require_exact_bf16(
+            input,
+            weight,
+            bias,
+            operation="native BF16 expert linear",
+        )
+        return F.linear(input, weight, bias)
+    if pair == ("float32", "float32"):
+        _require_exact_float32(
+            input,
+            weight,
+            bias,
+            operation="native FP32 expert linear",
+        )
         return F.linear(input, weight, bias)
     raise NativeExpertPrecisionError(
         "no integrated native expert kernel for "
@@ -336,7 +407,7 @@ def native_weight_reconstruction_error(weight: Tensor, *, weight_format: str) ->
         padded = F.pad(weight, (0, padded_k - weight.shape[1]))
         packed = _mx_quantize_rows(padded)
         restored = packed.dequantize(weight.dtype)[:, : weight.shape[1]]
-    elif weight_format == "bfloat16":
+    elif weight_format in {"bfloat16", "float32"}:
         return weight.new_zeros((), dtype=torch.float32)
     else:
         raise NativeExpertPrecisionError(
@@ -377,20 +448,29 @@ def _smoke_native_pair(
     if not available:
         return False, note
     try:
-        generator = torch.Generator(device="cpu").manual_seed(1204)
-        input_cpu = torch.randn((7, 37), generator=generator)
-        weight_cpu = torch.randn((23, 37), generator=generator)
-        grad_cpu = torch.randn((7, 23), generator=generator)
-        input = input_cpu.to(device=device, dtype=torch.bfloat16).requires_grad_(True)
-        weight = weight_cpu.to(device=device, dtype=torch.bfloat16).requires_grad_(True)
-        grad_output = grad_cpu.to(device=device, dtype=torch.bfloat16)
-        output = native_expert_linear(
-            input,
-            weight,
-            weight_format=weight_format,
-            activation_format=activation_format,
-        )
-        output.backward(grad_output)
+        # This probe is also reached lazily from ``generate_tokens``, whose
+        # public contract runs under ``torch.inference_mode``.  Build ordinary
+        # autograd tensors explicitly so an uncached, working provider is not
+        # rejected merely because its first caller is inference.
+        with (
+            torch.inference_mode(False),
+            torch.enable_grad(),
+            torch.cuda.device(device_index),
+        ):
+            generator = torch.Generator(device="cpu").manual_seed(1204)
+            input_cpu = torch.randn((7, 37), generator=generator)
+            weight_cpu = torch.randn((23, 37), generator=generator)
+            grad_cpu = torch.randn((7, 23), generator=generator)
+            input = input_cpu.to(device=device, dtype=torch.bfloat16).requires_grad_(True)
+            weight = weight_cpu.to(device=device, dtype=torch.bfloat16).requires_grad_(True)
+            grad_output = grad_cpu.to(device=device, dtype=torch.bfloat16)
+            output = native_expert_linear(
+                input,
+                weight,
+                weight_format=weight_format,
+                activation_format=activation_format,
+            )
+            output.backward(grad_output)
         torch.cuda.synchronize(device)
         if not (
             bool(torch.isfinite(output).all())

@@ -95,9 +95,9 @@ class MicroExpertsConfig:
     expert_execution: Literal["grouped", "loop"] = "grouped"
     expert_weight_format: ExpertWeightFormat = "bfloat16"
     expert_activation_format: ExpertActivationFormat = "bfloat16"
-    expert_master_dtype: Literal["bfloat16"] = "bfloat16"
+    expert_master_dtype: Literal["bfloat16", "float32"] = "bfloat16"
     expert_qat_backend: Literal["auto", "native"] = "auto"
-    expert_promotion_format: Literal["mxfp8", "bfloat16"] = "bfloat16"
+    expert_promotion_format: Literal["mxfp8", "bfloat16", "float32"] = "bfloat16"
     potentiation_budget: int = 0
     potentiation_ema_decay: float = 0.95
     potentiation_warmup_steps: int = 4
@@ -129,24 +129,36 @@ class MicroExpertsConfig:
             raise ValueError(
                 f"expert_activation_format must be one of {EXPERT_ACTIVATION_FORMATS}"
             )
-        if self.expert_master_dtype != "bfloat16":
-            raise ValueError("expert_master_dtype must be 'bfloat16'")
+        if self.expert_master_dtype not in {"bfloat16", "float32"}:
+            raise ValueError("expert_master_dtype must be 'bfloat16' or 'float32'")
         if self.expert_qat_backend not in {"auto", "native"}:
             raise ValueError("expert_qat_backend must be 'auto' or 'native'")
-        if self.expert_promotion_format not in {"mxfp8", "bfloat16"}:
-            raise ValueError("expert_promotion_format must be 'mxfp8' or 'bfloat16'")
-        if self.expert_weight_format == "bfloat16":
-            if self.expert_activation_format != "bfloat16":
-                raise ValueError("BF16 expert weights require BF16 activations")
-            if self.expert_master_dtype != "bfloat16":
-                raise ValueError("BF16 expert execution requires BF16 master parameters")
+        if self.expert_promotion_format not in {"mxfp8", "bfloat16", "float32"}:
+            raise ValueError(
+                "expert_promotion_format must be 'mxfp8', 'bfloat16', or 'float32'"
+            )
+        if self.expert_weight_format in {"bfloat16", "float32"}:
+            if self.expert_activation_format != self.expert_weight_format:
+                raise ValueError(
+                    f"{self.expert_weight_format.upper()} expert weights require matching "
+                    "activations"
+                )
+            if self.expert_master_dtype != self.expert_weight_format:
+                raise ValueError(
+                    f"{self.expert_weight_format.upper()} expert execution requires matching "
+                    "master parameters"
+                )
             if self.potentiation_budget:
                 raise ValueError(
-                    "BF16 expert execution has no higher promotion tier; "
+                    f"{self.expert_weight_format.upper()} expert execution has no higher "
+                    "promotion tier; "
                     "potentiation_budget must be zero"
                 )
-            if self.expert_promotion_format != "bfloat16":
-                raise ValueError("BF16 expert execution requires BF16 promotion format")
+            if self.expert_promotion_format != self.expert_weight_format:
+                raise ValueError(
+                    f"{self.expert_weight_format.upper()} expert execution requires matching "
+                    "promotion format"
+                )
         else:
             allowed_activations = (
                 {"mxfp8", "nvfp4"}
@@ -163,6 +175,8 @@ class MicroExpertsConfig:
                 raise ValueError(
                     "low-precision expert training requires one BF16 master parameter payload"
                 )
+            if self.expert_promotion_format == "float32":
+                raise ValueError("low-precision experts do not expose an FP32 promotion lane")
         if not 0 <= self.potentiation_budget <= self.num_experts:
             raise ValueError(
                 "potentiation_budget must be between zero and num_experts; "
@@ -263,13 +277,14 @@ class MicroExpertsConfig:
             "mxfp6": 6,
             "mxfp8": 8,
             "bfloat16": 16,
+            "float32": 32,
         }[self.expert_weight_format]
 
     @property
     def expert_master_bits(self) -> int:
         """Width of the single persistent trainable expert weight copy."""
 
-        return 16
+        return 16 if self.expert_master_dtype == "bfloat16" else 32
 
 
 def _require_positive(name: str, value: int) -> None:

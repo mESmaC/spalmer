@@ -681,7 +681,10 @@ def _reject_emulated_checkpoint_precision(
         retired_expert_fields.append("expert_fake_quantization=true")
     if bool(experts_config.get("expert_stochastic_rounding", False)):
         retired_expert_fields.append("expert_stochastic_rounding=true")
-    if experts_config.get("expert_master_dtype") == "float32":
+    if (
+        experts_config.get("expert_master_dtype") == "float32"
+        and experts_config.get("expert_weight_format") != "float32"
+    ):
         retired_expert_fields.append("expert_master_dtype=float32")
     if retired_expert_fields:
         raise ValueError(

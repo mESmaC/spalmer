@@ -23,11 +23,11 @@ def test_expert_execution_reports_exact_bounded_padding_scalars(execution: str) 
             max_active_experts=4,
             max_resident_experts=4,
             expert_execution=execution,
-            expert_weight_format="bfloat16",
-            expert_activation_format="bfloat16",
-            expert_master_dtype="bfloat16",
+            expert_weight_format="float32",
+            expert_activation_format="float32",
+            expert_master_dtype="float32",
             expert_qat_backend="auto",
-            expert_promotion_format="bfloat16",
+            expert_promotion_format="float32",
             potentiation_budget=0,
         )
     ).eval()

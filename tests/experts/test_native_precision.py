@@ -90,6 +90,29 @@ def test_native_expert_dispatch_never_falls_back_for_unknown_pair() -> None:
         )
 
 
+def test_native_bf16_dispatch_rejects_fp32_operands() -> None:
+    values = torch.ones((2, 4), dtype=torch.float32)
+    with pytest.raises(NativeExpertPrecisionError, match="requires BF16"):
+        native_expert_linear(
+            values,
+            values,
+            weight_format="bfloat16",
+            activation_format="bfloat16",
+        )
+
+
+def test_native_float32_dispatch_is_an_explicit_cpu_pair() -> None:
+    input = torch.randn((2, 4), dtype=torch.float32)
+    weight = torch.randn((3, 4), dtype=torch.float32)
+    actual = native_expert_linear(
+        input,
+        weight,
+        weight_format="float32",
+        activation_format="float32",
+    )
+    torch.testing.assert_close(actual, torch.nn.functional.linear(input, weight))
+
+
 @pytest.mark.parametrize(
     ("weight_format", "activation_format", "forward_tolerance"),
     [
@@ -146,7 +169,7 @@ def test_expert_bank_validates_and_caches_the_actual_execution_device(
 
     class Report:
         def require(self, weight_format: str, activation_format: str):
-            assert (weight_format, activation_format) == ("bfloat16", "bfloat16")
+            assert (weight_format, activation_format) == ("float32", "float32")
             return capability
 
     def detect(device: torch.device):
@@ -164,6 +187,10 @@ def test_expert_bank_validates_and_caches_the_actual_execution_device(
         min_resident_experts=1,
         max_resident_experts=2,
         expert_execution="loop",
+        expert_weight_format="float32",
+        expert_activation_format="float32",
+        expert_master_dtype="float32",
+        expert_promotion_format="float32",
     )
     bank = MicroExpertBank(config)
     assert devices == []

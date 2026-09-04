@@ -167,11 +167,11 @@ def _bundle_inputs(
         num_experts=4,
         expert_inter_dim=3,
         active_experts=2,
-        expert_weight_format="bfloat16",
-        expert_activation_format="bfloat16",
-        expert_master_dtype="bfloat16",
+        expert_weight_format="float32",
+        expert_activation_format="float32",
+        expert_master_dtype="float32",
         expert_qat_backend="auto",
-        expert_promotion_format="bfloat16",
+        expert_promotion_format="float32",
     )
     return model_config, kda_config, mla_config, experts_config
 
@@ -188,7 +188,7 @@ def _save_bundle(
     torch.manual_seed(0)
     model = build_spalmer_model(
         model_config, kda_config, mla_config, experts_config
-    ).to(dtype=torch.bfloat16).eval()
+    ).to(dtype=torch.float32).eval()
     save_checkpoint(
         path,
         model,
@@ -371,7 +371,10 @@ def test_v7_fake_qat_ple_metadata_is_rejected_before_construction(tmp_path: Path
         {"expert_stochastic_rounding": True},
         {"expert_qat_backend": "reference"},
         {"expert_weight_format": "legacy_int"},
-        {"expert_master_dtype": "float32"},
+        {
+            "expert_weight_format": "bfloat16",
+            "expert_activation_format": "bfloat16",
+        },
     ],
 )
 def test_v8_emulated_expert_metadata_is_rejected_before_construction(
@@ -440,7 +443,7 @@ def test_adapter_presence_must_match_config(tmp_path: Path) -> None:
     flat_inputs = _bundle_inputs(vocab, None)
 
     torch.manual_seed(0)
-    recurrent = build_spalmer_model(*recurrent_inputs).to(dtype=torch.bfloat16).eval()
+    recurrent = build_spalmer_model(*recurrent_inputs).to(dtype=torch.float32).eval()
     recurrent.backbone.recurrence = None
     with pytest.raises(ValueError, match="recurrence configuration disagrees"):
         save_checkpoint(
@@ -453,7 +456,7 @@ def test_adapter_presence_must_match_config(tmp_path: Path) -> None:
         )
 
     torch.manual_seed(0)
-    flat = build_spalmer_model(*flat_inputs).to(dtype=torch.bfloat16).eval()
+    flat = build_spalmer_model(*flat_inputs).to(dtype=torch.float32).eval()
     flat.backbone.recurrence = LatentRecurrence(flat.config.d_model)
     with pytest.raises(ValueError, match="recurrence configuration disagrees"):
         save_checkpoint(

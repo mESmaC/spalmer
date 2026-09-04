@@ -6,6 +6,7 @@ import types
 
 import pytest
 
+import spalmer.precision as precision_module
 from spalmer.__main__ import _plan_parser, _precision_parser, _run_precision, _training_parser
 from spalmer.config import PLEConfig, SPALMERConfig
 from spalmer.experts import MicroExpertsConfig
@@ -106,17 +107,26 @@ def test_expert_emulation_has_no_private_construction_bypass() -> None:
         )
 
 
-def test_capability_report_exposes_only_real_selectable_pairs_on_cpu() -> None:
+def test_capability_report_exposes_only_real_selectable_pairs_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        precision_module.torch.cpu,
+        "_is_avx512_bf16_supported",
+        lambda: False,
+        raising=False,
+    )
     report = detect_precision_capabilities("cpu")
 
-    assert report.supports("bfloat16", "bfloat16")
+    assert not report.supports("bfloat16", "bfloat16")
+    assert report.supports("float32", "float32")
     assert not report.supports("mxfp4", "mxfp8")
-    assert report.selectable_weight_formats == ("bfloat16",)
-    bf16 = report.require("bfloat16", "bfloat16")
-    assert bf16.provider_id == "bf16_torch"
-    assert bf16.selectable
+    assert report.selectable_weight_formats == ("float32",)
+    fp32 = report.require("float32", "float32")
+    assert fp32.provider_id == "fp32_torch_cpu"
+    assert fp32.selectable
     assert report.to_dict()["selectable_pairs"] == [
-        {"weight_format": "bfloat16", "activation_format": "bfloat16"}
+        {"weight_format": "float32", "activation_format": "float32"}
     ]
 
 
@@ -172,7 +182,15 @@ def test_emulation_cannot_register_as_a_precision_provider() -> None:
         )
 
 
-def test_cli_surfaces_have_no_fake_or_reference_choices(capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_surfaces_have_no_fake_or_reference_choices(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        precision_module.torch.cpu,
+        "_is_avx512_bf16_supported",
+        lambda: False,
+        raising=False,
+    )
     plan = _plan_parser(device="cpu")
     training = _training_parser(device="cpu")
     assert "fake_qat" not in plan.format_help()
@@ -193,5 +211,5 @@ def test_cli_surfaces_have_no_fake_or_reference_choices(capsys: pytest.CaptureFi
     _run_precision(args)
     payload = json.loads(capsys.readouterr().out)
     assert payload["selectable_pairs"] == [
-        {"weight_format": "bfloat16", "activation_format": "bfloat16"}
+        {"weight_format": "float32", "activation_format": "float32"}
     ]

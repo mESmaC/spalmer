@@ -225,6 +225,7 @@ def build_configs(
         "expert_weight_format": config.expert_weight_format,
         "expert_activation_format": config.expert_activation_format,
         "expert_master_dtype": config.expert_master_dtype,
+        "expert_promotion_format": config.expert_master_dtype,
     }
     expert_fields.update(expert_extra)
     experts = MicroExpertsConfig(**expert_fields)

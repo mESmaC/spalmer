@@ -36,11 +36,11 @@ def _build(num_experts: int = 8, **overrides: object):
         "active_experts": 2,
         "max_active_experts": 6,
         "potentiation_budget": 0,
-        "expert_weight_format": "bfloat16",
-        "expert_activation_format": "bfloat16",
-        "expert_master_dtype": "bfloat16",
+        "expert_weight_format": "float32",
+        "expert_activation_format": "float32",
+        "expert_master_dtype": "float32",
         "expert_qat_backend": "auto",
-        "expert_promotion_format": "bfloat16",
+        "expert_promotion_format": "float32",
     }
     values.update(overrides)
     experts = MicroExpertsConfig(**values)
@@ -186,7 +186,6 @@ def test_explicit_initial_ids_obey_resident_cap_independently_of_execution_cap()
 
 def test_training_tracks_average_surprise_and_checkpoints_carry_it(tmp_path) -> None:
     model, vocab, (kda, mla, experts) = _build()
-    model.to(dtype=torch.bfloat16)
     tokens = torch.tensor(Encoder(vocab).encode("alpha beta gamma delta epsilon zeta " * 8))
     result = train_token_stream(model, tokens, steps=3, batch_size=2, sequence_length=8)
     assert result.average_surprise > 0
@@ -198,7 +197,9 @@ def test_training_tracks_average_surprise_and_checkpoints_carry_it(tmp_path) -> 
     restored, _, _ = load_checkpoint(path)
     assert restored.average_surprise == pytest.approx(model.average_surprise)
 
-    # A version-2 bundle predates the buffers and the residency fields.
+    # A version-2 bundle predates QR-PLE and therefore depends on the retired
+    # fake-QAT topology.  Native-only SPALMER must reject it before attempting
+    # any state migration.
     payload = torch.load(path, weights_only=False)
     payload["format_version"] = 2
     payload["model_config"].pop("surprise_ema_decay")
@@ -217,8 +218,8 @@ def test_training_tracks_average_surprise_and_checkpoints_carry_it(tmp_path) -> 
     payload["metadata"]["average_surprise"] = 1.5
     legacy = tmp_path / "v2.pt"
     torch.save(payload, legacy)
-    legacy_model, _, _ = load_checkpoint(legacy)
-    assert legacy_model.average_surprise == pytest.approx(1.5)
+    with pytest.raises(ValueError, match="predates QR-PLE"):
+        load_checkpoint(legacy)
 
     hybrid_payload = torch.load(path, weights_only=False)
     hybrid_payload["format_version"] = 2
@@ -236,7 +237,7 @@ def test_training_tracks_average_surprise_and_checkpoints_carry_it(tmp_path) -> 
         hybrid_payload["experts_config"].pop(field)
     hybrid = tmp_path / "hybrid-v2.pt"
     torch.save(hybrid_payload, hybrid)
-    with pytest.raises(RuntimeError, match="surprise_ema"):
+    with pytest.raises(ValueError, match="predates QR-PLE"):
         load_checkpoint(hybrid)
 
     missing_config_payload = torch.load(path, weights_only=False)

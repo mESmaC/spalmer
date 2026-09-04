@@ -14,6 +14,7 @@ from spalmer.attention import KDAConfig, MLAConfig
 from spalmer.config import SPALMERConfig
 from spalmer.experts import MicroExpertBank, MicroExpertsConfig
 from spalmer.factory import build_spalmer_model
+from spalmer.precision import detect_precision_capabilities
 
 
 def _experts(**overrides: object) -> MicroExpertsConfig:
@@ -26,16 +27,16 @@ def _experts(**overrides: object) -> MicroExpertsConfig:
         "max_active_experts": 4,
         "max_resident_experts": 4,
         "potentiation_budget": 0,
-        "expert_weight_format": "bfloat16",
-        "expert_activation_format": "bfloat16",
-        "expert_master_dtype": "bfloat16",
-        "expert_promotion_format": "bfloat16",
+        "expert_weight_format": "float32",
+        "expert_activation_format": "float32",
+        "expert_master_dtype": "float32",
+        "expert_promotion_format": "float32",
     }
     values.update(overrides)
     return MicroExpertsConfig(**values)
 
 
-def _tiny_model():
+def _tiny_model(experts: MicroExpertsConfig | None = None):
     model_config = SPALMERConfig(
         vocab_size=16,
         d_model=8,
@@ -52,7 +53,7 @@ def _tiny_model():
         q_latent_dim=4,
         kv_latent_dim=4,
     )
-    return build_spalmer_model(model_config, kda, mla, _experts()).eval()
+    return build_spalmer_model(model_config, kda, mla, experts or _experts()).eval()
 
 
 def _banks(model) -> tuple[MicroExpertBank, ...]:
@@ -235,7 +236,17 @@ def test_cached_global_id_mapping_preserves_native_execution_numerics() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_forward_uses_cpu_masters_and_bounded_resident_caches() -> None:
-    model = _tiny_model()
+    if not detect_precision_capabilities("cuda").supports("bfloat16", "bfloat16"):
+        pytest.skip("verified native CUDA BF16 forward/backward is unavailable")
+    if not detect_precision_capabilities("cpu").supports("bfloat16", "bfloat16"):
+        pytest.skip("verified native CPU BF16 forward/backward is unavailable")
+    experts = _experts(
+        expert_weight_format="bfloat16",
+        expert_activation_format="bfloat16",
+        expert_master_dtype="bfloat16",
+        expert_promotion_format="bfloat16",
+    )
+    model = _tiny_model(experts).to(dtype=torch.bfloat16)
     resident_ids = (1, 4)
     model.residency.set(resident_ids)
     input_ids = torch.tensor([[1, 3, 5, 7]], dtype=torch.long)

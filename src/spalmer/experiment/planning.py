@@ -162,7 +162,7 @@ class ModelScaleConfig:
     max_resident_experts: int = 20
     expert_weight_format: ExpertWeightFormat = "bfloat16"
     expert_activation_format: ExpertActivationFormat = "bfloat16"
-    expert_master_dtype: Literal["bfloat16"] = "bfloat16"
+    expert_master_dtype: Literal["bfloat16", "float32"] = "bfloat16"
     directional: DirectionalScaleConfig | None = None
     atxy: ATXYScaleConfig | None = None
     recurrence: RecurrenceScaleConfig | None = None
@@ -211,9 +211,12 @@ class ModelScaleConfig:
             raise ValueError(
                 f"expert_activation_format must be one of {EXPERT_ACTIVATION_FORMATS}"
             )
-        if self.expert_weight_format == "bfloat16":
-            if self.expert_activation_format != "bfloat16":
-                raise ValueError("BF16 expert weights require BF16 activations")
+        if self.expert_weight_format in {"bfloat16", "float32"}:
+            if self.expert_activation_format != self.expert_weight_format:
+                raise ValueError(
+                    f"{self.expert_weight_format.upper()} expert weights require matching "
+                    "activations"
+                )
         elif self.expert_weight_format == "nvfp4":
             if self.expert_activation_format not in {"nvfp4", "mxfp8"}:
                 raise ValueError("NVFP4 expert weights require NVFP4 or MXFP8 activations")
@@ -221,8 +224,14 @@ class ModelScaleConfig:
             raise ValueError(
                 f"{self.expert_weight_format.upper()} expert weights require MXFP8 activations"
             )
-        if self.expert_master_dtype != "bfloat16":
-            raise ValueError("expert_master_dtype must be 'bfloat16'")
+        expected_master = (
+            "float32" if self.expert_weight_format == "float32" else "bfloat16"
+        )
+        if self.expert_master_dtype != expected_master:
+            raise ValueError(
+                f"{self.expert_weight_format.upper()} expert planning requires "
+                f"expert_master_dtype={expected_master!r}"
+            )
         if self.ple_backend not in PLE_BACKENDS:
             raise ValueError("ple_backend must be 'qr'; fake-QAT PLE is retired")
         if self.directional is not None:
@@ -505,7 +514,11 @@ def count_parameters(config: ModelScaleConfig) -> ParameterBreakdown:
         lm_head=lm_head,
         ple_exact_input=ple_exact_input,
         ple_qr_refresh=ple_qr_refresh,
-        expert_low_bit=(expert_banks if config.expert_weight_format != "bfloat16" else 0),
+        expert_low_bit=(
+            expert_banks
+            if config.expert_weight_format not in {"bfloat16", "float32"}
+            else 0
+        ),
     )
 
 
@@ -855,6 +868,7 @@ def plan_configuration(
         raise ValueError(f"expert_weight_format must be one of {EXPERT_WEIGHT_FORMATS}")
     resolved_activation = expert_activation_format or {
         "bfloat16": "bfloat16",
+        "float32": "float32",
         "nvfp4": "nvfp4",
     }.get(expert_weight_format, "mxfp8")
     candidates: list[tuple[tuple[int, ...], ModelScaleConfig, ParameterBreakdown]] = []
@@ -897,6 +911,11 @@ def plan_configuration(
                                 max_resident_experts=min(20, search_space.num_experts),
                                 expert_weight_format=expert_weight_format,
                                 expert_activation_format=resolved_activation,
+                                expert_master_dtype=(
+                                    "float32"
+                                    if expert_weight_format == "float32"
+                                    else "bfloat16"
+                                ),
                                 directional=directional,
                                 atxy=atxy,
                                 recurrence=recurrence,

@@ -35,6 +35,10 @@ def _experts(**overrides: object) -> MicroExpertsConfig:
         "active_experts": 2,
         "max_resident_experts": 6,
         "potentiation_budget": 0,
+        "expert_weight_format": "float32",
+        "expert_activation_format": "float32",
+        "expert_master_dtype": "float32",
+        "expert_promotion_format": "float32",
     }
     values.update(overrides)
     return MicroExpertsConfig(**values)
@@ -229,9 +233,9 @@ def test_accounting_matches_tensor_sums_and_moves_by_whole_experts() -> None:
     model.residency.expand([7])
     three = model.parameter_accounting()
     assert three.resident_parameters - two.resident_parameters == accounting.parameters_per_expert
-    # Persistent storage and execution both use the selected native BF16 lane.
-    assert three.nominal_bits["expert_pool"] == 16
-    assert three.execution_bits["expert_pool"] == 16
+    # Persistent storage and execution both use the selected native FP32 lane.
+    assert three.nominal_bits["expert_pool"] == 32
+    assert three.execution_bits["expert_pool"] == 32
     assert three.nominal_bits["embeddings"] == 32
     assert "embeddings" not in three.execution_bits
     assert three.actual_parameter_bytes == sum(

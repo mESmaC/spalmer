@@ -9,6 +9,7 @@ import torch
 
 from spalmer.experts import MicroExpertBank, MicroExpertsConfig
 from spalmer.experts.bank import _power_of_two_count_buckets
+from spalmer.precision import detect_precision_capabilities
 
 
 def _config(*, execution: str, num_experts: int = 8) -> MicroExpertsConfig:
@@ -22,8 +23,10 @@ def _config(*, execution: str, num_experts: int = 8) -> MicroExpertsConfig:
         min_resident_experts=2,
         max_resident_experts=min(8, num_experts),
         expert_execution=execution,
-        expert_weight_format="bfloat16",
-        expert_activation_format="bfloat16",
+        expert_weight_format="float32",
+        expert_activation_format="float32",
+        expert_master_dtype="float32",
+        expert_promotion_format="float32",
         potentiation_budget=0,
     )
 
@@ -81,16 +84,21 @@ def test_bucketed_grouped_forward_and_backward_match_expert_loop() -> None:
 
 
 @pytest.mark.parametrize("execution", ["loop", "grouped"])
-@pytest.mark.parametrize("hidden_dtype", [torch.bfloat16, torch.float32])
-def test_mixed_precision_routes_reduce_in_hidden_dtype(
-    execution: str,
-    hidden_dtype: torch.dtype,
-) -> None:
+def test_bf16_routes_reduce_in_hidden_dtype(execution: str) -> None:
     """Autocast expert GEMMs and FP32 probabilities follow the residual dtype."""
 
+    if not detect_precision_capabilities("cpu").supports("bfloat16", "bfloat16"):
+        pytest.skip("verified native CPU BF16 forward/backward is unavailable")
     torch.manual_seed(43)
-    bank = MicroExpertBank(_config(execution=execution)).to(dtype=torch.bfloat16)
-    hidden_states = torch.randn(7, 8, dtype=hidden_dtype, requires_grad=True)
+    config = replace(
+        _config(execution=execution),
+        expert_weight_format="bfloat16",
+        expert_activation_format="bfloat16",
+        expert_master_dtype="bfloat16",
+        expert_promotion_format="bfloat16",
+    )
+    bank = MicroExpertBank(config).to(dtype=torch.bfloat16)
+    hidden_states = torch.randn(7, 8, dtype=torch.bfloat16, requires_grad=True)
     token_index = torch.arange(7).repeat_interleave(2)
     expert_index = torch.tensor((0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7))
     routing_weights = torch.rand(7, 2, dtype=torch.float32)
@@ -107,7 +115,7 @@ def test_mixed_precision_routes_reduce_in_hidden_dtype(
             routing_weights,
         )
 
-    assert output.dtype == hidden_dtype
+    assert output.dtype == torch.bfloat16
     output.float().square().mean().backward()
     assert routing_weights.grad is not None
     assert routing_weights.grad.dtype == torch.float32

@@ -23,8 +23,10 @@ from typing import Any, Literal
 
 import torch
 
-ExpertWeightFormat = Literal["mxfp4", "nvfp4", "mxfp6", "mxfp8", "bfloat16"]
-ExpertActivationFormat = Literal["mxfp8", "nvfp4", "bfloat16"]
+ExpertWeightFormat = Literal[
+    "mxfp4", "nvfp4", "mxfp6", "mxfp8", "bfloat16", "float32"
+]
+ExpertActivationFormat = Literal["mxfp8", "nvfp4", "bfloat16", "float32"]
 
 EXPERT_WEIGHT_FORMATS: tuple[ExpertWeightFormat, ...] = (
     "mxfp4",
@@ -32,11 +34,13 @@ EXPERT_WEIGHT_FORMATS: tuple[ExpertWeightFormat, ...] = (
     "mxfp6",
     "mxfp8",
     "bfloat16",
+    "float32",
 )
 EXPERT_ACTIVATION_FORMATS: tuple[ExpertActivationFormat, ...] = (
     "mxfp8",
     "nvfp4",
     "bfloat16",
+    "float32",
 )
 
 _FORBIDDEN_PROVIDER_MARKERS = ("fake", "emulat", "reference")
@@ -214,7 +218,7 @@ def detect_precision_capabilities(
 
     resolved = _resolve_device(device)
     device_name, compute_capability = _device_metadata(resolved)
-    capabilities = [_bf16_capability(resolved)]
+    capabilities = [_bf16_capability(resolved), _float32_capability(resolved)]
     native, diagnostics = _native_capabilities(resolved)
     capabilities.extend(native)
 
@@ -277,8 +281,39 @@ def _device_metadata(
 
 def _bf16_capability(device: torch.device) -> ExpertPrecisionCapability:
     if device.type == "cpu":
-        available = True
-        detail = "PyTorch dense BF16 forward/backward"
+        try:
+            hardware_probe = getattr(torch.cpu, "_is_avx512_bf16_supported", None)
+            if not callable(hardware_probe) or not bool(hardware_probe()):
+                raise RuntimeError("CPU does not report AVX512_BF16 support")
+            # A feature bit alone is insufficient. Verify the same BF16
+            # forward/backward family used by the expert bank while explicitly
+            # escaping a possible inference-mode caller.
+            with torch.inference_mode(False), torch.enable_grad():
+                generator = torch.Generator(device="cpu").manual_seed(1616)
+                left = torch.randn((8, 16), generator=generator).to(
+                    dtype=torch.bfloat16
+                ).requires_grad_(True)
+                right = torch.randn((16, 8), generator=generator).to(
+                    dtype=torch.bfloat16
+                ).requires_grad_(True)
+                output = left @ right
+                gradients = torch.autograd.grad(
+                    output.float().square().mean(),
+                    (left, right),
+                )
+            available = bool(torch.isfinite(output).all()) and all(
+                bool(torch.isfinite(gradient).all()) for gradient in gradients
+            )
+            if not available:
+                raise RuntimeError("CPU BF16 smoke returned non-finite values")
+            detail = "native AVX512_BF16 PyTorch forward/backward smoke passed"
+        except (AssertionError, AttributeError, RuntimeError, TypeError, ValueError):
+            available = False
+            capability = getattr(torch.backends.cpu, "get_cpu_capability", lambda: "unknown")()
+            detail = (
+                "CPU has no verified native AVX512_BF16 forward/backward path "
+                f"(reported capability {capability})"
+            )
     elif device.type == "cuda" and torch.cuda.is_available():
         try:
             index = torch.cuda.current_device() if device.index is None else int(device.index)
@@ -316,6 +351,40 @@ def _bf16_capability(device: torch.device) -> ExpertPrecisionCapability:
         provider_id="bf16_torch",
         weight_format="bfloat16",
         activation_format="bfloat16",
+        forward_available=available,
+        backward_available=available,
+        grouped_available=available,
+        verified=available,
+        detail=detail,
+    )
+
+
+def _float32_capability(device: torch.device) -> ExpertPrecisionCapability:
+    """Expose an honest CPU/dev lane without relabelling FP32 as BF16."""
+
+    available = False
+    if device.type == "cpu":
+        try:
+            with torch.inference_mode(False), torch.enable_grad():
+                generator = torch.Generator(device="cpu").manual_seed(3232)
+                left = torch.randn((8, 16), generator=generator, requires_grad=True)
+                right = torch.randn((16, 8), generator=generator, requires_grad=True)
+                output = left @ right
+                gradients = torch.autograd.grad(output.square().mean(), (left, right))
+            available = bool(torch.isfinite(output).all()) and all(
+                bool(torch.isfinite(gradient).all()) for gradient in gradients
+            )
+        except (AssertionError, RuntimeError, TypeError, ValueError):
+            available = False
+    detail = (
+        "native PyTorch CPU FP32 forward/backward smoke passed"
+        if available
+        else "FP32 dev expert execution is exposed only on a verified CPU path"
+    )
+    return ExpertPrecisionCapability(
+        provider_id="fp32_torch_cpu",
+        weight_format="float32",
+        activation_format="float32",
         forward_available=available,
         backward_available=available,
         grouped_available=available,

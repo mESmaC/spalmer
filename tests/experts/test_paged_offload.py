@@ -31,10 +31,10 @@ def _experts(**overrides: object) -> MicroExpertsConfig:
         "max_resident_experts": 4,
         "potentiation_budget": 0,
         "expert_execution": "grouped",
-        "expert_weight_format": "bfloat16",
-        "expert_activation_format": "bfloat16",
-        "expert_master_dtype": "bfloat16",
-        "expert_promotion_format": "bfloat16",
+        "expert_weight_format": "float32",
+        "expert_activation_format": "float32",
+        "expert_master_dtype": "float32",
+        "expert_promotion_format": "float32",
     }
     values.update(overrides)
     return MicroExpertsConfig(**values)
