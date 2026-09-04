@@ -80,6 +80,12 @@ otherwise runs the plain-PyTorch correctness backend.
 The project favors the simplest faithful implementation of each drafted
 component and records experimental limitations explicitly.
 
+The [architecture research plan](docs/architecture-research-plan.md) records
+candidate improvements and their evidence. The selected next study is the
+[micro-expert granularity and NLL-calibration experiment](docs/micro-expert-nll-experiment.md),
+followed by selective precision promotion. These are proposed experiments,
+not measured performance improvements.
+
 ## Plan scales and prepare data
 
 Model size and vocabulary size are independent experiment inputs. A ladder can
