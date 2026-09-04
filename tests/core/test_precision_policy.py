@@ -186,6 +186,8 @@ def test_cli_surfaces_have_no_fake_or_reference_choices(capsys: pytest.CaptureFi
         )
     with pytest.raises(SystemExit):
         training.parse_args(["--smoke", "--expert-weight-format", "mxfp6"])
+    with pytest.raises(SystemExit):
+        training.parse_args(["--smoke", "--expert-promotion-format", "mxfp8"])
 
     args = _precision_parser().parse_args(["--device", "cpu", "--json"])
     _run_precision(args)

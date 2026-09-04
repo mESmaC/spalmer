@@ -203,6 +203,12 @@ def _training_parser(*, device: str | torch.device | None = None) -> argparse.Ar
     weight_formats, activation_formats, pair_text = _selectable_precision_cli_values(
         resolved_device
     )
+    capabilities = detect_precision_capabilities(resolved_device)
+    promotion_formats = (
+        ("mxfp8", "bfloat16")
+        if capabilities.supports("mxfp8", "mxfp8")
+        else ("bfloat16",)
+    )
     parser = argparse.ArgumentParser(
         prog="spalmer",
         description="Train a small SPALMER prototype",
@@ -246,8 +252,9 @@ def _training_parser(*, device: str | torch.device | None = None) -> argparse.Ar
     )
     parser.add_argument(
         "--expert-promotion-format",
-        choices=("mxfp8", "bfloat16"),
+        choices=promotion_formats,
         default="bfloat16",
+        help="device-verified whole-expert promotion precision",
     )
     parser.add_argument("--potentiation-budget", type=int, default=0)
     parser.add_argument("--potentiation-warmup-steps", type=int, default=4)
