@@ -29,11 +29,11 @@ def _experts(**overrides: object) -> MicroExpertsConfig:
         "active_experts": 2,
         "max_active_experts": 4,
         "max_resident_experts": 4,
-        "potentiation_budget": 1,
+        "potentiation_budget": 0,
         "expert_execution": "grouped",
-        "expert_weight_format": "legacy_int",
+        "expert_weight_format": "bfloat16",
         "expert_activation_format": "bfloat16",
-        "expert_master_dtype": "float32",
+        "expert_master_dtype": "bfloat16",
         "expert_promotion_format": "bfloat16",
     }
     values.update(overrides)
@@ -90,22 +90,17 @@ def test_paged_prefill_matches_unrestricted_when_unique_experts_exceed_capacity(
     expert_index = torch.tensor((5, 1, 4, 2, 0, 5, 3, 1, 4, 5, 2, 3, 0, 5, 1, 4, 3, 5))
     routing_weights = torch.rand(expert_index.numel()).reshape(9, 2)
     routing_weights = (routing_weights / routing_weights.sum(dim=-1, keepdim=True)).reshape(-1)
-    promoted = torch.zeros(config.num_experts, dtype=torch.bool)
-    promoted[[1, 5]] = True
-
     expected = reference.execute_routing(
         hidden,
         token_index,
         expert_index,
         routing_weights,
-        promoted_mask=promoted,
     )
     actual = paged.execute_routing(
         hidden,
         token_index,
         expert_index,
         routing_weights,
-        promoted_mask=promoted,
     )
 
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
@@ -228,55 +223,8 @@ def test_paged_recurrent_decode_matches_unrestricted_across_steps() -> None:
     assert all(len(bank.cached_expert_ids) <= 1 for bank in _banks(paged))
 
 
-@pytest.mark.parametrize("weight_format", ["mxfp4", "nvfp4"])
-def test_paged_reference_fp4_formats_match_unrestricted(weight_format: str) -> None:
-    config = _experts(
-        expert_weight_format=weight_format,
-        expert_activation_format="mxfp8",
-        expert_master_dtype="bfloat16",
-        expert_qat_backend="reference",
-        expert_promotion_format="bfloat16",
-        potentiation_budget=2,
-    )
-    torch.manual_seed(29)
-    reference = MicroExpertBank(config).to(dtype=torch.bfloat16).eval()
-    paged = MicroExpertBank(config).to(dtype=torch.bfloat16).eval()
-    paged.load_state_dict(reference.state_dict())
-    _prepare_paged(paged, capacity=1)
-
-    hidden = torch.randn(6, config.d_model, dtype=torch.bfloat16)
-    token_index = torch.arange(6).repeat_interleave(2)
-    expert_index = torch.tensor((5, 0, 4, 1, 3, 2, 0, 5, 1, 4, 2, 3))
-    routing_weights = torch.rand(6, 2, dtype=torch.bfloat16)
-    routing_weights = (routing_weights / routing_weights.sum(dim=-1, keepdim=True)).reshape(-1)
-    promoted = torch.zeros(config.num_experts, dtype=torch.bool)
-    promoted[[1, 5]] = True
-
-    with torch.inference_mode():
-        expected = reference.execute_routing(
-            hidden,
-            token_index,
-            expert_index,
-            routing_weights,
-            promoted_mask=promoted,
-        )
-        actual = paged.execute_routing(
-            hidden,
-            token_index,
-            expert_index,
-            routing_weights,
-            promoted_mask=promoted,
-        )
-        expected_error = reference.quantization_error(expert_index)
-        actual_error = paged.quantization_error(expert_index)
-
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    torch.testing.assert_close(actual_error, expected_error, rtol=0, atol=0)
-    assert len(paged.cached_expert_ids) <= 1
-
-
 def test_layer_caches_page_independently_and_retain_hits() -> None:
-    config = _experts(expert_execution="loop", expert_fake_quantization=False)
+    config = _experts(expert_execution="loop")
     first = MicroExpertBank(config).eval()
     second = MicroExpertBank(config).eval()
     for bank in (first, second):
@@ -299,7 +247,7 @@ def test_layer_caches_page_independently_and_retain_hits() -> None:
 
 
 def test_transactional_page_failure_keeps_previous_cache_executable(monkeypatch) -> None:
-    bank = MicroExpertBank(_experts(expert_fake_quantization=False)).eval()
+    bank = MicroExpertBank(_experts()).eval()
     _prepare_paged(bank, capacity=2)
     bank._stage_expert_rows((1, 4))
     cached_before = (

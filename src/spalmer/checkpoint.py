@@ -33,7 +33,7 @@ from spalmer.tokenizer import (
 )
 
 FORMAT_NAME = "spalmer.prototype.checkpoint"
-FORMAT_VERSION = 7
+FORMAT_VERSION = 8
 _SUPPORTED_FORMAT_VERSIONS = set(range(1, FORMAT_VERSION + 1))
 CHECKPOINT_BINDING_METADATA_KEY = "_spalmer_checkpoint_binding"
 _CHECKPOINT_BINDING_ATTRIBUTE = "_spalmer_checkpoint_binding"
@@ -41,38 +41,26 @@ _MODEL_PARAMETER_DTYPES = {
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
 }
-# Version 3 added the shared average-surprise buffers on the language model and
-# the C13 residency fields of the expert configuration.
-_VERSION_3_EXPERT_FIELDS = {"residency_increment", "residency_min_gain"}
+# Version 3 added the shared average-surprise buffers on the language model.
 _VERSION_3_MODEL_BUFFERS = {"surprise_ema", "surprise_observations"}
 _VERSION_3_MODEL_CONFIG_FIELDS = {"surprise_ema_decay"}
 # Version 6 added the optional depth-recurrent core to the model config.
 _VERSION_6_MODEL_CONFIG_FIELDS = {"recurrence"}
-_VERSION_5_EXPERT_FIELDS = {
-    "expert_weight_format",
-    "expert_activation_format",
-    "expert_master_dtype",
-    "expert_qat_backend",
-    "expert_promotion_format",
+# Version 8 physically removed the ignored knobs that belonged to the retired
+# full-table fake-QAT PLE. Version-7 QR checkpoints are losslessly migrated by
+# validating and then discarding these fields.
+_VERSION_7_RETIRED_PLE_FIELDS = {
+    "ple_quant_bits",
+    "ple_stochastic_rounding",
+    "ple_sparse_gradients",
+    "ple_alternation_policy",
+    "ple_reference_max_numel",
 }
-_POST_V3_EXPERT_FIELDS = {
-    "shared_inter_dim",
-    "min_resident_experts",
-    "max_resident_experts",
-    "expert_execution",
+_VERSION_7_RETIRED_EXPERT_FIELDS = {
+    "expert_quant_bits",
+    "expert_fake_quantization",
+    "expert_stochastic_rounding",
 }
-_VERSION_1_EXPERT_FIELDS = {
-    "d_model",
-    "num_experts",
-    "expert_inter_dim",
-    "active_experts",
-    "min_active_experts",
-    "max_active_experts",
-    "router_bias",
-    "initializer_range",
-}
-
-
 def save_checkpoint(
     path: str | Path,
     model: SPALMERCausalLM,
@@ -89,6 +77,7 @@ def save_checkpoint(
 ) -> Path:
     """Persist model weights, construction inputs, and an optional run-state binding."""
 
+    _reject_emulated_checkpoint_precision(model.config.to_dict(), asdict(experts_config))
     _validate_model_tokenizer(model.config, vocab)
     _validate_model_attention_configs(model, kda_config, mla_config)
     _validate_model_experts_config(model, experts_config)
@@ -507,18 +496,33 @@ def load_checkpoint(
                 "but carries a recurrence configuration"
             )
     if checkpoint_version < 7:
-        # QR-PLE has a different parameter topology and cannot be inferred from
-        # legacy state tensors.  Missing keys resolve to the only historical
-        # backend; an explicitly backdated QR declaration is rejected instead
-        # of attempting a weight migration.
+        # Every pre-v7 bundle uses the removed full-table PLE topology. An
+        # explicitly backdated QR declaration is corrupt rather than migratable.
         legacy_backend = raw_model_config.get("ple_backend", "fake_qat")
         if legacy_backend != "fake_qat":
             raise ValueError(
                 f"checkpoint version {checkpoint_version} predates QR-PLE "
                 f"but declares PLE backend {legacy_backend!r}"
             )
-        raw_model_config.setdefault("ple_backend", "fake_qat")
-    _require_config_schema("model", raw_model_config, required_model)
+        raise ValueError(
+            "checkpoint requests retired fake-QAT PLE; SPALMER no longer executes "
+            "emulated precision and has no fake fallback"
+        )
+    if checkpoint_version == 7:
+        _require_config_schema(
+            "model",
+            raw_model_config,
+            required_model | _VERSION_7_RETIRED_PLE_FIELDS,
+        )
+        if raw_model_config.get("ple_backend") != "qr":
+            raise ValueError(
+                "checkpoint requests retired fake-QAT PLE; SPALMER no longer executes "
+                "emulated precision and has no fake fallback"
+            )
+        for field in _VERSION_7_RETIRED_PLE_FIELDS:
+            raw_model_config.pop(field)
+    else:
+        _require_config_schema("model", raw_model_config, required_model)
     raw_recurrence = raw_model_config.get("recurrence")
     if isinstance(raw_recurrence, Mapping):
         _require_config_schema(
@@ -526,6 +530,12 @@ def load_checkpoint(
             dict(raw_recurrence),
             {field.name for field in fields(RecurrenceConfig)},
         )
+    raw_experts_payload = dict(payload["experts_config"])
+    _reject_emulated_checkpoint_precision(raw_model_config, raw_experts_payload)
+    raw_experts_config = _migrate_experts_config(
+        raw_experts_payload,
+        checkpoint_version,
+    )
     config = SPALMERConfig(**raw_model_config)
     raw_kda_config = dict(payload["kda_config"])
     raw_mla_config = dict(payload["mla_config"])
@@ -533,10 +543,6 @@ def load_checkpoint(
     _require_config_schema("MLA", raw_mla_config, {field.name for field in fields(MLAConfig)})
     kda_config = KDAConfig(**raw_kda_config)
     mla_config = MLAConfig(**raw_mla_config)
-    raw_experts_config = _migrate_experts_config(
-        dict(payload["experts_config"]),
-        checkpoint_version,
-    )
     legacy_experts = checkpoint_version == 1
     experts_config = MicroExpertsConfig(**raw_experts_config)
     model_parameter_dtype = _load_model_parameter_dtype(
@@ -633,80 +639,56 @@ def _migrate_experts_config(
     raw_config: dict[str, Any],
     checkpoint_version: int,
 ) -> dict[str, Any]:
-    """Upgrade historical expert configs without changing their numerics."""
+    """Validate the native expert schema used by loadable QR-PLE bundles."""
 
-    current_fields = {field.name for field in fields(MicroExpertsConfig)}
-    # The v5 and v6 expert schemas are identical; an equality gate here would
-    # reject every v5 bundle the moment FORMAT_VERSION moves past it.
-    if checkpoint_version >= 5:
-        _require_config_schema("expert", raw_config, current_fields)
-        return raw_config
-    if checkpoint_version == 1:
-        _require_config_schema("expert", raw_config, _VERSION_1_EXPERT_FIELDS)
-    else:
-        minimum_fields = current_fields - _VERSION_5_EXPERT_FIELDS - _POST_V3_EXPERT_FIELDS
-        if checkpoint_version == 2:
-            minimum_fields -= _VERSION_3_EXPERT_FIELDS
-        missing = minimum_fields - raw_config.keys()
-        unexpected = raw_config.keys() - (current_fields - _VERSION_5_EXPERT_FIELDS)
-        if missing or unexpected:
-            raise ValueError(
-                "checkpoint has invalid expert configuration fields: "
-                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
-            )
-
-    active = int(raw_config["active_experts"])
-    num_experts = int(raw_config["num_experts"])
-    min_active = int(raw_config.get("min_active_experts", min(2, active)))
-    max_active = int(raw_config.get("max_active_experts", max(active, min(20, num_experts))))
-    dense_v1 = checkpoint_version == 1
-    compatibility = MicroExpertsConfig(
-        d_model=int(raw_config["d_model"]),
-        num_experts=num_experts,
-        expert_inter_dim=raw_config.get("expert_inter_dim"),
-        shared_inter_dim=0,
-        active_experts=active,
-        min_active_experts=min_active,
-        max_active_experts=max_active,
-        min_resident_experts=active,
-        max_resident_experts=num_experts,
-        expert_execution="loop",
-        expert_weight_format="legacy_int",
-        expert_activation_format="bfloat16",
-        expert_master_dtype="float32",
-        expert_qat_backend="reference",
-        expert_promotion_format="bfloat16",
-        expert_fake_quantization=(
-            False if dense_v1 else bool(raw_config.get("expert_fake_quantization", True))
-        ),
-        potentiation_budget=(
-            0 if dense_v1 else int(raw_config.get("potentiation_budget", 0))
-        ),
-        router_score_transform=(
-            "identity" if dense_v1 else str(raw_config.get("router_score_transform", "identity"))
-        ),
-    )
-    migrated = asdict(compatibility)
-    migrated.update(raw_config)
-    # These fields did not exist before v5. Preserve the old integer fake-QAT
-    # path and FP32 parameter payload rather than silently changing outputs.
-    migrated.update(
-        expert_weight_format="legacy_int",
-        expert_activation_format="bfloat16",
-        expert_master_dtype="float32",
-        expert_qat_backend="reference",
-        expert_promotion_format="bfloat16",
-    )
-    # Pre-v5 residency and per-token execution capacity were independent, as
-    # they are now. Preserve both historical counts exactly.
-    if dense_v1:
-        migrated.update(
-            expert_fake_quantization=False,
-            potentiation_budget=0,
-            router_score_transform="identity",
+    if checkpoint_version < 7:
+        raise ValueError(
+            "pre-v7 SPALMER checkpoints require retired emulated precision and "
+            "cannot be loaded"
         )
-    _require_config_schema("expert", migrated, current_fields)
-    return migrated
+    expected = {field.name for field in fields(MicroExpertsConfig)}
+    if checkpoint_version == 7:
+        _require_config_schema(
+            "expert",
+            raw_config,
+            expected | _VERSION_7_RETIRED_EXPERT_FIELDS,
+        )
+        for field in _VERSION_7_RETIRED_EXPERT_FIELDS:
+            raw_config.pop(field)
+    else:
+        _require_config_schema("expert", raw_config, expected)
+    return raw_config
+
+
+def _reject_emulated_checkpoint_precision(
+    model_config: Mapping[str, Any],
+    experts_config: Mapping[str, Any],
+) -> None:
+    """Fail before construction when a checkpoint needs simulated precision."""
+
+    if model_config.get("ple_backend") != "qr":
+        raise ValueError(
+            "checkpoint requests retired fake-QAT PLE; SPALMER no longer executes "
+            "emulated precision and has no fake fallback"
+        )
+
+    retired_expert_fields: list[str] = []
+    if experts_config.get("expert_weight_format") == "legacy_int":
+        retired_expert_fields.append("expert_weight_format=legacy_int")
+    if experts_config.get("expert_qat_backend") == "reference":
+        retired_expert_fields.append("expert_qat_backend=reference")
+    if bool(experts_config.get("expert_fake_quantization", False)):
+        retired_expert_fields.append("expert_fake_quantization=true")
+    if bool(experts_config.get("expert_stochastic_rounding", False)):
+        retired_expert_fields.append("expert_stochastic_rounding=true")
+    if experts_config.get("expert_master_dtype") == "float32":
+        retired_expert_fields.append("expert_master_dtype=float32")
+    if retired_expert_fields:
+        raise ValueError(
+            "checkpoint requests retired emulated expert precision "
+            f"({', '.join(retired_expert_fields)}); SPALMER requires a verified "
+            "native precision provider and has no fake fallback"
+        )
 
 
 def _load_optional_component_configs(
@@ -845,8 +827,6 @@ def _validate_potentiation_state(
         raise ValueError(
             f"promoted expert count {promoted} exceeds budget {experts_config.potentiation_budget}"
         )
-    if not experts_config.expert_fake_quantization and promoted:
-        raise ValueError("dense legacy expert execution cannot carry promoted experts")
 
 
 __all__ = [

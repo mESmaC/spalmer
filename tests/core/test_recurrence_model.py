@@ -81,7 +81,7 @@ def _config(
     recurrence: RecurrenceConfig | None = None,
     *,
     n_layers: int = 4,
-    ple_backend: Literal["fake_qat", "qr"] = "fake_qat",
+    ple_backend: Literal["qr"] = "qr",
 ) -> SPALMERConfig:
     return SPALMERConfig(
         vocab_size=31,
@@ -101,7 +101,7 @@ def _tiny_model(
     channel_mixer: type[nn.Module] = RecordingChannelMixer,
     n_layers: int = 4,
     seed: int = 0,
-    ple_backend: Literal["fake_qat", "qr"] = "fake_qat",
+    ple_backend: Literal["qr"] = "qr",
 ) -> SPALMERCausalLM:
     torch.manual_seed(seed)
     config = _config(recurrence, n_layers=n_layers, ple_backend=ple_backend)
@@ -114,7 +114,7 @@ def _tiny_model(
         )
         for _ in range(config.n_layers)
     ]
-    # eval(): deterministic PLE rounding so repeated forwards are comparable.
+    # eval(): deterministic behavior so repeated forwards are comparable.
     return SPALMERCausalLM(config, SPALMERBackbone(config, blocks)).eval()
 
 
@@ -499,8 +499,6 @@ def test_latent_init_replaces_noise_and_generator_is_honoured() -> None:
 
 
 def test_truncated_backprop_grad_flow() -> None:
-    # train(): the PLE fake-QAT path is straight-through only in training, so
-    # this is where a real gradient reaches the lookup tables.
     model = _recurrent_model().train()
     input_ids = torch.tensor([[1, 2, 3, 4, 5]])
 
@@ -527,8 +525,14 @@ def test_truncated_backprop_grad_flow() -> None:
     # Prelude weights and every PLE table, core included, still learn.
     assert model.backbone.blocks[0].token_mixer.projection.weight.grad is not None
     for layer in model.backbone.embeddings.layers:
-        assert layer.weight.grad is not None
-        assert layer.weight.grad.abs().sum().item() > 0
+        tables = (
+            [layer.input_embedding]
+            if layer.layer_index == 0
+            else [layer.remainder_embedding, layer.quotient_embedding]
+        )
+        for table in tables:
+            assert table.weight.grad is not None
+            assert table.weight.grad.abs().sum().item() > 0
 
     full = _recurrent_model().train()
     full(input_ids, labels=input_ids, recurrence_steps=4).loss.backward()
@@ -559,9 +563,13 @@ def test_core_ple_is_looked_up_once_per_forward(monkeypatch: pytest.MonkeyPatch)
     lookups: list[int] = []
     real_forward = PLELayerEmbedding.forward
 
-    def counting_forward(self: PLELayerEmbedding, input_ids: Tensor) -> Tensor:
+    def counting_forward(
+        self: PLELayerEmbedding,
+        input_ids: Tensor,
+        **kwargs: object,
+    ) -> Tensor:
         lookups.append(self.layer_index)
-        return real_forward(self, input_ids)
+        return real_forward(self, input_ids, **kwargs)
 
     monkeypatch.setattr(PLELayerEmbedding, "forward", counting_forward)
     model.train()
@@ -577,8 +585,12 @@ def test_core_ple_tensor_is_reused_across_iterations() -> None:
     seen: list[Tensor] = []
     real_forward = model.backbone.embeddings.forward
 
-    def recording_forward(input_ids: Tensor, layer_index: int) -> Tensor:
-        result = real_forward(input_ids, layer_index)
+    def recording_forward(
+        input_ids: Tensor,
+        layer_index: int,
+        **kwargs: object,
+    ) -> Tensor:
+        result = real_forward(input_ids, layer_index, **kwargs)
         seen.append(result)
         return result
 

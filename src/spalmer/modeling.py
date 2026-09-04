@@ -726,8 +726,8 @@ class SPALMERBackbone(nn.Module):
         working_dtype = injection.dtype
         normalized_injection = recurrence.normalize_injection(injection)
         # Resolve each core block's lexical refresh once, then re-add the same
-        # tensor at every recurrent iteration.  This also keeps one stochastic
-        # draw per legacy fake-QAT block and one pair of gathers per QR block.
+        # tensor at every recurrent iteration. Each QR refresh therefore needs
+        # only one pair of gathers per forward.
         if qr_indices is None:
             core_ple = [
                 self.embeddings(input_ids, layer_index=prelude + offset)

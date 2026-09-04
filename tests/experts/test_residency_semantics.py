@@ -229,12 +229,11 @@ def test_accounting_matches_tensor_sums_and_moves_by_whole_experts() -> None:
     model.residency.expand([7])
     three = model.parameter_accounting()
     assert three.resident_parameters - two.resident_parameters == accounting.parameters_per_expert
-    # Persistent storage uses the configured BF16 expert masters; execution
-    # remains four-bit fake QAT and is reported separately.
+    # Persistent storage and execution both use the selected native BF16 lane.
     assert three.nominal_bits["expert_pool"] == 16
-    assert three.execution_bits["expert_pool"] == 4
+    assert three.execution_bits["expert_pool"] == 16
     assert three.nominal_bits["embeddings"] == 32
-    assert three.execution_bits["embeddings"] == 4
+    assert "embeddings" not in three.execution_bits
     assert three.actual_parameter_bytes == sum(
         parameter.numel() * parameter.element_size() for parameter in model.parameters()
     )
@@ -290,9 +289,8 @@ def test_config_exposes_the_shared_routed_split() -> None:
 
 
 @pytest.mark.parametrize("resident", [None, [0, 2, 5, 9, 11]])
-@pytest.mark.parametrize("promoted", [False, True])
-def test_grouped_execution_matches_the_loop_reference(resident, promoted) -> None:
-    base = _experts(active_experts=3, max_resident_experts=8, potentiation_budget=2)
+def test_grouped_execution_matches_the_loop_reference(resident) -> None:
+    base = _experts(active_experts=3, max_resident_experts=8)
     torch.manual_seed(3)
     grouped = MicroExpertChannelMixer(replace(base, expert_execution="grouped")).eval()
     loop = MicroExpertChannelMixer(replace(base, expert_execution="loop")).eval()
@@ -301,8 +299,6 @@ def test_grouped_execution_matches_the_loop_reference(resident, promoted) -> Non
     for mixer in (grouped, loop):
         if resident is not None:
             mixer.residency.set(resident)
-        if promoted:
-            mixer.potentiation_controller.promoted_mask[[0, 5]] = True
     x = torch.randn(3, 7, D_MODEL)
     out_grouped = grouped(x)
     out_loop = loop(x)
@@ -356,10 +352,10 @@ def test_load_balance_loss_ignores_sequence_length_and_backbone_averages_layers(
     four = _model(n_layers=4)
     eight = _model(n_layers=8)
     input_ids = torch.randint(0, 40, (2, 6))
-    loss_four = float(four(input_ids).auxiliary_loss)
-    loss_eight = float(eight(input_ids).auxiliary_loss)
+    loss_four = float(four(input_ids).auxiliary_loss.detach())
+    loss_eight = float(eight(input_ids).auxiliary_loss.detach())
     per_layer_eight = [
-        float(load_balance_loss(m["router_scores"], m["expert_ids"]))
+        float(load_balance_loss(m["router_scores"], m["expert_ids"]).detach())
         for m in eight(input_ids).layer_metrics
     ]
     assert loss_eight == pytest.approx(sum(per_layer_eight) / 8, rel=1e-5)

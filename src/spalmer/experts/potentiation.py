@@ -11,10 +11,9 @@ from spalmer.experts.config import MicroExpertsConfig
 class ExpertPotentiationController(nn.Module):
     """Promote coherent expert identities using auditable EMA telemetry.
 
-    This reference controller promotes an expert from deterministic/stochastic
-    fake-low-bit execution to its floating shadow parameter. It establishes the
-    expert-wide control semantics; packed FP4 plus FP8 residual storage remains a
-    later numerical backend.
+    The controller promotes a complete expert identity from its selected native
+    low-precision kernel lane to a verified higher-precision native lane. It
+    never substitutes a simulated quantize/dequantize path.
 
     Signal roles stay separate (ledger C10). The promotion score is precision
     pressure only: how often an expert is selected times its quantization

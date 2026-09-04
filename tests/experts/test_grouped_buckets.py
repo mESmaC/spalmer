@@ -22,8 +22,8 @@ def _config(*, execution: str, num_experts: int = 8) -> MicroExpertsConfig:
         min_resident_experts=2,
         max_resident_experts=min(8, num_experts),
         expert_execution=execution,
-        expert_weight_format="legacy_int",
-        expert_fake_quantization=False,
+        expert_weight_format="bfloat16",
+        expert_activation_format="bfloat16",
         potentiation_budget=0,
     )
 

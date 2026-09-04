@@ -16,12 +16,16 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Literal, Protocol, runtime_checkable
 
+from spalmer.precision import (
+    EXPERT_ACTIVATION_FORMATS,
+    EXPERT_WEIGHT_FORMATS,
+    ExpertActivationFormat,
+    ExpertWeightFormat,
+)
 from spalmer.qr import qr_codebook_rows, qr_lane_moduli
 
-# Per-layer embedding backends the planner can count.  ``fake_qat`` is the
-# legacy lane-table implementation whose counts and fingerprints are frozen;
-# ``qr`` is the BF16 quotient/remainder compositional backend.
-PLE_BACKENDS: tuple[str, ...] = ("fake_qat", "qr")
+# Plans use the BF16 quotient/remainder compositional backend exclusively.
+PLE_BACKENDS: tuple[str, ...] = ("qr",)
 
 
 def _require_positive(name: str, value: int) -> None:
@@ -156,15 +160,14 @@ class ModelScaleConfig:
     active_experts: int = 2
     min_resident_experts: int = 2
     max_resident_experts: int = 20
-    expert_weight_format: Literal["mxfp4", "nvfp4"] = "mxfp4"
-    expert_activation_format: Literal["mxfp8"] = "mxfp8"
+    expert_weight_format: ExpertWeightFormat = "bfloat16"
+    expert_activation_format: ExpertActivationFormat = "bfloat16"
     expert_master_dtype: Literal["bfloat16"] = "bfloat16"
     directional: DirectionalScaleConfig | None = None
     atxy: ATXYScaleConfig | None = None
     recurrence: RecurrenceScaleConfig | None = None
-    # ``ple_expansion`` is the lane count for both backends: fake-QAT lane
-    # tables on every layer, or QR lanes on the refresh layers ``1..L-1``.
-    ple_backend: Literal["fake_qat", "qr"] = "fake_qat"
+    # ``ple_expansion`` is the QR lane count on refresh layers ``1..L-1``.
+    ple_backend: Literal["qr"] = "qr"
 
     def __post_init__(self) -> None:
         for name in (
@@ -202,14 +205,26 @@ class ModelScaleConfig:
             )
         if self.min_resident_experts > self.num_experts:
             raise ValueError("min_resident_experts cannot exceed num_experts")
-        if self.expert_weight_format not in {"mxfp4", "nvfp4"}:
-            raise ValueError("expert_weight_format must be 'mxfp4' or 'nvfp4'")
-        if self.expert_activation_format != "mxfp8":
-            raise ValueError("expert_activation_format must be 'mxfp8'")
+        if self.expert_weight_format not in EXPERT_WEIGHT_FORMATS:
+            raise ValueError(f"expert_weight_format must be one of {EXPERT_WEIGHT_FORMATS}")
+        if self.expert_activation_format not in EXPERT_ACTIVATION_FORMATS:
+            raise ValueError(
+                f"expert_activation_format must be one of {EXPERT_ACTIVATION_FORMATS}"
+            )
+        if self.expert_weight_format == "bfloat16":
+            if self.expert_activation_format != "bfloat16":
+                raise ValueError("BF16 expert weights require BF16 activations")
+        elif self.expert_weight_format == "nvfp4":
+            if self.expert_activation_format not in {"nvfp4", "mxfp8"}:
+                raise ValueError("NVFP4 expert weights require NVFP4 or MXFP8 activations")
+        elif self.expert_activation_format != "mxfp8":
+            raise ValueError(
+                f"{self.expert_weight_format.upper()} expert weights require MXFP8 activations"
+            )
         if self.expert_master_dtype != "bfloat16":
             raise ValueError("expert_master_dtype must be 'bfloat16'")
         if self.ple_backend not in PLE_BACKENDS:
-            raise ValueError("ple_backend must be 'fake_qat' or 'qr'")
+            raise ValueError("ple_backend must be 'qr'; fake-QAT PLE is retired")
         if self.directional is not None:
             self.directional.parameters_per_layer(self.d_model)
         if self.atxy is not None and self.atxy.injection_layer >= self.n_layers:
@@ -265,10 +280,8 @@ class ModelScaleConfig:
 
     @property
     def ple_lane_moduli(self) -> tuple[int, ...]:
-        """Deterministic QR lane moduli; empty for the legacy fake-QAT tables."""
+        """Deterministic QR lane moduli."""
 
-        if self.ple_backend != "qr":
-            return ()
         return qr_lane_moduli(self.vocab_size, self.ple_expansion)
 
     def to_dict(self) -> dict[str, object]:
@@ -277,10 +290,6 @@ class ModelScaleConfig:
             # Non-recurrent shapes keep the exact dict every stored plan
             # fingerprint was computed from.
             values.pop("recurrence")
-        if self.ple_backend == "fake_qat":
-            # Legacy shapes likewise stay byte-identical to their stored
-            # fingerprints; only a QR-PLE shape names its backend.
-            values.pop("ple_backend")
         return values
 
 
@@ -301,10 +310,12 @@ class ParameterBreakdown:
     lm_head: int
     recurrence: int = 0
     # QR-PLE decomposition of ``ple_lookup``: the exact BF16 input table of
-    # layer 0 and the quotient/remainder codebooks of the refresh layers.  Both
-    # stay zero for legacy fake-QAT tables, whose lookups are low-bit candidates.
+    # layer 0 and the quotient/remainder codebooks of the refresh layers.
     ple_exact_input: int = 0
     ple_qr_refresh: int = 0
+    # Expert parameters entering a real native sub-BF16 kernel. This is zero
+    # for the dense BF16 default.
+    expert_low_bit: int = 0
 
     @property
     def total(self) -> int:
@@ -370,19 +381,13 @@ class ParameterBreakdown:
         return self.ple_lookup + self.ple_controls
 
     @property
-    def fake_qat_ple_lookup(self) -> int:
-        """Legacy lookup weights whose forward operands are derived at four bits."""
-
-        return self.ple_lookup - self.ple_exact_input - self.ple_qr_refresh
-
-    @property
     def low_bit_candidates(self) -> int:
         """Parameters whose forward representations are derived at low precision.
 
         QR-PLE codebooks execute at their BF16 storage width and are excluded.
         """
 
-        return self.fake_qat_ple_lookup + self.expert_banks
+        return self.expert_low_bit
 
     @property
     def dense_parameters(self) -> int:
@@ -395,9 +400,10 @@ class ParameterBreakdown:
             # existing plan fingerprints were hashed from.
             values.pop("recurrence")
         if not self.ple_exact_input and not self.ple_qr_refresh:
-            # Likewise for every legacy fake-QAT breakdown.
             values.pop("ple_exact_input")
             values.pop("ple_qr_refresh")
+        if not self.expert_low_bit:
+            values.pop("expert_low_bit")
         values.update(
             total=self.total,
             low_bit_candidates=self.low_bit_candidates,
@@ -499,6 +505,7 @@ def count_parameters(config: ModelScaleConfig) -> ParameterBreakdown:
         lm_head=lm_head,
         ple_exact_input=ple_exact_input,
         ple_qr_refresh=ple_qr_refresh,
+        expert_low_bit=(expert_banks if config.expert_weight_format != "bfloat16" else 0),
     )
 
 
@@ -825,11 +832,12 @@ def plan_configuration(
     *,
     search_space: ScaleSearchSpace = DEFAULT_SEARCH_SPACE,
     memory_assumptions: MemoryAssumptions = MemoryAssumptions(),
-    expert_weight_format: Literal["mxfp4", "nvfp4"] = "mxfp4",
+    expert_weight_format: ExpertWeightFormat = "bfloat16",
+    expert_activation_format: ExpertActivationFormat | None = None,
     directional: DirectionalScaleConfig | None = None,
     atxy: ATXYScaleConfig | None = None,
     recurrence: RecurrenceScaleConfig | None = None,
-    ple_backend: Literal["fake_qat", "qr"] = "fake_qat",
+    ple_backend: Literal["qr"] = "qr",
 ) -> ScalePlan:
     """Choose the enumerated shape nearest an explicit total parameter target.
 
@@ -842,7 +850,13 @@ def plan_configuration(
     _require_positive("target_parameters", target_parameters)
     _require_positive("vocab_size", vocab_size)
     if ple_backend not in PLE_BACKENDS:
-        raise ValueError("ple_backend must be 'fake_qat' or 'qr'")
+        raise ValueError("ple_backend must be 'qr'; fake-QAT PLE is retired")
+    if expert_weight_format not in EXPERT_WEIGHT_FORMATS:
+        raise ValueError(f"expert_weight_format must be one of {EXPERT_WEIGHT_FORMATS}")
+    resolved_activation = expert_activation_format or {
+        "bfloat16": "bfloat16",
+        "nvfp4": "nvfp4",
+    }.get(expert_weight_format, "mxfp8")
     candidates: list[tuple[tuple[int, ...], ModelScaleConfig, ParameterBreakdown]] = []
     for d_model in sorted(set(search_space.d_models)):
         if directional is not None and d_model % directional.num_feature_groups:
@@ -882,6 +896,7 @@ def plan_configuration(
                                 ple_expansion=expansion,
                                 max_resident_experts=min(20, search_space.num_experts),
                                 expert_weight_format=expert_weight_format,
+                                expert_activation_format=resolved_activation,
                                 directional=directional,
                                 atxy=atxy,
                                 recurrence=recurrence,
@@ -918,11 +933,12 @@ def plan_ladder(
     *,
     search_space: ScaleSearchSpace = DEFAULT_SEARCH_SPACE,
     memory_assumptions: MemoryAssumptions = MemoryAssumptions(),
-    expert_weight_format: Literal["mxfp4", "nvfp4"] = "mxfp4",
+    expert_weight_format: ExpertWeightFormat = "bfloat16",
+    expert_activation_format: ExpertActivationFormat | None = None,
     directional: DirectionalScaleConfig | None = None,
     atxy: ATXYScaleConfig | None = None,
     recurrence: RecurrenceScaleConfig | None = None,
-    ple_backend: Literal["fake_qat", "qr"] = "fake_qat",
+    ple_backend: Literal["qr"] = "qr",
 ) -> tuple[ScalePlan, ...]:
     """Plan several scales, resolving vocabulary size independently per rung."""
 
@@ -938,6 +954,7 @@ def plan_ladder(
                 search_space=search_space,
                 memory_assumptions=memory_assumptions,
                 expert_weight_format=expert_weight_format,
+                expert_activation_format=expert_activation_format,
                 directional=directional,
                 atxy=atxy,
                 recurrence=recurrence,

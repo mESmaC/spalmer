@@ -9,94 +9,9 @@ from spalmer.config import PLEConfig
 from spalmer.embeddings import (
     AlternatingPLE,
     PLELayerEmbedding,
-    fake_quantize_low_bit,
     qr_codebook_rows,
     qr_lane_moduli,
 )
-
-
-def test_fixed_alternation_owns_one_table_per_layer() -> None:
-    config = PLEConfig(vocab_size=23, d_model=8, n_layers=4, expansion_factor=3)
-    embeddings = AlternatingPLE(config)
-
-    assert [embeddings.phase_for_layer(index) for index in range(4)] == ["A", "B", "A", "B"]
-    assert len({id(layer.weight) for layer in embeddings.layers}) == config.n_layers
-
-    token_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
-    assert embeddings(token_ids, layer_index=2).shape == (2, 3, config.d_model)
-
-
-def test_eval_rounding_is_deterministic_and_training_keeps_gradients() -> None:
-    config = PLEConfig(vocab_size=17, d_model=6, n_layers=2, expansion_factor=2)
-    layer = PLELayerEmbedding(config, layer_index=0)
-    token_ids = torch.tensor([[1, 2, 1]])
-
-    layer.eval()
-    first = layer(token_ids)
-    second = layer(token_ids)
-    torch.testing.assert_close(first, second)
-
-    layer.train()
-    layer(token_ids).square().mean().backward()
-    assert layer.weight.grad is not None
-    assert layer.lane_logits.grad is not None
-    assert layer.gate.grad is not None
-
-
-def test_repeated_tokens_share_one_stochastic_rounding_sample_per_forward() -> None:
-    config = PLEConfig(vocab_size=17, d_model=6, n_layers=2, expansion_factor=2)
-    layer = PLELayerEmbedding(config, layer_index=0).train()
-
-    output = layer(torch.tensor([[3, 3, 3, 3]]))
-
-    torch.testing.assert_close(output[:, :1].expand_as(output), output, rtol=0, atol=0)
-
-
-def test_fake_quantization_uses_a_straight_through_gradient() -> None:
-    values = torch.tensor([[0.12, -0.37, 0.91]], requires_grad=True)
-    quantized = fake_quantize_low_bit(
-        values,
-        bits=4,
-        stochastic=False,
-        straight_through=True,
-    )
-    quantized.sum().backward()
-
-    assert not torch.equal(values.detach(), quantized.detach())
-    torch.testing.assert_close(values.grad, torch.ones_like(values))
-
-
-def test_ple_config_rejects_non_low_bit_values() -> None:
-    with pytest.raises(ValueError, match="quant_bits"):
-        PLEConfig(vocab_size=8, d_model=4, n_layers=2, quant_bits=16)
-
-
-def test_reference_backend_guards_accidental_large_shadow_allocation() -> None:
-    config = PLEConfig(
-        vocab_size=32,
-        d_model=16,
-        n_layers=4,
-        expansion_factor=2,
-        reference_max_numel=1_000,
-    )
-
-    with pytest.raises(MemoryError, match="fake-QAT PLE backend"):
-        AlternatingPLE(config)
-
-
-def test_sparse_lookup_mode_produces_sparse_table_gradients() -> None:
-    config = PLEConfig(
-        vocab_size=17,
-        d_model=6,
-        n_layers=1,
-        expansion_factor=2,
-        sparse_gradients=True,
-    )
-    layer = PLELayerEmbedding(config, layer_index=0).train()
-
-    layer(torch.tensor([[1, 2, 1]])).sum().backward()
-
-    assert layer.weight.grad is not None and layer.weight.grad.is_sparse
 
 
 def test_qr_moduli_are_deterministic_distinct_primes_above_sqrt_vocab() -> None:
@@ -185,14 +100,12 @@ def test_qr_composition_matches_product_softmax_and_gate() -> None:
     torch.testing.assert_close(layer(torch.tensor([[0, 8, 16]])), expected)
 
 
-@pytest.mark.parametrize("backend", ["fake_qat", "qr"])
-def test_lane_controls_do_not_promote_embedding_dtype(backend: str) -> None:
+def test_lane_controls_do_not_promote_embedding_dtype() -> None:
     config = PLEConfig(
         vocab_size=17,
         d_model=4,
         n_layers=2,
         expansion_factor=2,
-        backend=backend,
     )
     layer = PLELayerEmbedding(config, layer_index=1).to(dtype=torch.bfloat16)
     # CUDA softmax may retain these tiny stability-sensitive controls in FP32.
@@ -231,29 +144,21 @@ def test_qr_refresh_uses_two_flat_embedding_gathers(
     assert calls == 2
 
 
-def test_qr_backend_never_calls_fake_quantization_or_shadow_size_guard(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_qr_bank_uses_only_exact_and_compositional_tables() -> None:
     config = PLEConfig(
         vocab_size=32,
         d_model=8,
         n_layers=3,
         expansion_factor=2,
-        backend="qr",
-        reference_max_numel=1,
     )
-
-    def fail_fake_quant(*args: object, **kwargs: object) -> torch.Tensor:
-        raise AssertionError("QR-PLE must not enter the fake-quantization path")
-
-    monkeypatch.setattr("spalmer.embeddings.ple.fake_quantize_low_bit", fail_fake_quant)
     embeddings = AlternatingPLE(config)
 
     token_ids = torch.tensor([[1, 2, 3]])
     assert embeddings(token_ids, layer_index=0).shape == (1, 3, config.d_model)
     assert embeddings(token_ids, layer_index=2).shape == (1, 3, config.d_model)
-    with pytest.raises(ValueError, match="no A/B phase"):
-        embeddings.phase_for_layer(0)
+    assert hasattr(embeddings.layers[0], "input_embedding")
+    assert hasattr(embeddings.layers[2], "remainder_embedding")
+    assert hasattr(embeddings.layers[2], "quotient_embedding")
 
 
 def test_qr_indices_are_computed_once_and_reused_across_layers(

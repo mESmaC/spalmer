@@ -19,6 +19,7 @@ from spalmer.data import JsonlAdapterConfig, prepare_approved_jsonl
 from spalmer.experiment import ExplicitVocabularyPolicy, RecurrenceScaleConfig, plan_ladder
 from spalmer.experts import MicroExpertsConfig
 from spalmer.factory import build_spalmer_model
+from spalmer.precision import detect_precision_capabilities
 from spalmer.runtime import RecurrenceTrace, generate_tokens, train_token_stream
 from spalmer.tokenizer import Encoder, Sample, TokenizerBackend, TrainerConfig, Vocab, train
 from spalmer.tokenizer.backends import (
@@ -40,19 +41,24 @@ _HYBRID_CYCLE = ("kda", "kda", "kda", "mla")
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments[:1] == ["plan"]:
-        args = _plan_parser().parse_args(arguments[1:])
+        plan_arguments = arguments[1:]
+        args = _plan_parser(device=_requested_device(plan_arguments)).parse_args(plan_arguments)
         _run_plan(args)
         return
     if arguments[:1] == ["prepare-data"]:
         args = _prepare_data_parser().parse_args(arguments[1:])
         _run_prepare_data(args)
         return
+    if arguments[:1] == ["precision"]:
+        args = _precision_parser().parse_args(arguments[1:])
+        _run_precision(args)
+        return
     if arguments[:1] == ["generate"]:
         args = _generate_parser().parse_args(arguments[1:])
         _run_generate(args)
         return
 
-    parser = _training_parser()
+    parser = _training_parser(device=_requested_device(arguments))
     args = parser.parse_args(arguments)
     if args.smoke and args.text_file is not None:
         parser.error("use either a corpus path or --smoke, not both")
@@ -61,7 +67,46 @@ def main(argv: Sequence[str] | None = None) -> None:
     _run(args)
 
 
-def _plan_parser() -> argparse.ArgumentParser:
+def _default_device() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _requested_device(arguments: Sequence[str]) -> str:
+    """Read ``--device`` before building device-specific precision choices."""
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--device", default=_default_device())
+    namespace, _ = parser.parse_known_args(arguments)
+    return str(namespace.device)
+
+
+def _selectable_precision_cli_values(
+    device: str | torch.device,
+) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+    capabilities = detect_precision_capabilities(device)
+    pairs = capabilities.selectable_pairs
+    pair_text = ", ".join(
+        f"{pair.weight_format}/{pair.activation_format}" for pair in pairs
+    ) or "none"
+    return (
+        capabilities.selectable_weight_formats,
+        capabilities.selectable_activation_formats,
+        pair_text,
+    )
+
+
+def _resolved_expert_activation(weight_format: str, activation_format: str | None) -> str:
+    return activation_format or {
+        "bfloat16": "bfloat16",
+        "nvfp4": "nvfp4",
+    }.get(weight_format, "mxfp8")
+
+
+def _plan_parser(*, device: str | torch.device | None = None) -> argparse.ArgumentParser:
+    resolved_device = _default_device() if device is None else str(device)
+    weight_formats, activation_formats, pair_text = _selectable_precision_cli_values(
+        resolved_device
+    )
     parser = argparse.ArgumentParser(
         prog="spalmer plan",
         description="Plan scale-aware model shapes without constructing or training a model",
@@ -84,18 +129,21 @@ def _plan_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--expert-weight-format",
-        choices=("mxfp4", "nvfp4"),
-        default="mxfp4",
-        help="routed-expert QAT forward-weight format recorded in each plan",
+        choices=weight_formats,
+        default="bfloat16",
+        help=f"device-verified routed-expert weight format; exact pairs: {pair_text}",
     )
     parser.add_argument(
+        "--expert-activation-format",
+        choices=activation_formats,
+        help="real activation format (default is derived honestly from the weight format)",
+    )
+    parser.add_argument("--device", default=resolved_device)
+    parser.add_argument(
         "--ple-backend",
-        choices=("fake_qat", "qr"),
-        default="fake_qat",
-        help=(
-            "per-layer embedding backend: legacy four-bit fake-QAT lane tables, or "
-            "BF16 quotient/remainder codebooks behind one exact input table"
-        ),
+        choices=("qr",),
+        default="qr",
+        help="BF16 quotient/remainder codebooks behind one exact input table",
     )
     parser.add_argument(
         "--recurrence",
@@ -140,7 +188,21 @@ def _prepare_data_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _training_parser() -> argparse.ArgumentParser:
+def _precision_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="spalmer precision",
+        description="Report only verified real expert training kernels for this system",
+    )
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    return parser
+
+
+def _training_parser(*, device: str | torch.device | None = None) -> argparse.ArgumentParser:
+    resolved_device = _default_device() if device is None else str(device)
+    weight_formats, activation_formats, pair_text = _selectable_precision_cli_values(
+        resolved_device
+    )
     parser = argparse.ArgumentParser(
         prog="spalmer",
         description="Train a small SPALMER prototype",
@@ -167,22 +229,27 @@ def _training_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expert-width", type=int)
     parser.add_argument(
         "--expert-weight-format",
-        choices=("mxfp4", "nvfp4"),
-        default="mxfp4",
-        help="routed-expert QAT forward-weight format",
+        choices=weight_formats,
+        default="bfloat16",
+        help=f"device-verified routed-expert weight format; exact pairs: {pair_text}",
+    )
+    parser.add_argument(
+        "--expert-activation-format",
+        choices=activation_formats,
+        help="real activation format (default is derived honestly from the weight format)",
     )
     parser.add_argument(
         "--expert-qat-backend",
-        choices=("auto", "reference", "native"),
+        choices=("auto", "native"),
         default="auto",
-        help="auto/reference emulate W4A8 today; native fails unless a real kernel is available",
+        help="select a verified real kernel or fail; emulation is never used",
     )
     parser.add_argument(
         "--expert-promotion-format",
         choices=("mxfp8", "bfloat16"),
-        default="mxfp8",
+        default="bfloat16",
     )
-    parser.add_argument("--potentiation-budget", type=int, default=2)
+    parser.add_argument("--potentiation-budget", type=int, default=0)
     parser.add_argument("--potentiation-warmup-steps", type=int, default=4)
     parser.add_argument("--potentiation-hold-steps", type=int, default=8)
     parser.add_argument("--surprise-loss-weight", type=float, default=0.05)
@@ -192,9 +259,9 @@ def _training_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ple-expansion", type=int, default=2)
     parser.add_argument(
         "--ple-backend",
-        choices=("fake_qat", "qr"),
-        default="fake_qat",
-        help="per-layer embedding backend (QR-PLE checkpoints are scratch models)",
+        choices=("qr",),
+        default="qr",
+        help="quotient/remainder PLE; emulated checkpoint formats fail closed",
     )
     parser.add_argument(
         "--recurrent-layers",
@@ -218,7 +285,7 @@ def _training_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-recurrence", type=int)
     parser.add_argument("--new-tokens", type=int, default=32)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default=resolved_device)
     return parser
 
 
@@ -289,6 +356,14 @@ def _run_plan(args: argparse.Namespace) -> None:
         right <= left for left, right in zip(args.vocab_sizes, args.vocab_sizes[1:])
     ):
         raise SystemExit("vocabulary size must increase at every larger model target")
+    activation_format = _resolved_expert_activation(
+        args.expert_weight_format,
+        args.expert_activation_format,
+    )
+    detect_precision_capabilities(args.device).require(
+        args.expert_weight_format,
+        activation_format,
+    )
     recurrence = None
     if args.recurrence is not None:
         prelude, coda = args.recurrence
@@ -302,6 +377,7 @@ def _run_plan(args: argparse.Namespace) -> None:
         tuple(args.targets),
         policy,
         expert_weight_format=args.expert_weight_format,
+        expert_activation_format=activation_format,
         recurrence=recurrence,
         ple_backend=args.ple_backend,
     )
@@ -330,6 +406,25 @@ def _run_plan(args: argparse.Namespace) -> None:
             f"{memory.gib(memory.reference_training_bytes):9.3f} "
             f"{memory.gib(memory.packed_training_bytes):11.3f}"
         )
+
+
+def _run_precision(args: argparse.Namespace) -> None:
+    capabilities = detect_precision_capabilities(args.device)
+    if args.json:
+        print(json.dumps(capabilities.to_dict(), indent=2))
+        return
+    name = capabilities.device_name or "unknown device"
+    print(f"device={capabilities.device} name={name}")
+    for capability in capabilities.expert_precisions:
+        state = "selectable" if capability.selectable else "unavailable"
+        grouped = "grouped" if capability.grouped_available else "dense"
+        print(
+            f"{capability.weight_format}/{capability.activation_format} "
+            f"provider={capability.provider_id} state={state} execution={grouped} "
+            f"detail={capability.detail}"
+        )
+    for diagnostic in capabilities.diagnostics:
+        print(f"diagnostic: {diagnostic}")
 
 
 def _run_prepare_data(args: argparse.Namespace) -> None:
@@ -417,6 +512,15 @@ def _run(args: argparse.Namespace) -> None:
     if args.layers <= 0 or args.layers % len(_HYBRID_CYCLE):
         raise ValueError("layers must be a positive multiple of 4 for the 3:1 KDA/MLA cycle")
     recurrence_config, sampler = _resolve_training_recurrence(args)
+    device = torch.device(args.device)
+    activation_format = _resolved_expert_activation(
+        args.expert_weight_format,
+        args.expert_activation_format,
+    )
+    capability = detect_precision_capabilities(device).require(
+        args.expert_weight_format,
+        activation_format,
+    )
 
     if args.smoke:
         text = _SMOKE_TEXT
@@ -439,7 +543,6 @@ def _run(args: argparse.Namespace) -> None:
     encoder = Encoder(vocab)
     token_ids = torch.tensor(encoder.encode(text, kind=args.kind), dtype=torch.long)
     head_dim = args.d_model // args.heads
-    device = torch.device(args.device)
 
     model_fields: dict[str, object] = {
         "vocab_size": len(vocab),
@@ -451,8 +554,7 @@ def _run(args: argparse.Namespace) -> None:
         "token_mixer_pattern": _HYBRID_CYCLE,
         "surprise_ema_decay": args.surprise_ema_decay,
     }
-    if args.ple_backend != "fake_qat":
-        model_fields["ple_backend"] = args.ple_backend
+    model_fields["ple_backend"] = args.ple_backend
     if recurrence_config is not None:
         model_fields["recurrence"] = recurrence_config
     config = SPALMERConfig(**model_fields)
@@ -477,8 +579,9 @@ def _run(args: argparse.Namespace) -> None:
         expert_inter_dim=args.expert_width,
         active_experts=args.active_experts,
         max_active_experts=min(20, args.experts),
+        expert_execution="grouped" if capability.grouped_available else "loop",
         expert_weight_format=args.expert_weight_format,
-        expert_activation_format="mxfp8",
+        expert_activation_format=activation_format,
         expert_master_dtype="bfloat16",
         expert_qat_backend=args.expert_qat_backend,
         expert_promotion_format=args.expert_promotion_format,
@@ -491,14 +594,13 @@ def _run(args: argparse.Namespace) -> None:
     model = build_spalmer_model(config, kda_config, mla_config, experts_config)
     dtype = torch.bfloat16
     model.to(device=device, dtype=dtype)
-    qat_status = model.backbone.blocks[0].channel_mixer.experts.qat_backend_status
     print(
-        "expert QAT: "
+        "expert precision: "
         f"weights={experts_config.expert_weight_format} "
         f"activations={experts_config.expert_activation_format} "
         f"master={experts_config.expert_master_dtype} "
-        f"backend={qat_status.selected_backend or 'unavailable'} "
-        f"emulated={qat_status.emulated}",
+        f"provider={capability.provider_id} "
+        f"grouped={capability.grouped_available}",
         flush=True,
     )
 

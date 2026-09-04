@@ -6,6 +6,13 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
+from spalmer.precision import (
+    EXPERT_ACTIVATION_FORMATS,
+    EXPERT_WEIGHT_FORMATS,
+    ExpertActivationFormat,
+    ExpertWeightFormat,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class MicroExpertsConfig:
@@ -43,22 +50,18 @@ class MicroExpertsConfig:
         expert_execution: ``grouped`` executes every resident expert's tokens
             with padded batched matmuls (no per-expert Python loop);
             ``loop`` is the per-expert reference path.
-        expert_weight_format: Routed-expert forward-weight format. ``mxfp4``
-            is the Kimi-style default; ``nvfp4`` selects NVIDIA's two-level
-            block scaling; ``legacy_int`` exists only for old checkpoints.
+        expert_weight_format: Real routed-expert GEMM weight operand format.
+            Low-precision formats are selectable only when the runtime reports
+            a verified native forward/backward provider.
         expert_activation_format: Input format at each routed-expert GEMM.
             The selected base-pretraining contract uses ``mxfp8``.
         expert_master_dtype: Persistent optimizer-visible expert weights. New
             base-pretraining runs use one BF16 copy and no FP32 shadow.
-        expert_qat_backend: ``auto`` chooses the best implemented backend,
-            ``reference`` is the correctness lane, and ``native`` fails closed
-            unless a real mixed W4A8 kernel is present.
+        expert_qat_backend: ``auto`` chooses a verified native implementation;
+            ``native`` makes that requirement explicit. Both fail closed. The
+            historical ``reference`` value is metadata-only and never
+            executable.
         expert_promotion_format: Forward precision of a potentiated expert.
-        expert_quant_bits: Width of the pre-v5 ``legacy_int`` fake quantizer.
-        expert_fake_quantization: Master switch retained for dense legacy
-            checkpoints. New QAT runs leave it enabled.
-        expert_stochastic_rounding: Apply stochastic rounding to supported
-            low-bit expert formats during training.
         potentiation_budget: Number of complete expert identities promoted to
             shadow precision across every layer. Zero disables promotion.
         potentiation_ema_decay: Smoothing applied to the expert-wide precision
@@ -90,15 +93,12 @@ class MicroExpertsConfig:
     min_resident_experts: int | None = None
     max_resident_experts: int = 20
     expert_execution: Literal["grouped", "loop"] = "grouped"
-    expert_weight_format: Literal["mxfp4", "nvfp4", "legacy_int"] = "mxfp4"
-    expert_activation_format: Literal["mxfp8", "bfloat16"] = "mxfp8"
-    expert_master_dtype: Literal["bfloat16", "float32"] = "bfloat16"
-    expert_qat_backend: Literal["auto", "reference", "native"] = "auto"
-    expert_promotion_format: Literal["mxfp8", "bfloat16"] = "mxfp8"
-    expert_quant_bits: int = 4
-    expert_fake_quantization: bool = True
-    expert_stochastic_rounding: bool = True
-    potentiation_budget: int = 2
+    expert_weight_format: ExpertWeightFormat = "bfloat16"
+    expert_activation_format: ExpertActivationFormat = "bfloat16"
+    expert_master_dtype: Literal["bfloat16"] = "bfloat16"
+    expert_qat_backend: Literal["auto", "native"] = "auto"
+    expert_promotion_format: Literal["mxfp8", "bfloat16"] = "bfloat16"
+    potentiation_budget: int = 0
     potentiation_ema_decay: float = 0.95
     potentiation_warmup_steps: int = 4
     potentiation_hold_steps: int = 8
@@ -108,7 +108,6 @@ class MicroExpertsConfig:
     residency_increment: int = 2
     residency_min_gain: float = 0.02
     initializer_range: float = 0.02
-
     def __post_init__(self) -> None:
         _require_positive("d_model", self.d_model)
         _require_positive("num_experts", self.num_experts)
@@ -124,33 +123,46 @@ class MicroExpertsConfig:
             raise ValueError("shared_inter_dim must be non-negative when provided")
         if self.expert_execution not in {"grouped", "loop"}:
             raise ValueError("expert_execution must be 'grouped' or 'loop'")
-        if self.expert_weight_format not in {"mxfp4", "nvfp4", "legacy_int"}:
+        if self.expert_weight_format not in EXPERT_WEIGHT_FORMATS:
+            raise ValueError(f"expert_weight_format must be one of {EXPERT_WEIGHT_FORMATS}")
+        if self.expert_activation_format not in EXPERT_ACTIVATION_FORMATS:
             raise ValueError(
-                "expert_weight_format must be 'mxfp4', 'nvfp4', or 'legacy_int'"
+                f"expert_activation_format must be one of {EXPERT_ACTIVATION_FORMATS}"
             )
-        if self.expert_activation_format not in {"mxfp8", "bfloat16"}:
-            raise ValueError("expert_activation_format must be 'mxfp8' or 'bfloat16'")
-        if self.expert_master_dtype not in {"bfloat16", "float32"}:
-            raise ValueError("expert_master_dtype must be 'bfloat16' or 'float32'")
-        if self.expert_qat_backend not in {
-            "auto",
-            "reference",
-            "native",
-        }:
-            raise ValueError(
-                "expert_qat_backend must be 'auto', 'reference', or 'native'"
-            )
+        if self.expert_master_dtype != "bfloat16":
+            raise ValueError("expert_master_dtype must be 'bfloat16'")
+        if self.expert_qat_backend not in {"auto", "native"}:
+            raise ValueError("expert_qat_backend must be 'auto' or 'native'")
         if self.expert_promotion_format not in {"mxfp8", "bfloat16"}:
             raise ValueError("expert_promotion_format must be 'mxfp8' or 'bfloat16'")
-        if self.expert_weight_format != "legacy_int":
-            if self.expert_activation_format != "mxfp8":
-                raise ValueError("FP4 expert QAT requires MXFP8 activations")
+        if self.expert_weight_format == "bfloat16":
+            if self.expert_activation_format != "bfloat16":
+                raise ValueError("BF16 expert weights require BF16 activations")
             if self.expert_master_dtype != "bfloat16":
-                raise ValueError("FP4 expert QAT requires one BF16 master parameter payload")
-            if not self.expert_fake_quantization:
-                raise ValueError("FP4 expert formats require expert_fake_quantization")
-        if not 2 <= self.expert_quant_bits <= 8:
-            raise ValueError("expert_quant_bits must be between 2 and 8")
+                raise ValueError("BF16 expert execution requires BF16 master parameters")
+            if self.potentiation_budget:
+                raise ValueError(
+                    "BF16 expert execution has no higher promotion tier; "
+                    "potentiation_budget must be zero"
+                )
+            if self.expert_promotion_format != "bfloat16":
+                raise ValueError("BF16 expert execution requires BF16 promotion format")
+        else:
+            allowed_activations = (
+                {"mxfp8", "nvfp4"}
+                if self.expert_weight_format == "nvfp4"
+                else {"mxfp8"}
+            )
+            if self.expert_activation_format not in allowed_activations:
+                expected = "NVFP4 or MXFP8" if self.expert_weight_format == "nvfp4" else "MXFP8"
+                raise ValueError(
+                    f"{self.expert_weight_format.upper()} expert weights require "
+                    f"{expected} activations"
+                )
+            if self.expert_master_dtype != "bfloat16":
+                raise ValueError(
+                    "low-precision expert training requires one BF16 master parameter payload"
+                )
         if not 0 <= self.potentiation_budget <= self.num_experts:
             raise ValueError(
                 "potentiation_budget must be between zero and num_experts; "
@@ -245,17 +257,19 @@ class MicroExpertsConfig:
     def expert_forward_weight_bits(self) -> int:
         """Nominal routed-expert execution width (not persistent storage)."""
 
-        if not self.expert_fake_quantization:
-            return 16 if self.expert_master_dtype == "bfloat16" else 32
-        if self.expert_weight_format == "legacy_int":
-            return self.expert_quant_bits
-        return 4
+        return {
+            "mxfp4": 4,
+            "nvfp4": 4,
+            "mxfp6": 6,
+            "mxfp8": 8,
+            "bfloat16": 16,
+        }[self.expert_weight_format]
 
     @property
     def expert_master_bits(self) -> int:
         """Width of the single persistent trainable expert weight copy."""
 
-        return 16 if self.expert_master_dtype == "bfloat16" else 32
+        return 16
 
 
 def _require_positive(name: str, value: int) -> None:

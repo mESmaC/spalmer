@@ -25,10 +25,10 @@ def _experts(**overrides: object) -> MicroExpertsConfig:
         "active_experts": 2,
         "max_active_experts": 4,
         "max_resident_experts": 4,
-        "potentiation_budget": 1,
-        "expert_weight_format": "legacy_int",
+        "potentiation_budget": 0,
+        "expert_weight_format": "bfloat16",
         "expert_activation_format": "bfloat16",
-        "expert_master_dtype": "float32",
+        "expert_master_dtype": "bfloat16",
         "expert_promotion_format": "bfloat16",
     }
     values.update(overrides)
@@ -191,7 +191,7 @@ def test_state_dict_load_refreshes_detached_resident_caches() -> None:
     )
 
 
-def test_cached_global_id_mapping_preserves_qat_and_potentiation_numerics() -> None:
+def test_cached_global_id_mapping_preserves_native_execution_numerics() -> None:
     config = _experts(expert_execution="grouped")
     torch.manual_seed(7)
     reference = MicroExpertBank(config).eval()
@@ -209,8 +209,6 @@ def test_cached_global_id_mapping_preserves_qat_and_potentiation_numerics() -> N
     token_index = torch.tensor((0, 0, 1, 2, 3, 4))
     expert_index = torch.tensor((1, 4, 5, 1, 4, 5))
     routing_weights = torch.tensor((0.4, 0.6, 1.0, 1.0, 1.0, 1.0))
-    promoted = torch.zeros(config.num_experts, dtype=torch.bool)
-    promoted[4] = True
     resident_ids = torch.tensor((1, 4, 5))
 
     expected = reference.execute_routing(
@@ -218,7 +216,6 @@ def test_cached_global_id_mapping_preserves_qat_and_potentiation_numerics() -> N
         token_index,
         expert_index,
         routing_weights,
-        promoted_mask=promoted,
         resident_ids=resident_ids,
     )
     actual = cached.execute_routing(
@@ -226,7 +223,6 @@ def test_cached_global_id_mapping_preserves_qat_and_potentiation_numerics() -> N
         token_index,
         expert_index,
         routing_weights,
-        promoted_mask=promoted,
         resident_ids=resident_ids,
     )
     torch.testing.assert_close(actual, expected)

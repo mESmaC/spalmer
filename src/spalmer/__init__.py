@@ -20,6 +20,12 @@ from spalmer.modeling import (
     SPALMERBlock,
     SPALMERCausalLM,
 )
+from spalmer.precision import (
+    ExpertPrecisionCapability,
+    ExpertPrecisionPair,
+    PrecisionCapabilities,
+    detect_precision_capabilities,
+)
 from spalmer.runtime import RecurrenceTrace
 
 __all__ = [
@@ -30,8 +36,11 @@ __all__ = [
     "ChannelMixerOutput",
     "DenseSwiGLU",
     "ExpertOffloadTelemetry",
+    "ExpertPrecisionCapability",
+    "ExpertPrecisionPair",
     "LatentRecurrence",
     "PLEConfig",
+    "PrecisionCapabilities",
     "RecurrenceConfig",
     "RecurrenceTrace",
     "RecurrentMixerStates",
@@ -42,6 +51,7 @@ __all__ = [
     "build_kda_bootstrap_model",
     "build_spalmer_model",
     "disable_expert_offload",
+    "detect_precision_capabilities",
     "enable_expert_offload",
     "load_checkpoint",
     "save_checkpoint",

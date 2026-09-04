@@ -36,10 +36,10 @@ def _build(num_experts: int = 8, **overrides: object):
         "active_experts": 2,
         "max_active_experts": 6,
         "potentiation_budget": 0,
-        "expert_weight_format": "legacy_int",
+        "expert_weight_format": "bfloat16",
         "expert_activation_format": "bfloat16",
-        "expert_master_dtype": "float32",
-        "expert_qat_backend": "reference",
+        "expert_master_dtype": "bfloat16",
+        "expert_qat_backend": "auto",
         "expert_promotion_format": "bfloat16",
     }
     values.update(overrides)
@@ -186,6 +186,7 @@ def test_explicit_initial_ids_obey_resident_cap_independently_of_execution_cap()
 
 def test_training_tracks_average_surprise_and_checkpoints_carry_it(tmp_path) -> None:
     model, vocab, (kda, mla, experts) = _build()
+    model.to(dtype=torch.bfloat16)
     tokens = torch.tensor(Encoder(vocab).encode("alpha beta gamma delta epsilon zeta " * 8))
     result = train_token_stream(model, tokens, steps=3, batch_size=2, sequence_length=8)
     assert result.average_surprise > 0
@@ -246,10 +247,10 @@ def test_training_tracks_average_surprise_and_checkpoints_carry_it(tmp_path) -> 
         load_checkpoint(missing_config)
 
     missing_ple_payload = torch.load(path, weights_only=False)
-    missing_ple_payload["model_config"].pop("ple_quant_bits")
+    missing_ple_payload["model_config"].pop("ple_gate_init")
     missing_ple = tmp_path / "missing-ple-config.pt"
     torch.save(missing_ple_payload, missing_ple)
-    with pytest.raises(ValueError, match="ple_quant_bits"):
+    with pytest.raises(ValueError, match="ple_gate_init"):
         load_checkpoint(missing_ple)
 
     missing_kda_payload = torch.load(path, weights_only=False)

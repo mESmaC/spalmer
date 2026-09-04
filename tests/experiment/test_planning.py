@@ -32,11 +32,11 @@ def test_parameter_breakdown_matches_known_core_shape() -> None:
     )
     breakdown = count_parameters(config)
 
-    assert breakdown.total == 9_908_080
-    assert breakdown.ple_lookup == 2_097_152
+    assert breakdown.total == 8_059_373
+    assert breakdown.ple_lookup == 248_448
     assert breakdown.shared_channel == 786_432
     assert breakdown.expert_banks == 6_291_456
-    assert breakdown.low_bit_candidates == breakdown.ple_lookup + breakdown.expert_banks
+    assert breakdown.low_bit_candidates == 0
     assert sum(breakdown.components.values()) == breakdown.total
     assert breakdown.components["shared_channel"] == breakdown.shared_channel
 
@@ -60,7 +60,7 @@ def test_qr_ple_breakdown_uses_exact_input_and_sqrt_vocab_refreshes() -> None:
     assert breakdown.ple_qr_refresh == 7 * (remainder_rows + quotient_rows) * 128
     assert breakdown.ple_lookup == breakdown.ple_exact_input + breakdown.ple_qr_refresh
     assert breakdown.ple_controls == 7 * 3
-    assert breakdown.low_bit_candidates == breakdown.expert_banks
+    assert breakdown.low_bit_candidates == 0
     assert breakdown.total == sum(breakdown.components.values())
     assert config.to_dict()["ple_backend"] == "qr"
 
@@ -199,7 +199,7 @@ def test_search_space_constraints_are_honored() -> None:
         shared_width=256,
         ple_expansion=2,
     )
-    assert plan.parameters.total == 9_908_080
+    assert plan.parameters.total == 8_059_373
 
 
 @pytest.mark.parametrize(
@@ -276,7 +276,7 @@ def _breakdown_shape(**overrides: object) -> ModelScaleConfig:
 def test_recurrence_adds_adapter_and_keeps_fingerprints() -> None:
     flat = _breakdown_shape()
     flat_counts = count_parameters(flat)
-    assert flat_counts.total == 9_908_080
+    assert flat_counts.total == 8_059_373
     assert flat_counts.recurrence == 0
     assert "recurrence" not in flat_counts.to_dict()
     assert "recurrence" not in flat.to_dict()
@@ -291,7 +291,7 @@ def test_recurrence_adds_adapter_and_keeps_fingerprints() -> None:
 
     adapter = 2 * 128 * 128 + 2 * 128
     assert counts.recurrence == adapter
-    assert counts.total == 9_908_080 + adapter
+    assert counts.total == flat_counts.total + adapter
     assert counts.to_dict()["recurrence"] == adapter
     assert sum(counts.components.values()) == counts.total
     assert recurrent.core_layers == 6

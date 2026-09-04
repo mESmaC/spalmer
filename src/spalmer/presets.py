@@ -29,6 +29,7 @@ from spalmer.experiment.planning import (
 )
 from spalmer.experts import MicroExpertsConfig
 from spalmer.memory import ATXYConfig
+from spalmer.precision import ExpertActivationFormat, ExpertWeightFormat
 
 if TYPE_CHECKING:
     from spalmer.experts import ParameterAccounting
@@ -47,11 +48,12 @@ def plan_named_scale(
     *,
     vocab_size: int,
     search_space: ScaleSearchSpace | None = None,
-    expert_weight_format: Literal["mxfp4", "nvfp4"] = "mxfp4",
+    expert_weight_format: ExpertWeightFormat = "bfloat16",
+    expert_activation_format: ExpertActivationFormat | None = None,
     directional: DirectionalScaleConfig | None = None,
     atxy: ATXYScaleConfig | None = None,
     recurrence: RecurrenceScaleConfig | None = None,
-    ple_backend: Literal["fake_qat", "qr"] = "fake_qat",
+    ple_backend: Literal["qr"] = "qr",
 ) -> ScalePlan:
     """Plan a conventional experiment rung as an inclusive total budget."""
 
@@ -63,6 +65,7 @@ def plan_named_scale(
         ) from error
     kwargs: dict[str, Any] = {
         "expert_weight_format": expert_weight_format,
+        "expert_activation_format": expert_activation_format,
         "directional": directional,
         "atxy": atxy,
         "recurrence": recurrence,
@@ -113,7 +116,6 @@ _MODEL_SHAPE_FIELDS = {
     "d_model",
     "n_layers",
     "ple_expansion_factor",
-    "ple_quant_bits",
     "ple_backend",
     "token_mixer_pattern",
     "recurrence",
@@ -132,7 +134,6 @@ _EXPERT_SHAPE_FIELDS = {
     "expert_weight_format",
     "expert_activation_format",
     "expert_master_dtype",
-    "expert_fake_quantization",
 }
 
 
@@ -177,13 +178,9 @@ def build_configs(
         "tokenizer_version": tokenizer_version,
         "tokenizer_fingerprint": tokenizer_fingerprint,
         "ple_expansion_factor": config.ple_expansion,
-        "ple_quant_bits": 4,
         "token_mixer_pattern": ("kda", "kda", "kda", "mla"),
     }
-    if config.ple_backend != "fake_qat":
-        # Legacy plans keep constructing the exact historical config; only a
-        # QR-PLE plan names its backend.
-        model_fields["ple_backend"] = config.ple_backend
+    model_fields["ple_backend"] = config.ple_backend
     if config.recurrence is not None:
         # Imported lazily so a non-recurrent build never depends on the
         # recurrence config type being present.

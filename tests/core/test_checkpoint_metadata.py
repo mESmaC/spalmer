@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -11,14 +10,13 @@ from spalmer.checkpoint import (
     FORMAT_VERSION,
     _load_checkpoint_tokenizer,
     _load_model_parameter_dtype,
-    _migrate_experts_config,
     _model_parameter_dtype,
     _serialize_tokenizer_binding,
     _validate_checkpoint_parameter_state_dtype,
     load_checkpoint,
     save_checkpoint,
 )
-from spalmer.config import PLEConfig, RecurrenceConfig, SPALMERConfig
+from spalmer.config import RecurrenceConfig, SPALMERConfig
 from spalmer.experiment.state import tensor_state_sha256
 from spalmer.experts import MicroExpertsConfig
 from spalmer.factory import build_spalmer_model
@@ -50,18 +48,17 @@ class _Tokenizer:
         return "hello"
 
 
-def _experts(*, master_dtype: str = "bfloat16") -> MicroExpertsConfig:
-    legacy = master_dtype == "float32"
+def _experts() -> MicroExpertsConfig:
     return MicroExpertsConfig(
         d_model=8,
         num_experts=2,
         expert_inter_dim=4,
         active_experts=2,
-        expert_weight_format="legacy_int" if legacy else "mxfp4",
-        expert_activation_format="bfloat16" if legacy else "mxfp8",
-        expert_master_dtype=master_dtype,
-        expert_qat_backend="reference" if legacy else "auto",
-        expert_promotion_format="bfloat16" if legacy else "mxfp8",
+        expert_weight_format="bfloat16",
+        expert_activation_format="bfloat16",
+        expert_master_dtype="bfloat16",
+        expert_qat_backend="auto",
+        expert_promotion_format="bfloat16",
     )
 
 
@@ -93,7 +90,6 @@ def test_v5_model_dtype_is_authoritative_and_must_match_expert_recipe() -> None:
             5,
             _experts(),
         )
-    assert _load_model_parameter_dtype({}, 4, _experts(master_dtype="float32")) == "float32"
 
 
 def test_saved_parameter_payload_must_match_declared_model_dtype() -> None:
@@ -139,45 +135,12 @@ def test_local_hf_binding_persists_an_absolute_source(tmp_path: Path) -> None:
     assert binding["identity"]["source"] == str(local.resolve())
 
 
-def test_legacy_top1_and_decoupled_residency_configs_migrate_to_valid_capacity() -> None:
-    v1 = {
-        "d_model": 8,
-        "num_experts": 4,
-        "expert_inter_dim": 4,
-        "active_experts": 1,
-        "min_active_experts": 1,
-        "max_active_experts": 1,
-        "router_bias": False,
-        "initializer_range": 0.02,
-    }
-    migrated_v1 = _migrate_experts_config(v1, 1)
-    assert migrated_v1["min_resident_experts"] == 1
-    MicroExpertsConfig(**migrated_v1)
-
-    v4 = _experts(master_dtype="float32")
-    raw_v4 = asdict(v4)
-    for field in (
-        "expert_weight_format",
-        "expert_activation_format",
-        "expert_master_dtype",
-        "expert_qat_backend",
-        "expert_promotion_format",
-    ):
-        raw_v4.pop(field)
-    raw_v4.update(num_experts=8, max_active_experts=2, min_resident_experts=4)
-    migrated_v4 = _migrate_experts_config(raw_v4, 4)
-    assert migrated_v4["min_resident_experts"] == 4
-    MicroExpertsConfig(**migrated_v4)
-
-
 _RECURRENCE = RecurrenceConfig(1, 2, 1, default_steps=5, latent_init_std=0.5)
 
 
 def _bundle_inputs(
     vocab,
     recurrence: RecurrenceConfig | None,
-    *,
-    ple_backend: str = "fake_qat",
 ):
     model_config = SPALMERConfig(
         vocab_size=len(vocab),
@@ -186,7 +149,6 @@ def _bundle_inputs(
         tokenizer_version=vocab.version,
         tokenizer_fingerprint=vocab.fingerprint,
         ple_expansion_factor=1,
-        ple_backend=ple_backend,
         recurrence=recurrence,
     )
     kda_config = KDAConfig(
@@ -205,10 +167,10 @@ def _bundle_inputs(
         num_experts=4,
         expert_inter_dim=3,
         active_experts=2,
-        expert_weight_format="legacy_int",
+        expert_weight_format="bfloat16",
         expert_activation_format="bfloat16",
-        expert_master_dtype="float32",
-        expert_qat_backend="reference",
+        expert_master_dtype="bfloat16",
+        expert_qat_backend="auto",
         expert_promotion_format="bfloat16",
     )
     return model_config, kda_config, mla_config, experts_config
@@ -217,17 +179,16 @@ def _bundle_inputs(
 def _save_bundle(
     path: Path,
     recurrence: RecurrenceConfig | None,
-    *,
-    ple_backend: str = "fake_qat",
 ):
     vocab = train([Sample("alpha beta gamma delta " * 8)])
     model_config, kda_config, mla_config, experts_config = _bundle_inputs(
         vocab,
         recurrence,
-        ple_backend=ple_backend,
     )
     torch.manual_seed(0)
-    model = build_spalmer_model(model_config, kda_config, mla_config, experts_config).eval()
+    model = build_spalmer_model(
+        model_config, kda_config, mla_config, experts_config
+    ).to(dtype=torch.bfloat16).eval()
     save_checkpoint(
         path,
         model,
@@ -246,30 +207,38 @@ def _rewrite_payload(source: Path, destination: Path, mutate) -> Path:
     return destination
 
 
-def test_v5_bundle_loads_with_recurrence_none_and_current_expert_schema(tmp_path: Path) -> None:
-    original = _save_bundle(tmp_path / "current-flat.pt", None)[0]
+def _declare_v7_qr_schema(payload: dict) -> None:
+    payload["format_version"] = 7
+    payload["model_config"].update(
+        ple_quant_bits=4,
+        ple_stochastic_rounding=True,
+        ple_sparse_gradients=False,
+        ple_alternation_policy="fixed_layer_parity",
+        ple_reference_max_numel=100_000_000,
+    )
+    payload["experts_config"].update(
+        expert_quant_bits=4,
+        expert_fake_quantization=False,
+        expert_stochastic_rounding=False,
+    )
+
+
+def test_v5_fake_qat_bundle_is_rejected_before_model_construction(tmp_path: Path) -> None:
+    _save_bundle(tmp_path / "current-flat.pt", None)
     assert (
         torch.load(tmp_path / "current-flat.pt", weights_only=False)["format_version"]
         == FORMAT_VERSION
-        == 7
+        == 8
     )
 
     def to_v5(payload: dict) -> None:
         payload["format_version"] = 5
         payload["model_config"].pop("recurrence")
+        payload["model_config"]["ple_backend"] = "fake_qat"
 
     legacy = _rewrite_payload(tmp_path / "current-flat.pt", tmp_path / "v5-flat.pt", to_v5)
-    # eval(): load_checkpoint returns a freshly built module in training mode,
-    # where the PLE fake-QAT path rounds stochastically.
-    model = load_checkpoint(legacy)[0].eval()
-
-    assert model.config.recurrence is None
-    assert model.backbone.recurrence is None
-    assert not model.is_recurrent
-    assert not any(".recurrence." in name for name, _ in model.named_parameters())
-    prompt = torch.tensor([[1, 2, 3]])
-    with torch.no_grad():
-        torch.testing.assert_close(model(prompt).logits, original(prompt).logits)
+    with pytest.raises(ValueError, match="retired fake-QAT PLE"):
+        load_checkpoint(legacy)
 
 
 def test_current_recurrent_bundle_round_trips_adapter_and_default_steps(tmp_path: Path) -> None:
@@ -277,7 +246,7 @@ def test_current_recurrent_bundle_round_trips_adapter_and_default_steps(tmp_path
     original = _save_bundle(path, _RECURRENCE)[0]
     payload = torch.load(path, map_location="cpu", weights_only=False)
 
-    assert payload["format_version"] == FORMAT_VERSION == 7
+    assert payload["format_version"] == FORMAT_VERSION == 8
     assert payload["model_config"]["recurrence"] == {
         "prelude_layers": 1,
         "core_layers": 2,
@@ -332,9 +301,11 @@ def test_pre_v6_payloads_tolerate_a_null_recurrence_but_not_a_populated_one(
     def keep_null_recurrence(payload: dict) -> None:
         payload["format_version"] = 5
         assert payload["model_config"]["recurrence"] is None
+        payload["model_config"]["ple_backend"] = "fake_qat"
 
     tolerated = _rewrite_payload(flat, tmp_path / "v5-null.pt", keep_null_recurrence)
-    assert load_checkpoint(tolerated)[0].config.recurrence is None
+    with pytest.raises(ValueError, match="retired fake-QAT PLE"):
+        load_checkpoint(tolerated)
 
     recurrent = tmp_path / "current-recurrent.pt"
     _save_bundle(recurrent, _RECURRENCE)
@@ -365,34 +336,7 @@ def test_recurrence_schema_is_exact(tmp_path: Path) -> None:
         load_checkpoint(missing)
 
 
-def test_qr_backend_ignores_legacy_fake_quantization_controls() -> None:
-    config = PLEConfig(
-        vocab_size=64,
-        d_model=8,
-        n_layers=4,
-        backend="qr",
-        quant_bits=16,
-        stochastic_rounding=True,
-        reference_max_numel=0,
-        quant_eps=-1.0,
-    )
-
-    assert config.backend == "qr"
-    assert config.to_dict()["backend"] == "qr"
-
-
-def test_qr_backend_rejects_sparse_gradients() -> None:
-    with pytest.raises(ValueError, match="QR-PLE uses dense gradients"):
-        PLEConfig(
-            vocab_size=64,
-            d_model=8,
-            n_layers=4,
-            backend="qr",
-            sparse_gradients=True,
-        )
-
-
-def test_pre_v7_missing_ple_backend_is_explicitly_migrated_to_fake_qat(
+def test_pre_v7_missing_ple_backend_is_rejected_as_fake_qat(
     tmp_path: Path,
 ) -> None:
     current = tmp_path / "current-flat.pt"
@@ -403,10 +347,46 @@ def test_pre_v7_missing_ple_backend_is_explicitly_migrated_to_fake_qat(
         payload["model_config"].pop("ple_backend")
 
     legacy = _rewrite_payload(current, tmp_path / "v6-no-backend.pt", to_v6_without_backend)
-    loaded = load_checkpoint(legacy)[0]
+    with pytest.raises(ValueError, match="retired fake-QAT PLE"):
+        load_checkpoint(legacy)
 
-    assert loaded.config.ple_backend == "fake_qat"
-    assert loaded.config.ple_config().backend == "fake_qat"
+
+def test_v7_fake_qat_ple_metadata_is_rejected_before_construction(tmp_path: Path) -> None:
+    current = tmp_path / "current-flat.pt"
+    _save_bundle(current, None)
+
+    def request_fake_qat(payload: dict) -> None:
+        _declare_v7_qr_schema(payload)
+        payload["model_config"]["ple_backend"] = "fake_qat"
+
+    invalid = _rewrite_payload(current, tmp_path / "v7-fake-ple.pt", request_fake_qat)
+    with pytest.raises(ValueError, match="retired fake-QAT PLE"):
+        load_checkpoint(invalid)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"expert_fake_quantization": True},
+        {"expert_stochastic_rounding": True},
+        {"expert_qat_backend": "reference"},
+        {"expert_weight_format": "legacy_int"},
+        {"expert_master_dtype": "float32"},
+    ],
+)
+def test_v8_emulated_expert_metadata_is_rejected_before_construction(
+    tmp_path: Path,
+    override: dict[str, object],
+) -> None:
+    current = tmp_path / "current-flat.pt"
+    _save_bundle(current, None)
+
+    def request_emulation(payload: dict) -> None:
+        payload["experts_config"].update(override)
+
+    invalid = _rewrite_payload(current, tmp_path / "v8-emulated-experts.pt", request_emulation)
+    with pytest.raises(ValueError, match="retired emulated expert precision"):
+        load_checkpoint(invalid)
 
 
 def test_pre_v7_checkpoint_cannot_claim_qr_weights(tmp_path: Path) -> None:
@@ -427,6 +407,7 @@ def test_v7_checkpoint_requires_explicit_ple_backend(tmp_path: Path) -> None:
     _save_bundle(current, None)
 
     def remove_backend(payload: dict) -> None:
+        _declare_v7_qr_schema(payload)
         payload["model_config"].pop("ple_backend")
 
     invalid = _rewrite_payload(current, tmp_path / "v7-no-backend.pt", remove_backend)
@@ -435,8 +416,9 @@ def test_v7_checkpoint_requires_explicit_ple_backend(tmp_path: Path) -> None:
 
 
 def test_v7_qr_checkpoint_round_trips_exact_layout_and_logits(tmp_path: Path) -> None:
-    path = tmp_path / "v7-qr.pt"
-    original, _ = _save_bundle(path, None, ple_backend="qr")
+    current = tmp_path / "current-qr.pt"
+    original, _ = _save_bundle(current, None)
+    path = _rewrite_payload(current, tmp_path / "v7-qr.pt", _declare_v7_qr_schema)
     payload = torch.load(path, map_location="cpu", weights_only=False)
 
     assert payload["format_version"] == 7
@@ -458,7 +440,7 @@ def test_adapter_presence_must_match_config(tmp_path: Path) -> None:
     flat_inputs = _bundle_inputs(vocab, None)
 
     torch.manual_seed(0)
-    recurrent = build_spalmer_model(*recurrent_inputs).eval()
+    recurrent = build_spalmer_model(*recurrent_inputs).to(dtype=torch.bfloat16).eval()
     recurrent.backbone.recurrence = None
     with pytest.raises(ValueError, match="recurrence configuration disagrees"):
         save_checkpoint(
@@ -471,7 +453,7 @@ def test_adapter_presence_must_match_config(tmp_path: Path) -> None:
         )
 
     torch.manual_seed(0)
-    flat = build_spalmer_model(*flat_inputs).eval()
+    flat = build_spalmer_model(*flat_inputs).to(dtype=torch.bfloat16).eval()
     flat.backbone.recurrence = LatentRecurrence(flat.config.d_model)
     with pytest.raises(ValueError, match="recurrence configuration disagrees"):
         save_checkpoint(

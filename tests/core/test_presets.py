@@ -40,8 +40,8 @@ def _one_shape_search() -> ScaleSearchSpace:
 def _tiny_plan(
     *,
     extensions: bool = False,
-    expert_weight_format: str = "mxfp4",
-    ple_backend: str = "fake_qat",
+    expert_weight_format: str = "bfloat16",
+    ple_backend: str = "qr",
 ):
     directional = (
         DirectionalScaleConfig(num_feature_groups=4, lateral_rank=4)
@@ -102,7 +102,8 @@ def test_scale_plan_builds_matching_static_configs(extensions, expert_weight_for
     assert bundle.experts.resolved_inter_dim == config.expert_width
     assert bundle.experts.resolved_shared_inter_dim == config.resolved_shared_width
     assert bundle.experts.expert_weight_format == expert_weight_format
-    assert bundle.experts.expert_activation_format == "mxfp8"
+    expected_activation = "nvfp4" if expert_weight_format == "nvfp4" else "mxfp8"
+    assert bundle.experts.expert_activation_format == expected_activation
     assert bundle.experts.expert_master_dtype == "bfloat16"
     assert bundle.experts.potentiation_budget == 0
 
@@ -162,7 +163,6 @@ def test_qr_plan_builds_exact_layout_and_matches_measured_accounting() -> None:
         tokenizer_version=1,
         tokenizer_fingerprint="qr-presets",
         attention_backend="reference",
-        experts_overrides={"expert_qat_backend": "reference"},
     )
     model = bundle.build()
     accounting = account_parameters(model)
@@ -209,13 +209,6 @@ def test_plan_fields_cannot_be_silently_overridden() -> None:
             tokenizer_version=1,
             tokenizer_fingerprint="presets",
             experts_overrides={"num_experts": 200},
-        )
-    with pytest.raises(ValueError, match="ScalePlan fields"):
-        build_configs(
-            plan,
-            tokenizer_version=1,
-            tokenizer_fingerprint="presets",
-            experts_overrides={"expert_fake_quantization": False},
         )
     with pytest.raises(KeyError, match="unknown scale"):
         plan_named_scale("7B", vocab_size=32_000)
@@ -276,7 +269,6 @@ def test_recurrent_accounting_matches_the_plan_component_by_component() -> None:
         tokenizer_version=1,
         tokenizer_fingerprint="presets",
         attention_backend="reference",
-        experts_overrides={"expert_qat_backend": "reference"},
     ).build()
     accounting = account_parameters(model)
 

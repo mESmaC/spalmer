@@ -1,4 +1,4 @@
-"""QR-PLE planning, preset, and CLI surfaces; legacy counts stay frozen."""
+"""QR-PLE-only planning, preset, and CLI surfaces."""
 
 from __future__ import annotations
 
@@ -47,30 +47,20 @@ def _one_shape_search() -> ScaleSearchSpace:
     )
 
 
-def test_legacy_golden_count_and_fingerprint_dicts_are_unchanged() -> None:
-    legacy = _shape()
-    counts = count_parameters(legacy)
+def test_default_plan_is_qr_ple_with_dense_bf16_experts() -> None:
+    shape = _shape()
+    counts = count_parameters(shape)
 
-    assert PLE_BACKENDS == ("fake_qat", "qr")
-    assert legacy.ple_backend == "fake_qat"
-    assert counts.total == 9_908_080
-    assert (
-        plan_configuration(10_000_000, 8_192).fingerprint
-        == "0f4605145e5034a44ea43338547ddf912575bbda59040e0170f1bdf1e48d8375"
-    )
-    assert counts.ple_exact_input == 0
-    assert counts.ple_qr_refresh == 0
-    assert counts.fake_qat_ple_lookup == counts.ple_lookup
-    assert counts.low_bit_candidates == counts.ple_lookup + counts.expert_banks
-    assert legacy.ple_lane_moduli == ()
-    assert "ple_backend" not in legacy.to_dict()
-    assert "ple_exact_input" not in counts.to_dict()
-    assert "ple_qr_refresh" not in counts.to_dict()
-
-    explicit = _shape(ple_backend="fake_qat")
-    assert explicit == legacy
-    assert explicit.to_dict() == legacy.to_dict()
-    assert "ple" not in plan_configuration(2_000_000, 512).to_dict()
+    assert PLE_BACKENDS == ("qr",)
+    assert shape.ple_backend == "qr"
+    assert shape.expert_weight_format == "bfloat16"
+    assert shape.expert_activation_format == "bfloat16"
+    assert counts.ple_exact_input > 0
+    assert counts.ple_qr_refresh > 0
+    assert counts.low_bit_candidates == 0
+    assert shape.ple_lane_moduli
+    assert shape.to_dict()["ple_backend"] == "qr"
+    assert "ple" in plan_configuration(2_000_000, 512).to_dict()
 
 
 def test_qr_counts_exact_input_and_refresh_lanes() -> None:
@@ -89,17 +79,14 @@ def test_qr_counts_exact_input_and_refresh_lanes() -> None:
     assert counts.ple_lookup == counts.ple_exact_input + counts.ple_qr_refresh
     assert counts.ple_controls == 7 * (2 + 1)
     assert counts.ple_total == counts.ple_lookup + counts.ple_controls
-    assert counts.fake_qat_ple_lookup == 0
-    assert counts.low_bit_candidates == counts.expert_banks
-    assert counts.dense_parameters == counts.total - counts.expert_banks
+    assert counts.low_bit_candidates == 0
+    assert counts.dense_parameters == counts.total
     assert sum(counts.components.values()) == counts.total
 
-    legacy = count_parameters(_shape())
-    assert counts.total == legacy.total - legacy.ple_total + counts.ple_total
     payload = counts.to_dict()
     assert payload["ple_exact_input"] == counts.ple_exact_input
     assert payload["ple_qr_refresh"] == counts.ple_qr_refresh
-    assert payload["low_bit_candidates"] == counts.expert_banks
+    assert payload["low_bit_candidates"] == 0
     assert qr.to_dict()["ple_backend"] == "qr"
 
 
@@ -108,24 +95,22 @@ def test_invalid_ple_backend_fails_closed() -> None:
         _shape(ple_backend="int4")
     with pytest.raises(ValueError, match="ple_backend"):
         plan_configuration(1_000_000, 300, ple_backend="int4")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fake-QAT PLE is retired"):
+        _shape(ple_backend="fake_qat")
+    with pytest.raises(ValueError, match="fake-QAT PLE is retired"):
+        plan_configuration(1_000_000, 300, ple_backend="fake_qat")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
     "target, vocab_size",
     [(10_000_000, 8_192), (50_000_000, 8_192), (100_000_000, 32_768)],
 )
-def test_qr_plan_redistributes_freed_capacity_near_target(target: int, vocab_size: int) -> None:
-    legacy = plan_configuration(target, vocab_size)
-    qr = plan_configuration(target, vocab_size, ple_backend="qr")
+def test_qr_plan_lands_near_target(target: int, vocab_size: int) -> None:
+    qr = plan_configuration(target, vocab_size)
 
     assert qr.config.ple_backend == "qr"
     assert qr.parameters == count_parameters(qr.config)
     assert abs(qr.relative_error) <= 0.01
-    assert qr.parameters.ple_total < legacy.parameters.ple_total
-    non_ple_legacy = legacy.parameters.total - legacy.parameters.ple_total
-    non_ple_qr = qr.parameters.total - qr.parameters.ple_total
-    assert non_ple_qr > non_ple_legacy
-    assert qr.fingerprint != legacy.fingerprint
 
     block = qr.to_dict()["ple"]
     assert block["backend"] == "qr"
@@ -146,7 +131,7 @@ def test_plan_ladder_threads_ple_backend_to_every_rung() -> None:
     assert [plan.config.ple_backend for plan in plans] == ["qr", "qr"]
     assert all("ple" in plan.to_dict() for plan in plans)
     legacy = plan_ladder((1_000_000, 2_000_000), policy)
-    assert all(plan.config.ple_backend == "fake_qat" for plan in legacy)
+    assert all(plan.config.ple_backend == "qr" for plan in legacy)
 
 
 def test_build_configs_passes_qr_backend_and_protects_it() -> None:
@@ -157,12 +142,12 @@ def test_build_configs_passes_qr_backend_and_protects_it() -> None:
     assert bundle.model.ple_backend == "qr"
     assert bundle.model.ple_expansion_factor == qr_plan.config.ple_expansion
 
-    legacy = build_configs(
+    default = build_configs(
         plan_configuration(1_000_000, 300, search_space=_one_shape_search()),
         tokenizer_version=1,
         tokenizer_fingerprint="presets",
     )
-    assert legacy.model.ple_backend == "fake_qat"
+    assert default.model.ple_backend == "qr"
 
     with pytest.raises(ValueError, match="ScalePlan fields"):
         build_configs(
@@ -183,7 +168,6 @@ def test_qr_accounting_matches_the_plan_component_by_component() -> None:
         tokenizer_version=1,
         tokenizer_fingerprint="presets",
         attention_backend="reference",
-        experts_overrides={"expert_qat_backend": "reference"},
     )
     model = bundle.build()
 
@@ -212,6 +196,6 @@ def test_plan_cli_reports_the_ple_backend(capsys: pytest.CaptureFixture[str]) ->
     assert "qr" in table
 
     _run_plan(_plan_parser().parse_args(["1m", "--vocab-size", "300", "--json"]))
-    legacy = json.loads(capsys.readouterr().out)
-    assert "ple_backend" not in legacy[0]["config"]
-    assert "ple" not in legacy[0]
+    default = json.loads(capsys.readouterr().out)
+    assert default[0]["config"]["ple_backend"] == "qr"
+    assert default[0]["ple"]["backend"] == "qr"

@@ -43,7 +43,7 @@ class ParameterAccounting:
     active_experts_per_token: int
     parameters_per_expert: int
     # Persistent/master storage width. This intentionally does not describe
-    # fake-quantized forward execution.
+    # the native packed format used by forward execution.
     nominal_bits: dict[str, int] = field(default_factory=dict)
     # Forward execution widths where they differ from persistent storage
     # (currently PLE lookup weights and routed-expert weights).
@@ -263,11 +263,6 @@ def account_parameters(
     }
     execution_bits: dict[str, int] = {}
     config = getattr(model, "config", None)
-    ple_bits = getattr(config, "ple_quant_bits", None)
-    if ple_bits is not None and getattr(config, "ple_backend", "fake_qat") == "fake_qat":
-        # Only the legacy fake-QAT lookup derives low-bit forward operands;
-        # QR-PLE codebooks execute at their BF16 storage width.
-        execution_bits["embeddings"] = int(ple_bits)
     if banks:
         expert_config = banks[0].config
         bits["expert_pool"] = int(expert_config.expert_master_bits)

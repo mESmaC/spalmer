@@ -3,9 +3,9 @@
 A tensorized bank of small gated-MLP experts with learned per-token routing,
 realized-NLL calibration, an expert-wide potentiation controller, and a
 request-level inference residency controller that expands the active set while
-effective surprise stays above average. Routed-expert QAT derives selectable
-MXFP4/NVFP4 forward weights and MXFP8 activations from one BF16 master payload;
-native mixed W4A8 kernels and packed deployment remain later backends. The
+effective surprise stays above average. Routed experts execute only through a
+verified native BF16, NVFP4, or MXFP8 provider selected for the current GPU;
+low-precision kernels derive packed operands from one BF16 master payload. The
 inference offload backend keeps complete expert masters on CPU and stages only
 request-resident rows on the execution device.
 """
@@ -22,12 +22,6 @@ from spalmer.experts.offload import (
     enable_expert_offload,
 )
 from spalmer.experts.potentiation import ExpertPotentiationController
-from spalmer.experts.qat import (
-    ExpertQATBackendStatus,
-    ExpertQATConfig,
-    expert_qat_backend_status,
-    require_expert_qat_backend,
-)
 from spalmer.experts.residency import (
     ExpertResidency,
     ResidencyDecision,
@@ -41,8 +35,6 @@ __all__ = [
     "ExpertPotentiationController",
     "ExpertOffloadManager",
     "ExpertOffloadTelemetry",
-    "ExpertQATBackendStatus",
-    "ExpertQATConfig",
     "ExpertResidency",
     "MicroExpertBank",
     "MicroExpertChannelMixer",
@@ -56,9 +48,7 @@ __all__ = [
     "disable_expert_offload",
     "enable_expert_offload",
     "expert_utilization",
-    "expert_qat_backend_status",
     "load_balance_loss",
     "rank_nonresident_experts",
-    "require_expert_qat_backend",
     "select_least_surprised_experts",
 ]

@@ -106,8 +106,9 @@ def test_causal_lm_composes_blocks_and_computes_next_token_loss() -> None:
     assert output.loss is not None and torch.isfinite(output.loss)
 
     output.loss.backward()
-    assert model.backbone.embeddings.layers[0].weight.grad is not None
-    assert model.backbone.embeddings.layers[-1].weight.grad is not None
+    assert model.backbone.embeddings.layers[0].input_embedding.weight.grad is not None
+    assert model.backbone.embeddings.layers[-1].remainder_embedding.weight.grad is not None
+    assert model.backbone.embeddings.layers[-1].quotient_embedding.weight.grad is not None
     assert model.lm_head.weight.grad is not None
 
 

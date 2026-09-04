@@ -43,9 +43,9 @@ otherwise runs the plain-PyTorch correctness backend.
 ## Current implementation lanes
 
 - shared configuration and decoder assembly;
-- selectable per-layer embeddings: the checkpoint-compatible full-table
-  fake-QAT reference path, and QR-PLE with one exact input table followed by
-  multiplicative quotient/remainder refresh lanes trained directly in BF16;
+- QR-PLE with one exact input table followed by multiplicative
+  quotient/remainder refresh lanes trained directly in BF16; checkpoints that
+  require the retired full-table fake-QAT topology fail closed on load;
 - ranked-precedence distributional tokenization, with a character n-gram
   proxy model recursively scoring phrase and within-word splits, PMI-scored
   salvage merges, and Python-aware routing of code, comments/docstrings, and
@@ -66,10 +66,10 @@ otherwise runs the plain-PyTorch correctness backend.
   reports logical resident and per-token active parameter counts;
 - an always-on shared SwiGLU channel path beside the routed micro-experts
   (`shared_inter_dim`), with grouped batched expert execution and a per-expert
-  loop reference path;
-- routed-expert W4A8 QAT with selectable MXFP4 or NVFP4 forward weights,
-  MXFP8 expert inputs, one BF16 persistent/master weight payload, FP32 Adam
-  moments, and expert-wide promotion to MXFP8 or BF16 execution;
+  dense loop path;
+- native-only routed-expert precision selection, one BF16 persistent/master
+  weight payload, FP32 Adam moments, and expert-wide promotion to MXFP8 or BF16
+  execution when the selected real kernel supports those operands;
 - feature-gated C16 lateral mixing with peer-aware active silencing
   (`directional_config`) and feature-gated ATXY exact memory (`atxy_config`,
   acting only on forward calls that pass an `ATXYRequest`);
@@ -121,23 +121,25 @@ Adam moments remain in pinned host memory when available, while bounded moment
 chunks visit the accelerator for each update. Same-device moments remain the
 default.
 
-## Reference-backend boundary
+## Native precision boundary
 
-The legacy full-table PLE and routed-expert low-precision paths remain
-quantize/dequantize QAT correctness backends, so they do **not** provide
-packed-storage or low-bit GEMM speedups. QR-PLE does not simulate quantization:
-layer 0 is one exact table, and later layers use two vectorized BF16 codebook
-gathers, multiplicative lanes, scalar softmax reduction, and a gated residual.
-Its codebook size scales approximately with the square root of vocabulary size.
-The routed experts nevertheless exercise the requested MXFP4-or-NVFP4 weight
-and MXFP8 activation numerics from a BF16 master. A strict native request fails
-instead of silently using BF16 matmul. The installed SM120 software stack has no
-mixed W4A8 grouped kernel; native execution is a separate backend milestone.
-Backward currently uses BF16 autograd through the expert QAT STE; an explicit
-MXFP8 backward kernel is also a later backend milestone. Expert potentiation
-changes a complete expert's derived forward precision to MXFP8 or BF16 without
-adding another master copy. A hard allocation guard applies only to the legacy
-full-table PLE backend.
+New runs never use quantize/dequantize simulation. QR-PLE does not simulate
+quantization: layer 0 is one exact table, and later layers use two vectorized
+BF16 codebook gathers, multiplicative lanes, scalar softmax reduction, and a
+gated residual. Its codebook size scales approximately with the square root of
+vocabulary size. The full-table fake-QAT PLE and historical expert-emulation
+checkpoint formats are rejected before model construction; there is no
+emulated compatibility fallback.
+
+Run `spalmer precision --json` to inspect the exact weight/activation pairs
+available on the selected device. A pair is selectable only when a SPALMER
+provider verifies both its real forward and backward kernels; package presence
+or advertised hardware dtype support alone is insufficient. `auto` therefore
+selects a real provider or fails. BF16/BF16 is the portable default. MXFP4,
+NVFP4, MXFP6, and MXFP8 are exposed only when the corresponding native pair is
+integrated. In particular, an NVFP4/NVFP4 W4A4 kernel is not mislabeled as a
+mixed NVFP4/MXFP8 W4A8 kernel. Expert potentiation changes a complete expert's
+native execution precision without adding another master copy.
 
 The surprise-calibration target is mixture-level realized NLL attributed by
 routing responsibility. It is not a measured counterfactual NLL for every
@@ -153,6 +155,3 @@ Pass `--no-expert-offload` for all-resident CUDA inference.
 `--dynamic-residency` explicitly selects the older prompt-global masked policy
 and is experimental for checkpoints trained with full-pool routing. The cache
 runtime assumes serial generation.
-Legacy v1/v2 checkpoints have no calibrated average-surprise state unless one
-was recorded in metadata, so dynamic residency on those bundles uses the
-documented zero-baseline cold start.
