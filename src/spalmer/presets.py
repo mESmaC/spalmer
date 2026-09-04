@@ -51,6 +51,7 @@ def plan_named_scale(
     directional: DirectionalScaleConfig | None = None,
     atxy: ATXYScaleConfig | None = None,
     recurrence: RecurrenceScaleConfig | None = None,
+    ple_backend: Literal["fake_qat", "qr"] = "fake_qat",
 ) -> ScalePlan:
     """Plan a conventional experiment rung as an inclusive total budget."""
 
@@ -65,6 +66,7 @@ def plan_named_scale(
         "directional": directional,
         "atxy": atxy,
         "recurrence": recurrence,
+        "ple_backend": ple_backend,
     }
     if search_space is not None:
         kwargs["search_space"] = search_space
@@ -112,6 +114,7 @@ _MODEL_SHAPE_FIELDS = {
     "n_layers",
     "ple_expansion_factor",
     "ple_quant_bits",
+    "ple_backend",
     "token_mixer_pattern",
     "recurrence",
 }
@@ -177,6 +180,10 @@ def build_configs(
         "ple_quant_bits": 4,
         "token_mixer_pattern": ("kda", "kda", "kda", "mla"),
     }
+    if config.ple_backend != "fake_qat":
+        # Legacy plans keep constructing the exact historical config; only a
+        # QR-PLE plan names its backend.
+        model_fields["ple_backend"] = config.ple_backend
     if config.recurrence is not None:
         # Imported lazily so a non-recurrent build never depends on the
         # recurrence config type being present.

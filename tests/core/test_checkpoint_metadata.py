@@ -18,7 +18,7 @@ from spalmer.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from spalmer.config import RecurrenceConfig, SPALMERConfig
+from spalmer.config import PLEConfig, RecurrenceConfig, SPALMERConfig
 from spalmer.experiment.state import tensor_state_sha256
 from spalmer.experts import MicroExpertsConfig
 from spalmer.factory import build_spalmer_model
@@ -173,7 +173,12 @@ def test_legacy_top1_and_decoupled_residency_configs_migrate_to_valid_capacity()
 _RECURRENCE = RecurrenceConfig(1, 2, 1, default_steps=5, latent_init_std=0.5)
 
 
-def _bundle_inputs(vocab, recurrence: RecurrenceConfig | None):
+def _bundle_inputs(
+    vocab,
+    recurrence: RecurrenceConfig | None,
+    *,
+    ple_backend: str = "fake_qat",
+):
     model_config = SPALMERConfig(
         vocab_size=len(vocab),
         d_model=8,
@@ -181,6 +186,7 @@ def _bundle_inputs(vocab, recurrence: RecurrenceConfig | None):
         tokenizer_version=vocab.version,
         tokenizer_fingerprint=vocab.fingerprint,
         ple_expansion_factor=1,
+        ple_backend=ple_backend,
         recurrence=recurrence,
     )
     kda_config = KDAConfig(
@@ -208,9 +214,18 @@ def _bundle_inputs(vocab, recurrence: RecurrenceConfig | None):
     return model_config, kda_config, mla_config, experts_config
 
 
-def _save_bundle(path: Path, recurrence: RecurrenceConfig | None):
+def _save_bundle(
+    path: Path,
+    recurrence: RecurrenceConfig | None,
+    *,
+    ple_backend: str = "fake_qat",
+):
     vocab = train([Sample("alpha beta gamma delta " * 8)])
-    model_config, kda_config, mla_config, experts_config = _bundle_inputs(vocab, recurrence)
+    model_config, kda_config, mla_config, experts_config = _bundle_inputs(
+        vocab,
+        recurrence,
+        ple_backend=ple_backend,
+    )
     torch.manual_seed(0)
     model = build_spalmer_model(model_config, kda_config, mla_config, experts_config).eval()
     save_checkpoint(
@@ -232,14 +247,18 @@ def _rewrite_payload(source: Path, destination: Path, mutate) -> Path:
 
 
 def test_v5_bundle_loads_with_recurrence_none_and_current_expert_schema(tmp_path: Path) -> None:
-    original = _save_bundle(tmp_path / "v6-flat.pt", None)[0]
-    assert torch.load(tmp_path / "v6-flat.pt", weights_only=False)["format_version"] == 6
+    original = _save_bundle(tmp_path / "current-flat.pt", None)[0]
+    assert (
+        torch.load(tmp_path / "current-flat.pt", weights_only=False)["format_version"]
+        == FORMAT_VERSION
+        == 7
+    )
 
     def to_v5(payload: dict) -> None:
         payload["format_version"] = 5
         payload["model_config"].pop("recurrence")
 
-    legacy = _rewrite_payload(tmp_path / "v6-flat.pt", tmp_path / "v5-flat.pt", to_v5)
+    legacy = _rewrite_payload(tmp_path / "current-flat.pt", tmp_path / "v5-flat.pt", to_v5)
     # eval(): load_checkpoint returns a freshly built module in training mode,
     # where the PLE fake-QAT path rounds stochastically.
     model = load_checkpoint(legacy)[0].eval()
@@ -253,12 +272,12 @@ def test_v5_bundle_loads_with_recurrence_none_and_current_expert_schema(tmp_path
         torch.testing.assert_close(model(prompt).logits, original(prompt).logits)
 
 
-def test_v6_recurrent_bundle_round_trips_adapter_and_default_steps(tmp_path: Path) -> None:
-    path = tmp_path / "v6-recurrent.pt"
+def test_current_recurrent_bundle_round_trips_adapter_and_default_steps(tmp_path: Path) -> None:
+    path = tmp_path / "current-recurrent.pt"
     original = _save_bundle(path, _RECURRENCE)[0]
     payload = torch.load(path, map_location="cpu", weights_only=False)
 
-    assert payload["format_version"] == FORMAT_VERSION == 6
+    assert payload["format_version"] == FORMAT_VERSION == 7
     assert payload["model_config"]["recurrence"] == {
         "prelude_layers": 1,
         "core_layers": 2,
@@ -307,7 +326,7 @@ def test_v6_recurrent_bundle_round_trips_adapter_and_default_steps(tmp_path: Pat
 def test_pre_v6_payloads_tolerate_a_null_recurrence_but_not_a_populated_one(
     tmp_path: Path,
 ) -> None:
-    flat = tmp_path / "v6-flat.pt"
+    flat = tmp_path / "current-flat.pt"
     _save_bundle(flat, None)
 
     def keep_null_recurrence(payload: dict) -> None:
@@ -317,7 +336,7 @@ def test_pre_v6_payloads_tolerate_a_null_recurrence_but_not_a_populated_one(
     tolerated = _rewrite_payload(flat, tmp_path / "v5-null.pt", keep_null_recurrence)
     assert load_checkpoint(tolerated)[0].config.recurrence is None
 
-    recurrent = tmp_path / "v6-recurrent.pt"
+    recurrent = tmp_path / "current-recurrent.pt"
     _save_bundle(recurrent, _RECURRENCE)
 
     def backdate(payload: dict) -> None:
@@ -328,7 +347,7 @@ def test_pre_v6_payloads_tolerate_a_null_recurrence_but_not_a_populated_one(
 
 
 def test_recurrence_schema_is_exact(tmp_path: Path) -> None:
-    path = tmp_path / "v6-recurrent.pt"
+    path = tmp_path / "current-recurrent.pt"
     _save_bundle(path, _RECURRENCE)
 
     def add_key(payload: dict) -> None:
@@ -344,6 +363,93 @@ def test_recurrence_schema_is_exact(tmp_path: Path) -> None:
     missing = _rewrite_payload(path, tmp_path / "missing-key.pt", drop_key)
     with pytest.raises(ValueError, match="invalid recurrence configuration fields"):
         load_checkpoint(missing)
+
+
+def test_qr_backend_ignores_legacy_fake_quantization_controls() -> None:
+    config = PLEConfig(
+        vocab_size=64,
+        d_model=8,
+        n_layers=4,
+        backend="qr",
+        quant_bits=16,
+        stochastic_rounding=True,
+        reference_max_numel=0,
+        quant_eps=-1.0,
+    )
+
+    assert config.backend == "qr"
+    assert config.to_dict()["backend"] == "qr"
+
+
+def test_qr_backend_rejects_sparse_gradients() -> None:
+    with pytest.raises(ValueError, match="QR-PLE uses dense gradients"):
+        PLEConfig(
+            vocab_size=64,
+            d_model=8,
+            n_layers=4,
+            backend="qr",
+            sparse_gradients=True,
+        )
+
+
+def test_pre_v7_missing_ple_backend_is_explicitly_migrated_to_fake_qat(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "current-flat.pt"
+    _save_bundle(current, None)
+
+    def to_v6_without_backend(payload: dict) -> None:
+        payload["format_version"] = 6
+        payload["model_config"].pop("ple_backend")
+
+    legacy = _rewrite_payload(current, tmp_path / "v6-no-backend.pt", to_v6_without_backend)
+    loaded = load_checkpoint(legacy)[0]
+
+    assert loaded.config.ple_backend == "fake_qat"
+    assert loaded.config.ple_config().backend == "fake_qat"
+
+
+def test_pre_v7_checkpoint_cannot_claim_qr_weights(tmp_path: Path) -> None:
+    current = tmp_path / "current-flat.pt"
+    _save_bundle(current, None)
+
+    def backdate_qr(payload: dict) -> None:
+        payload["format_version"] = 6
+        payload["model_config"]["ple_backend"] = "qr"
+
+    invalid = _rewrite_payload(current, tmp_path / "v6-qr.pt", backdate_qr)
+    with pytest.raises(ValueError, match="predates QR-PLE"):
+        load_checkpoint(invalid)
+
+
+def test_v7_checkpoint_requires_explicit_ple_backend(tmp_path: Path) -> None:
+    current = tmp_path / "current-flat.pt"
+    _save_bundle(current, None)
+
+    def remove_backend(payload: dict) -> None:
+        payload["model_config"].pop("ple_backend")
+
+    invalid = _rewrite_payload(current, tmp_path / "v7-no-backend.pt", remove_backend)
+    with pytest.raises(ValueError, match=r"missing=\['ple_backend'\]"):
+        load_checkpoint(invalid)
+
+
+def test_v7_qr_checkpoint_round_trips_exact_layout_and_logits(tmp_path: Path) -> None:
+    path = tmp_path / "v7-qr.pt"
+    original, _ = _save_bundle(path, None, ple_backend="qr")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+
+    assert payload["format_version"] == 7
+    assert payload["model_config"]["ple_backend"] == "qr"
+    assert "backbone.embeddings.layers.0.input_embedding.weight" in payload["model_state"]
+    assert "backbone.embeddings.layers.1.remainder_embedding.weight" in payload["model_state"]
+    assert "backbone.embeddings.layers.1.quotient_embedding.weight" in payload["model_state"]
+
+    loaded = load_checkpoint(path)[0].eval()
+    assert loaded.config.ple_backend == "qr"
+    prompt = torch.tensor([[1, 2, 3]])
+    with torch.no_grad():
+        torch.testing.assert_close(loaded(prompt).logits, original(prompt).logits)
 
 
 def test_adapter_presence_must_match_config(tmp_path: Path) -> None:

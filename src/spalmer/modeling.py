@@ -13,7 +13,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from spalmer.config import SPALMERConfig
-from spalmer.embeddings import AlternatingPLE
+from spalmer.embeddings import AlternatingPLE, QRIndices
 from spalmer.nn import RMSNorm
 
 if TYPE_CHECKING:
@@ -485,6 +485,7 @@ class SPALMERBackbone(nn.Module):
         else:
             per_layer_kwargs = layer_mixer_kwargs
 
+        qr_indices = self.embeddings.prepare_qr_indices(input_ids)
         hidden_states = self.embeddings(input_ids, layer_index=0)
         if atxy is not None:
             # C03: the semantic coordinate enters the residual stream at the
@@ -525,6 +526,7 @@ class SPALMERBackbone(nn.Module):
                 attention_mask=attention_mask,
                 state_reset_mask=state_reset_mask,
                 atxy=atxy,
+                qr_indices=qr_indices,
             )
             auxiliary_loss = None
             if auxiliary_losses:
@@ -553,6 +555,7 @@ class SPALMERBackbone(nn.Module):
             adaptive_exit=adaptive_exit,
             latent_generator=latent_generator,
             exit_readout=exit_readout,
+            qr_indices=qr_indices,
         )
 
     def _run_block_range(
@@ -568,6 +571,7 @@ class SPALMERBackbone(nn.Module):
         attention_mask: Tensor | None,
         state_reset_mask: Tensor | None,
         atxy: ATXYRequest | None,
+        qr_indices: QRIndices | None,
         collect: bool = True,
     ) -> tuple[Tensor, list[Any], list[Any], list[Mapping[str, Any]], list[Tensor]]:
         """Run one contiguous span of physical blocks, exactly as a flat stack.
@@ -584,7 +588,19 @@ class SPALMERBackbone(nn.Module):
         auxiliary_losses: list[Tensor] = []
         for layer_index in indices:
             if layer_index:
-                hidden_states = self.embeddings.inject(hidden_states, input_ids, layer_index)
+                if qr_indices is None:
+                    hidden_states = self.embeddings.inject(
+                        hidden_states,
+                        input_ids,
+                        layer_index,
+                    )
+                else:
+                    hidden_states = self.embeddings.inject(
+                        hidden_states,
+                        input_ids,
+                        layer_index,
+                        qr_indices=qr_indices,
+                    )
             block_output = self.blocks[layer_index](
                 hidden_states,
                 token_mixer_state=token_states[layer_index],
@@ -636,6 +652,7 @@ class SPALMERBackbone(nn.Module):
         adaptive_exit: AdaptiveExit | None,
         latent_generator: torch.Generator | None,
         exit_readout: Callable[[Tensor], Tensor] | None,
+        qr_indices: QRIndices | None,
     ) -> BackboneOutput:
         """Prelude, ``r`` iterations of the latent core, then coda."""
 
@@ -703,15 +720,28 @@ class SPALMERBackbone(nn.Module):
             attention_mask=attention_mask,
             state_reset_mask=state_reset_mask,
             atxy=atxy,
+            qr_indices=qr_indices,
         )
         injection = hidden_states
         working_dtype = injection.dtype
         normalized_injection = recurrence.normalize_injection(injection)
-        # One stochastic-rounding draw and one unique() sync per core block,
-        # re-added identically at every iteration.
-        core_ple = [
-            self.embeddings(input_ids, layer_index=prelude + offset) for offset in range(core)
-        ]
+        # Resolve each core block's lexical refresh once, then re-add the same
+        # tensor at every recurrent iteration.  This also keeps one stochastic
+        # draw per legacy fake-QAT block and one pair of gathers per QR block.
+        if qr_indices is None:
+            core_ple = [
+                self.embeddings(input_ids, layer_index=prelude + offset)
+                for offset in range(core)
+            ]
+        else:
+            core_ple = [
+                self.embeddings(
+                    input_ids,
+                    layer_index=prelude + offset,
+                    qr_indices=qr_indices,
+                )
+                for offset in range(core)
+            ]
 
         if latent_init is not None:
             latent = latent_init.to(device=injection.device, dtype=torch.float32)
@@ -812,6 +842,7 @@ class SPALMERBackbone(nn.Module):
                     attention_mask=attention_mask,
                     state_reset_mask=state_reset_mask,
                     atxy=None,
+                    qr_indices=qr_indices,
                     collect=False,
                 )[0]
                 log_probabilities = F.log_softmax(
@@ -891,6 +922,7 @@ class SPALMERBackbone(nn.Module):
             attention_mask=attention_mask,
             state_reset_mask=state_reset_mask,
             atxy=atxy,
+            qr_indices=qr_indices,
         )
 
         auxiliary_losses = list(prelude_aux)

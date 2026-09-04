@@ -264,7 +264,9 @@ def account_parameters(
     execution_bits: dict[str, int] = {}
     config = getattr(model, "config", None)
     ple_bits = getattr(config, "ple_quant_bits", None)
-    if ple_bits is not None:
+    if ple_bits is not None and getattr(config, "ple_backend", "fake_qat") == "fake_qat":
+        # Only the legacy fake-QAT lookup derives low-bit forward operands;
+        # QR-PLE codebooks execute at their BF16 storage width.
         execution_bits["embeddings"] = int(ple_bits)
     if banks:
         expert_config = banks[0].config

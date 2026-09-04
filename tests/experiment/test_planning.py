@@ -17,6 +17,7 @@ from spalmer.experiment import (
     plan_configuration,
     plan_ladder,
 )
+from spalmer.qr import qr_codebook_rows, qr_lane_moduli
 
 
 def test_parameter_breakdown_matches_known_core_shape() -> None:
@@ -38,6 +39,37 @@ def test_parameter_breakdown_matches_known_core_shape() -> None:
     assert breakdown.low_bit_candidates == breakdown.ple_lookup + breakdown.expert_banks
     assert sum(breakdown.components.values()) == breakdown.total
     assert breakdown.components["shared_channel"] == breakdown.shared_channel
+
+
+def test_qr_ple_breakdown_uses_exact_input_and_sqrt_vocab_refreshes() -> None:
+    config = ModelScaleConfig(
+        vocab_size=1_024,
+        d_model=128,
+        n_layers=8,
+        num_heads=4,
+        num_experts=32,
+        expert_width=64,
+        ple_expansion=2,
+        ple_backend="qr",
+    )
+    breakdown = count_parameters(config)
+    remainder_rows, quotient_rows = qr_codebook_rows(1_024, 2)
+
+    assert config.ple_lane_moduli == qr_lane_moduli(1_024, 2) == (37, 41)
+    assert breakdown.ple_exact_input == 1_024 * 128
+    assert breakdown.ple_qr_refresh == 7 * (remainder_rows + quotient_rows) * 128
+    assert breakdown.ple_lookup == breakdown.ple_exact_input + breakdown.ple_qr_refresh
+    assert breakdown.ple_controls == 7 * 3
+    assert breakdown.low_bit_candidates == breakdown.expert_banks
+    assert breakdown.total == sum(breakdown.components.values())
+    assert config.to_dict()["ple_backend"] == "qr"
+
+    plan = plan_configuration(10_000_000, 1_024, ple_backend="qr")
+    payload = plan.to_dict()
+    assert payload["ple"]["backend"] == "qr"
+    assert payload["ple"]["moduli"] == list(plan.config.ple_lane_moduli)
+    assert payload["ple"]["exact_input_parameters"] == plan.parameters.ple_exact_input
+    assert payload["ple"]["qr_refresh_parameters"] == plan.parameters.ple_qr_refresh
 
 
 def test_optional_directional_and_atxy_capacity_is_inside_total() -> None:

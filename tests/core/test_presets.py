@@ -37,7 +37,12 @@ def _one_shape_search() -> ScaleSearchSpace:
     )
 
 
-def _tiny_plan(*, extensions: bool = False, expert_weight_format: str = "mxfp4"):
+def _tiny_plan(
+    *,
+    extensions: bool = False,
+    expert_weight_format: str = "mxfp4",
+    ple_backend: str = "fake_qat",
+):
     directional = (
         DirectionalScaleConfig(num_feature_groups=4, lateral_rank=4)
         if extensions
@@ -60,6 +65,7 @@ def _tiny_plan(*, extensions: bool = False, expert_weight_format: str = "mxfp4")
         300,
         search_space=_one_shape_search(),
         expert_weight_format=expert_weight_format,
+        ple_backend=ple_backend,
         directional=directional,
         atxy=atxy,
     )
@@ -147,6 +153,32 @@ def test_measured_accounting_contract_uses_the_same_component_ownership() -> Non
     )
     with pytest.raises(ValueError, match="shared_channel"):
         assert_accounting_matches_plan(plan, wrong)
+
+
+def test_qr_plan_builds_exact_layout_and_matches_measured_accounting() -> None:
+    plan = _tiny_plan(ple_backend="qr")
+    bundle = build_configs(
+        plan,
+        tokenizer_version=1,
+        tokenizer_fingerprint="qr-presets",
+        attention_backend="reference",
+        experts_overrides={"expert_qat_backend": "reference"},
+    )
+    model = bundle.build()
+    accounting = account_parameters(model)
+
+    assert bundle.model.ple_backend == "qr"
+    assert plan.parameters.ple_exact_input == plan.config.vocab_size * plan.config.d_model
+    assert len(model.backbone.embeddings.layers) == plan.config.n_layers
+    assert model.backbone.embeddings.layers[0].input_embedding.weight.shape == (
+        plan.config.vocab_size,
+        plan.config.d_model,
+    )
+    assert tuple(model.backbone.embeddings.layers[1].moduli.tolist()) == (
+        plan.config.ple_lane_moduli
+    )
+    assert "embeddings" not in accounting.execution_bits
+    assert_accounting_matches_plan(plan, accounting)
 
 
 @pytest.mark.parametrize("name", ["10M", "50M", "100M"])

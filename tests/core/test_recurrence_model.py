@@ -8,7 +8,7 @@ iteration metrics, and a well-defined decode/exit state budget.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 import torch
@@ -81,6 +81,7 @@ def _config(
     recurrence: RecurrenceConfig | None = None,
     *,
     n_layers: int = 4,
+    ple_backend: Literal["fake_qat", "qr"] = "fake_qat",
 ) -> SPALMERConfig:
     return SPALMERConfig(
         vocab_size=31,
@@ -89,6 +90,7 @@ def _config(
         tokenizer_version=1,
         tokenizer_fingerprint=TOKENIZER_FINGERPRINT,
         ple_expansion_factor=2,
+        ple_backend=ple_backend,
         recurrence=recurrence,
     )
 
@@ -99,9 +101,10 @@ def _tiny_model(
     channel_mixer: type[nn.Module] = RecordingChannelMixer,
     n_layers: int = 4,
     seed: int = 0,
+    ple_backend: Literal["fake_qat", "qr"] = "fake_qat",
 ) -> SPALMERCausalLM:
     torch.manual_seed(seed)
-    config = _config(recurrence, n_layers=n_layers)
+    config = _config(recurrence, n_layers=n_layers, ple_backend=ple_backend)
     blocks = [
         SPALMERBlock(
             config.d_model,
@@ -587,6 +590,46 @@ def test_core_ple_tensor_is_reused_across_iterations() -> None:
 
     # Layer 0's embedding plus one lookup for each of the two core blocks.
     assert len(seen) == 3
+
+
+def test_qr_core_refreshes_are_looked_up_once_and_reused_across_iterations() -> None:
+    model = _recurrent_model(ple_backend="qr").train()
+    seen: list[int] = []
+    embeddings = model.backbone.embeddings
+    real_forward = embeddings.forward
+
+    def recording_forward(
+        input_ids: Tensor,
+        layer_index: int,
+        **kwargs: object,
+    ) -> Tensor:
+        seen.append(layer_index)
+        return real_forward(input_ids, layer_index, **kwargs)
+
+    embeddings.forward = recording_forward
+    try:
+        output = model(
+            torch.tensor([[1, 2, 3, 4]]),
+            labels=torch.tensor([[1, 2, 3, 4]]),
+            recurrence_steps=5,
+        )
+    finally:
+        del embeddings.forward
+
+    # Layer 0 is the sole input embedding. Each physical core layer is looked
+    # up once outside the recurrence loop, then its tensor is reused five times.
+    assert seen == [0, 1, 2]
+    assert output.loss is not None
+    output.loss.backward()
+    assert embeddings.layers[0].input_embedding.weight.grad is not None
+    for layer in embeddings.layers[1:]:
+        table_parameters = [
+            parameter
+            for name, parameter in layer.named_parameters()
+            if name.endswith("weight")
+        ]
+        assert table_parameters
+        assert all(parameter.grad is not None for parameter in table_parameters)
 
 
 def test_recurrence_kwargs_rejected_without_recurrence() -> None:

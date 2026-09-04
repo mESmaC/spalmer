@@ -4,9 +4,9 @@
 **M**icro-**E**xpert **R**outing Transformer
 
 SPALMER is an open, MIT-licensed research implementation of a decoder-only
-language-model architecture built around per-layer low-bit embeddings, hybrid
-linear attention, addressed memory, many small dynamically routed experts, and
-expert-level adaptive potentiation.
+language-model architecture built around exact-plus-compositional per-layer
+embeddings, hybrid linear attention, addressed memory, many small dynamically
+routed experts, and expert-level adaptive potentiation.
 
 The repository is at the first executable-prototype stage. Components are kept
 small, independently testable, and feature-gated so architectural ideas can be
@@ -43,7 +43,9 @@ otherwise runs the plain-PyTorch correctness backend.
 ## Current implementation lanes
 
 - shared configuration and decoder assembly;
-- per-layer expand-before-compress embeddings;
+- selectable per-layer embeddings: the checkpoint-compatible full-table
+  fake-QAT reference path, and QR-PLE with one exact input table followed by
+  multiplicative quotient/remainder refresh lanes trained directly in BF16;
 - ranked-precedence distributional tokenization, with a character n-gram
   proxy model recursively scoring phrase and within-word splits, PMI-scored
   salvage merges, and Python-aware routing of code, comments/docstrings, and
@@ -121,18 +123,21 @@ default.
 
 ## Reference-backend boundary
 
-PLE and routed-expert low-precision paths currently remain quantize/dequantize
-QAT correctness backends, so they do **not** yet provide packed-storage or
-low-bit GEMM speedups. The routed experts nevertheless exercise the requested
-MXFP4-or-NVFP4 weight and MXFP8 activation numerics from a BF16 master. A strict
-native request fails instead of silently using BF16 matmul. The installed SM120
-software stack has no mixed W4A8 grouped kernel; native execution is a separate
-backend milestone. Backward currently uses BF16 autograd through the QAT STE;
-an explicit MXFP8 backward kernel is also a later backend milestone. Expert
-potentiation changes a complete expert's derived
-forward precision to MXFP8 or BF16 without adding another master copy. A hard
-allocation guard prevents accidentally scaling the PLE tables beyond prototype
-size.
+The legacy full-table PLE and routed-expert low-precision paths remain
+quantize/dequantize QAT correctness backends, so they do **not** provide
+packed-storage or low-bit GEMM speedups. QR-PLE does not simulate quantization:
+layer 0 is one exact table, and later layers use two vectorized BF16 codebook
+gathers, multiplicative lanes, scalar softmax reduction, and a gated residual.
+Its codebook size scales approximately with the square root of vocabulary size.
+The routed experts nevertheless exercise the requested MXFP4-or-NVFP4 weight
+and MXFP8 activation numerics from a BF16 master. A strict native request fails
+instead of silently using BF16 matmul. The installed SM120 software stack has no
+mixed W4A8 grouped kernel; native execution is a separate backend milestone.
+Backward currently uses BF16 autograd through the expert QAT STE; an explicit
+MXFP8 backward kernel is also a later backend milestone. Expert potentiation
+changes a complete expert's derived forward precision to MXFP8 or BF16 without
+adding another master copy. A hard allocation guard applies only to the legacy
+full-table PLE backend.
 
 The surprise-calibration target is mixture-level realized NLL attributed by
 routing responsibility. It is not a measured counterfactual NLL for every

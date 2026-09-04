@@ -71,6 +71,28 @@ def _tiny_model() -> SPALMERCausalLM:
     return SPALMERCausalLM(config, backbone)
 
 
+def _tiny_qr_model() -> SPALMERCausalLM:
+    config = SPALMERConfig(
+        vocab_size=31,
+        d_model=12,
+        n_layers=4,
+        tokenizer_version=TOKENIZER_VERSION,
+        tokenizer_fingerprint=TOKENIZER_FINGERPRINT,
+        ple_expansion_factor=2,
+        ple_backend="qr",
+    )
+    blocks = [
+        SPALMERBlock(
+            config.d_model,
+            TinyTokenMixer(config.d_model),
+            TinyChannelMixer(config.d_model),
+            norm_eps=config.norm_eps,
+        )
+        for _ in range(config.n_layers)
+    ]
+    return SPALMERCausalLM(config, SPALMERBackbone(config, blocks))
+
+
 def test_causal_lm_composes_blocks_and_computes_next_token_loss() -> None:
     torch.manual_seed(7)
     model = _tiny_model().eval()
@@ -87,6 +109,58 @@ def test_causal_lm_composes_blocks_and_computes_next_token_loss() -> None:
     assert model.backbone.embeddings.layers[0].weight.grad is not None
     assert model.backbone.embeddings.layers[-1].weight.grad is not None
     assert model.lm_head.weight.grad is not None
+
+
+def test_qr_ple_wires_exact_input_and_every_later_refresh_into_loss() -> None:
+    torch.manual_seed(11)
+    model = _tiny_qr_model().train()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]])
+    calls: list[tuple[str, int]] = []
+    embeddings = model.backbone.embeddings
+    real_forward = embeddings.forward
+    real_inject = embeddings.inject
+
+    def recording_forward(
+        input_ids: Tensor,
+        layer_index: int,
+        **kwargs: object,
+    ) -> Tensor:
+        calls.append(("forward", layer_index))
+        return real_forward(input_ids, layer_index, **kwargs)
+
+    def recording_inject(
+        hidden_states: Tensor,
+        input_ids: Tensor,
+        layer_index: int,
+        **kwargs: object,
+    ) -> Tensor:
+        calls.append(("inject", layer_index))
+        return real_inject(hidden_states, input_ids, layer_index, **kwargs)
+
+    embeddings.forward = recording_forward
+    embeddings.inject = recording_inject
+    try:
+        output = model(input_ids, labels=input_ids)
+    finally:
+        del embeddings.forward
+        del embeddings.inject
+
+    assert calls == [("forward", 0)] + [("inject", index) for index in range(1, 4)]
+    assert output.loss is not None
+    output.loss.backward()
+
+    first = embeddings.layers[0]
+    assert first.input_embedding.weight.grad is not None
+    assert first.input_embedding.weight.grad.abs().sum().item() > 0
+    for layer in embeddings.layers[1:]:
+        table_parameters = [
+            parameter
+            for name, parameter in layer.named_parameters()
+            if name.endswith("weight")
+        ]
+        assert table_parameters
+        assert all(parameter.grad is not None for parameter in table_parameters)
+        assert all(parameter.grad.abs().sum().item() > 0 for parameter in table_parameters)
 
 
 def test_non_recurrent_config_keeps_flat_contract() -> None:

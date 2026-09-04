@@ -1,9 +1,11 @@
 """Scale-aware, construction-free planning for SPALMER checkpoints.
 
 The estimates mirror the currently assembled 3 KDA : 1 MLA prototype, but
-this module intentionally imports no model code.  It therefore cannot allocate
-weights, execute a forward pass, or start training.  Counts are planning
-estimates rather than a substitute for a final ``named_parameters`` audit.
+this module intentionally imports no model code (only the pure-arithmetic QR
+lane partition helpers shared with the QR-PLE module).  It therefore cannot
+allocate weights, execute a forward pass, or start training.  Counts are
+planning estimates rather than a substitute for a final ``named_parameters``
+audit.
 """
 
 from __future__ import annotations
@@ -13,6 +15,13 @@ import json
 import math
 from dataclasses import asdict, dataclass
 from typing import Literal, Protocol, runtime_checkable
+
+from spalmer.qr import qr_codebook_rows, qr_lane_moduli
+
+# Per-layer embedding backends the planner can count.  ``fake_qat`` is the
+# legacy lane-table implementation whose counts and fingerprints are frozen;
+# ``qr`` is the BF16 quotient/remainder compositional backend.
+PLE_BACKENDS: tuple[str, ...] = ("fake_qat", "qr")
 
 
 def _require_positive(name: str, value: int) -> None:
@@ -153,6 +162,9 @@ class ModelScaleConfig:
     directional: DirectionalScaleConfig | None = None
     atxy: ATXYScaleConfig | None = None
     recurrence: RecurrenceScaleConfig | None = None
+    # ``ple_expansion`` is the lane count for both backends: fake-QAT lane
+    # tables on every layer, or QR lanes on the refresh layers ``1..L-1``.
+    ple_backend: Literal["fake_qat", "qr"] = "fake_qat"
 
     def __post_init__(self) -> None:
         for name in (
@@ -196,6 +208,8 @@ class ModelScaleConfig:
             raise ValueError("expert_activation_format must be 'mxfp8'")
         if self.expert_master_dtype != "bfloat16":
             raise ValueError("expert_master_dtype must be 'bfloat16'")
+        if self.ple_backend not in PLE_BACKENDS:
+            raise ValueError("ple_backend must be 'fake_qat' or 'qr'")
         if self.directional is not None:
             self.directional.parameters_per_layer(self.d_model)
         if self.atxy is not None and self.atxy.injection_layer >= self.n_layers:
@@ -249,12 +263,24 @@ class ModelScaleConfig:
     def mla_layers(self) -> int:
         return self.n_layers // 4
 
+    @property
+    def ple_lane_moduli(self) -> tuple[int, ...]:
+        """Deterministic QR lane moduli; empty for the legacy fake-QAT tables."""
+
+        if self.ple_backend != "qr":
+            return ()
+        return qr_lane_moduli(self.vocab_size, self.ple_expansion)
+
     def to_dict(self) -> dict[str, object]:
         values = asdict(self)
         if self.recurrence is None:
             # Non-recurrent shapes keep the exact dict every stored plan
             # fingerprint was computed from.
             values.pop("recurrence")
+        if self.ple_backend == "fake_qat":
+            # Legacy shapes likewise stay byte-identical to their stored
+            # fingerprints; only a QR-PLE shape names its backend.
+            values.pop("ple_backend")
         return values
 
 
@@ -274,6 +300,11 @@ class ParameterBreakdown:
     atxy: int
     lm_head: int
     recurrence: int = 0
+    # QR-PLE decomposition of ``ple_lookup``: the exact BF16 input table of
+    # layer 0 and the quotient/remainder codebooks of the refresh layers.  Both
+    # stay zero for legacy fake-QAT tables, whose lookups are low-bit candidates.
+    ple_exact_input: int = 0
+    ple_qr_refresh: int = 0
 
     @property
     def total(self) -> int:
@@ -333,10 +364,25 @@ class ParameterBreakdown:
         }
 
     @property
-    def low_bit_candidates(self) -> int:
-        """Parameters whose forward representations are derived at low precision."""
+    def ple_total(self) -> int:
+        """Every PLE parameter: lookup tables or codebooks plus scalar controls."""
 
-        return self.ple_lookup + self.expert_banks
+        return self.ple_lookup + self.ple_controls
+
+    @property
+    def fake_qat_ple_lookup(self) -> int:
+        """Legacy lookup weights whose forward operands are derived at four bits."""
+
+        return self.ple_lookup - self.ple_exact_input - self.ple_qr_refresh
+
+    @property
+    def low_bit_candidates(self) -> int:
+        """Parameters whose forward representations are derived at low precision.
+
+        QR-PLE codebooks execute at their BF16 storage width and are excluded.
+        """
+
+        return self.fake_qat_ple_lookup + self.expert_banks
 
     @property
     def dense_parameters(self) -> int:
@@ -348,6 +394,10 @@ class ParameterBreakdown:
             # Keep every non-recurrent breakdown byte-identical to the dicts
             # existing plan fingerprints were hashed from.
             values.pop("recurrence")
+        if not self.ple_exact_input and not self.ple_qr_refresh:
+            # Likewise for every legacy fake-QAT breakdown.
+            values.pop("ple_exact_input")
+            values.pop("ple_qr_refresh")
         values.update(
             total=self.total,
             low_bit_candidates=self.low_bit_candidates,
@@ -366,8 +416,24 @@ def count_parameters(config: ModelScaleConfig) -> ParameterBreakdown:
     key_dim = heads * head_k
     value_dim = heads * head_v
 
-    ple_lookup = config.n_layers * config.vocab_size * config.ple_expansion * d
-    ple_controls = config.n_layers * (config.ple_expansion + 1)
+    ple_exact_input = 0
+    ple_qr_refresh = 0
+    if config.ple_backend == "qr":
+        # Layer 0 is one exact BF16 [vocab, d] table without lanes; every later
+        # physical layer composes ``ple_expansion`` quotient/remainder lanes.
+        ple_exact_input = config.vocab_size * d
+        remainder_rows, quotient_rows = qr_codebook_rows(
+            config.vocab_size,
+            config.ple_expansion,
+        )
+        ple_qr_refresh = (
+            (config.n_layers - 1) * (remainder_rows + quotient_rows) * d
+        )
+        ple_lookup = ple_exact_input + ple_qr_refresh
+        ple_controls = (config.n_layers - 1) * (config.ple_expansion + 1)
+    else:
+        ple_lookup = config.n_layers * config.vocab_size * config.ple_expansion * d
+        ple_controls = config.n_layers * (config.ple_expansion + 1)
 
     conv_channels = 2 * key_dim + value_dim
     one_kda = (
@@ -431,6 +497,8 @@ def count_parameters(config: ModelScaleConfig) -> ParameterBreakdown:
         atxy=atxy,
         recurrence=recurrence,
         lm_head=lm_head,
+        ple_exact_input=ple_exact_input,
+        ple_qr_refresh=ple_qr_refresh,
     )
 
 
@@ -718,7 +786,25 @@ class ScalePlan:
                 "effective_depth": self.effective_depth,
                 "core_mixers": _core_mixer_counts(self.config),
             }
+        if self.config.ple_backend == "qr":
+            payload["ple"] = self.ple_summary()
         return payload
+
+    def ple_summary(self) -> dict[str, object]:
+        """Backend-aware PLE ownership: exact input, QR refresh, controls, total."""
+
+        config = self.config
+        parameters = self.parameters
+        return {
+            "backend": config.ple_backend,
+            "lanes": config.ple_expansion,
+            "moduli": list(config.ple_lane_moduli),
+            "exact_input_parameters": parameters.ple_exact_input,
+            "qr_refresh_parameters": parameters.ple_qr_refresh,
+            "lookup_parameters": parameters.ple_lookup,
+            "control_parameters": parameters.ple_controls,
+            "total_parameters": parameters.ple_total,
+        }
 
 
 def _core_mixer_counts(config: ModelScaleConfig) -> dict[str, int]:
@@ -743,11 +829,20 @@ def plan_configuration(
     directional: DirectionalScaleConfig | None = None,
     atxy: ATXYScaleConfig | None = None,
     recurrence: RecurrenceScaleConfig | None = None,
+    ple_backend: Literal["fake_qat", "qr"] = "fake_qat",
 ) -> ScalePlan:
-    """Choose the enumerated shape nearest an explicit total parameter target."""
+    """Choose the enumerated shape nearest an explicit total parameter target.
+
+    The same finite grid serves both PLE backends, so a QR plan redistributes
+    the capacity its smaller codebooks free into width, depth, the shared
+    channel, and the expert banks while landing as close to ``target_parameters``
+    as the grid allows.
+    """
 
     _require_positive("target_parameters", target_parameters)
     _require_positive("vocab_size", vocab_size)
+    if ple_backend not in PLE_BACKENDS:
+        raise ValueError("ple_backend must be 'fake_qat' or 'qr'")
     candidates: list[tuple[tuple[int, ...], ModelScaleConfig, ParameterBreakdown]] = []
     for d_model in sorted(set(search_space.d_models)):
         if directional is not None and d_model % directional.num_feature_groups:
@@ -790,6 +885,7 @@ def plan_configuration(
                                 directional=directional,
                                 atxy=atxy,
                                 recurrence=recurrence,
+                                ple_backend=ple_backend,
                             )
                             breakdown = count_parameters(config)
                             # Target distance dominates; stable tie-breakers prefer
@@ -826,6 +922,7 @@ def plan_ladder(
     directional: DirectionalScaleConfig | None = None,
     atxy: ATXYScaleConfig | None = None,
     recurrence: RecurrenceScaleConfig | None = None,
+    ple_backend: Literal["fake_qat", "qr"] = "fake_qat",
 ) -> tuple[ScalePlan, ...]:
     """Plan several scales, resolving vocabulary size independently per rung."""
 
@@ -844,6 +941,7 @@ def plan_ladder(
                 directional=directional,
                 atxy=atxy,
                 recurrence=recurrence,
+                ple_backend=ple_backend,
             )
         )
     return tuple(plans)
@@ -857,6 +955,7 @@ __all__ = [
     "MemoryAssumptions",
     "MemoryEstimate",
     "ModelScaleConfig",
+    "PLE_BACKENDS",
     "ParameterBreakdown",
     "RecurrenceScaleConfig",
     "ScalePlan",

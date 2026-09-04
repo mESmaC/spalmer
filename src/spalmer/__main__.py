@@ -89,6 +89,15 @@ def _plan_parser() -> argparse.ArgumentParser:
         help="routed-expert QAT forward-weight format recorded in each plan",
     )
     parser.add_argument(
+        "--ple-backend",
+        choices=("fake_qat", "qr"),
+        default="fake_qat",
+        help=(
+            "per-layer embedding backend: legacy four-bit fake-QAT lane tables, or "
+            "BF16 quotient/remainder codebooks behind one exact input table"
+        ),
+    )
+    parser.add_argument(
         "--recurrence",
         metavar=("PRELUDE", "CODA"),
         nargs=2,
@@ -181,6 +190,12 @@ def _training_parser() -> argparse.ArgumentParser:
     parser.add_argument("--residency-increment", type=int, default=2)
     parser.add_argument("--residency-min-gain", type=float, default=0.02)
     parser.add_argument("--ple-expansion", type=int, default=2)
+    parser.add_argument(
+        "--ple-backend",
+        choices=("fake_qat", "qr"),
+        default="fake_qat",
+        help="per-layer embedding backend (QR-PLE checkpoints are scratch models)",
+    )
     parser.add_argument(
         "--recurrent-layers",
         metavar=("PRELUDE", "CORE", "CODA"),
@@ -288,6 +303,7 @@ def _run_plan(args: argparse.Namespace) -> None:
         policy,
         expert_weight_format=args.expert_weight_format,
         recurrence=recurrence,
+        ple_backend=args.ple_backend,
     )
     if args.json:
         print(json.dumps([plan.to_dict() for plan in plans], indent=2))
@@ -295,7 +311,8 @@ def _run_plan(args: argparse.Namespace) -> None:
     header = (
         f"{'target':>12} {'planned':>12} {'error':>9} {'vocab':>8} "
         f"{'d':>5} {'L':>3} {'core':>5} {'eff':>5} {'h':>3} {'E':>4} "
-        f"{'expert':>7} {'PLE':>4} {'BF16 GiB':>9} {'cached W4':>11}"
+        f"{'expert':>7} {'PLE':>4} {'backend':>8} {'PLE params':>11} "
+        f"{'BF16 GiB':>9} {'cached W4':>11}"
     )
     print(header)
     print("-" * len(header))
@@ -308,7 +325,8 @@ def _run_plan(args: argparse.Namespace) -> None:
             f"{plan.relative_error:+8.2%} {shape.vocab_size:8,d} {shape.d_model:5d} "
             f"{shape.n_layers:3d} {core:>5} {plan.effective_depth:5d} "
             f"{shape.num_heads:3d} {shape.num_experts:4d} "
-            f"{shape.expert_width:7d} {shape.ple_expansion:4d} "
+            f"{shape.expert_width:7d} {shape.ple_expansion:4d} {shape.ple_backend:>8} "
+            f"{plan.parameters.ple_total:11,d} "
             f"{memory.gib(memory.reference_training_bytes):9.3f} "
             f"{memory.gib(memory.packed_training_bytes):11.3f}"
         )
@@ -433,6 +451,8 @@ def _run(args: argparse.Namespace) -> None:
         "token_mixer_pattern": _HYBRID_CYCLE,
         "surprise_ema_decay": args.surprise_ema_decay,
     }
+    if args.ple_backend != "fake_qat":
+        model_fields["ple_backend"] = args.ple_backend
     if recurrence_config is not None:
         model_fields["recurrence"] = recurrence_config
     config = SPALMERConfig(**model_fields)
@@ -525,6 +545,7 @@ def _run(args: argparse.Namespace) -> None:
             "residency_increment": args.residency_increment,
             "residency_min_gain": args.residency_min_gain,
             "seed": 0,
+            "ple_backend": config.ple_backend,
             "recurrence": _recurrence_metadata(recurrence_config, sampler, result),
         },
     )

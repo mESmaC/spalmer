@@ -33,8 +33,8 @@ from spalmer.tokenizer import (
 )
 
 FORMAT_NAME = "spalmer.prototype.checkpoint"
-FORMAT_VERSION = 6
-_SUPPORTED_FORMAT_VERSIONS = {1, 2, 3, 4, 5, FORMAT_VERSION}
+FORMAT_VERSION = 7
+_SUPPORTED_FORMAT_VERSIONS = set(range(1, FORMAT_VERSION + 1))
 CHECKPOINT_BINDING_METADATA_KEY = "_spalmer_checkpoint_binding"
 _CHECKPOINT_BINDING_ATTRIBUTE = "_spalmer_checkpoint_binding"
 _MODEL_PARAMETER_DTYPES = {
@@ -506,6 +506,18 @@ def load_checkpoint(
                 f"checkpoint version {checkpoint_version} predates the recurrent core "
                 "but carries a recurrence configuration"
             )
+    if checkpoint_version < 7:
+        # QR-PLE has a different parameter topology and cannot be inferred from
+        # legacy state tensors.  Missing keys resolve to the only historical
+        # backend; an explicitly backdated QR declaration is rejected instead
+        # of attempting a weight migration.
+        legacy_backend = raw_model_config.get("ple_backend", "fake_qat")
+        if legacy_backend != "fake_qat":
+            raise ValueError(
+                f"checkpoint version {checkpoint_version} predates QR-PLE "
+                f"but declares PLE backend {legacy_backend!r}"
+            )
+        raw_model_config.setdefault("ple_backend", "fake_qat")
     _require_config_schema("model", raw_model_config, required_model)
     raw_recurrence = raw_model_config.get("recurrence")
     if isinstance(raw_recurrence, Mapping):
