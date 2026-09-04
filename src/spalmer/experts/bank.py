@@ -695,7 +695,11 @@ class MicroExpertBank(nn.Module):
             slot_mask = expert_index == expert
             rows = token_index[slot_mask]
             outputs = self.expert_forward(hidden_states[rows], int(expert), promoted_mask)
-            weighted = routing_weights[slot_mask].unsqueeze(-1) * outputs
+            # Stable router softmaxes may remain FP32 under mixed precision.
+            # Cast only the combination weights so expert updates and their
+            # reduction stay in the activation dtype without promoting the
+            # full routed tensor to FP32.
+            weighted = routing_weights[slot_mask].to(outputs.dtype).unsqueeze(-1) * outputs
             update = update.index_add(0, rows, weighted)
         return update
 
@@ -765,7 +769,8 @@ class MicroExpertBank(nn.Module):
             real_rows = pair_rows[valid]
             routed_rows.append(real_rows)
             routed_updates.append(
-                outputs[valid] * routing_weights.index_select(0, real_rows).unsqueeze(-1)
+                outputs[valid]
+                * routing_weights.index_select(0, real_rows).to(outputs.dtype).unsqueeze(-1)
             )
 
         pair_rows = torch.cat(routed_rows)
@@ -797,7 +802,7 @@ class MicroExpertBank(nn.Module):
                 slot_mask = expert_index == expert
                 rows = token_index[slot_mask]
                 outputs = self.expert_forward(hidden_states[rows], expert, promoted_mask)
-                weighted = routing_weights[slot_mask].unsqueeze(-1) * outputs
+                weighted = routing_weights[slot_mask].to(outputs.dtype).unsqueeze(-1) * outputs
                 update = update.index_add(0, rows, weighted)
         self._publish_paged_quantization(selected_ids, errors)
         return update
@@ -872,7 +877,7 @@ class MicroExpertBank(nn.Module):
                 routed_rows.append(real_rows)
                 routed_updates.append(
                     outputs[valid]
-                    * routing_weights.index_select(0, real_rows).unsqueeze(-1)
+                    * routing_weights.index_select(0, real_rows).to(outputs.dtype).unsqueeze(-1)
                 )
 
         pair_rows = torch.cat(routed_rows)

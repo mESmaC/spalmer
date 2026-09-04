@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
 import torch
 
 from spalmer.experts import MicroExpertBank, MicroExpertsConfig
@@ -77,6 +78,37 @@ def test_bucketed_grouped_forward_and_backward_match_expert_loop() -> None:
             rtol=1e-5,
             atol=1e-6,
         )
+
+
+@pytest.mark.parametrize("execution", ["loop", "grouped"])
+def test_bf16_execution_accepts_fp32_routing_weights(execution: str) -> None:
+    """FP32 router probabilities must not promote the BF16 expert reduction."""
+
+    torch.manual_seed(43)
+    bank = MicroExpertBank(_config(execution=execution)).to(dtype=torch.bfloat16)
+    hidden_states = torch.randn(7, 8, dtype=torch.bfloat16, requires_grad=True)
+    token_index = torch.arange(7).repeat_interleave(2)
+    expert_index = torch.tensor((0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7))
+    routing_weights = torch.rand(7, 2, dtype=torch.float32)
+    routing_weights = (
+        routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    ).reshape(-1)
+    routing_weights.requires_grad_()
+
+    output = bank.execute_routing(
+        hidden_states,
+        token_index,
+        expert_index,
+        routing_weights,
+    )
+
+    assert output.dtype == torch.bfloat16
+    output.float().square().mean().backward()
+    assert routing_weights.grad is not None
+    assert routing_weights.grad.dtype == torch.float32
+    assert torch.isfinite(routing_weights.grad).all()
+    assert hidden_states.grad is not None
+    assert torch.isfinite(hidden_states.grad).all()
 
 
 def test_power_of_two_bucket_padding_is_strictly_bounded() -> None:
